@@ -1,70 +1,111 @@
-# bizfin-etl · 业财数据清洗
+# hero-digital-etl · 英雄电竞数据清洗
 
-把泛微导出的业务单据,按《业财项目_数据映射规则》清洗映射成汉得中台的期初导入模版。
-当前已实现 **应付期初(对公付款单)**,框架支持扩展到应收/预付/预收等其它期初。
+把泛微导出的业务单据，按《业财项目_数据映射规则》清洗映射成汉得中台期初导入模板。
+
+当前已实现任务：`ap_opening_payment`，即 **应付期初-对公付款单**。
 
 ## 目录结构
 
-```
-bizfin-etl/
-├── run.py                 # 入口:python run.py <任务名>
-├── common.py              # 公共能力:路径/数据库/各类映射/归一化/Excel读写/过滤去重
-├── ap_qichu.py            # 任务:应付期初(整条 ETL 一个文件读完)
-├── requirements.txt       # 依赖
-├── .env.example           # 数据库账密模板(复制为 .env 填写)
+```text
+hero-digital-etl/
+├── run.py                              # 任务入口：python run.py <任务名>
+├── requirements.txt                    # Python 依赖
+├── .env.example                        # 数据库环境变量模板
+├── etl/
+│   ├── common.py                       # 公共能力：路径、数据库、映射、归一化、Excel 读写
+│   └── tasks/
+│       └── ap_opening_payment.py       # 应付期初-对公付款单清洗任务
 ├── data/
-│   ├── source/            # 源表(泛微导出):主表、明细表
-│   ├── rules/             # 业财项目_数据映射规则.xlsx
-│   └── templates/         # 导入模版
-└── output/                # 产出(导入文件 + 未匹配清单)
+│   ├── source/
+│   │   └── ap_opening_payment/         # 当前任务源表
+│   │       ├── uf_dgfktz-主表.xlsx
+│   │       └── uf_dgfktz_dt1-明细表.xlsx
+│   ├── rules/
+│   │   └── 业财项目_数据映射规则.xlsx
+│   └── templates/
+│       └── ap_opening_payment/         # 当前任务导入模板
+│           └── 英雄期初对公付款单导入模版.xlsx
+└── output/
+    └── ap_opening_payment/             # 当前任务产出文件
+        ├── 英雄期初对公付款单导入_应付期初_v2.xlsx
+        └── 未匹配清单_应付期初_v2.xlsx
 ```
 
-> 结构很扁:**公共能力全在 `common.py`,每个清洗任务就是一个独立的 `.py`**。
+约定：每个清洗任务都使用同一个任务名作为目录名，`data/source/`、`data/templates/`、`output/` 下都要建同名文件夹，避免后续任务多了之后找不到对应 Excel。
 
 ## 快速开始
 
 ```bash
-# 1. 安装依赖
 pip install -r requirements.txt
-
-# 2. 配置数据库账密
-copy .env.example .env        # Windows;然后编辑 .env 填入真实账密
-
-# 3. 运行
-python run.py ap_qichu        # 跑应付期初
-python run.py --list          # 看所有任务
+copy .env.example .env
+python run.py ap_opening_payment
 ```
 
-> 说明:脚本对数据库**只读(SELECT)**;`.env` 含账密、已被 git 忽略,不要提交。
+也可以查看当前可用任务：
 
-## 应付期初字段映射(摘要)
+```bash
+python run.py --list
+```
 
-| 模版字段 | 取数来源 |
+`.env` 读取真实数据库连接信息，本地使用即可，不要提交到 GitHub。脚本只执行 `SELECT` 查询，不写入数据库。
+
+## 当前任务
+
+任务名：`ap_opening_payment`
+
+入口文件：`etl/tasks/ap_opening_payment.py`
+
+运行方式：
+
+```bash
+python run.py ap_opening_payment
+```
+
+直接运行任务文件也支持：
+
+```bash
+python etl/tasks/ap_opening_payment.py
+```
+
+数据口径：
+
+- 流程来源：`对公付款`、`个人劳务付款`
+- 申请日期：`>= 2026-01-01`
+- 流程状态：`审批完成`
+- 作废单据：剔除
+- 行粒度：主表和明细表按 `ID` 合并，一行对应一条费用明细
+
+主要映射：
+
+| 模板字段 | 取数来源 |
 |---|---|
-| 来源系统 | 固定 FW |
-| 来源单据编号 / 申请日期 / 备注 / 合同号 / 银行账号 / 计划付款日期 | 主表对应列 |
-| 单据类型 | 固定 AP01-1 |
-| 申请人工号 | 主表`经办人` → 泛微 hrmresource→hrmjobtitles.JOBTITLENAME |
-| 核算主体编号 | 主表`公司主体` → 规则「新旧主体映射」.新主体编码 |
-| 收款方编码 | 主表`供应商-文本` → 中台 hfbs_system_vender.vender_code |
-| 费用项目编码/描述 | 明细`预算科目` → 规则「赛事/MCN 新旧预算项科目-调整后」 |
-| 实际已支付金额 | 主表`支付状态`=已支付 ? 本行报账金额 : 0 |
-| 报账币种 | 主表`付款币种` → ISO 码 |
-| 报账金额 | 明细`付款金额` |
-| 订单编号/名称 | 暂留空(待"泛微项目编号→清洗后订单编号"映射) |
+| 来源系统 | 固定 `FW` |
+| 来源单据编号、申请日期、备注、合同号、银行账号、计划付款日期 | 泛微主表 |
+| 单据类型 | 固定 `AP01-1` |
+| 申请人工号 | 泛微 `hrmresource` / `hrmjobtitles` |
+| 核算主体编号 | `业财项目_数据映射规则.xlsx` 的新旧主体映射 |
+| 收款方编码 | 中台 `hfbs_system_vender.vender_code` |
+| 费用项目编码、费用项目描述 | 预算科目映射规则 |
+| 实际已支付金额 | 支付状态为已支付时取本行报账金额，否则为 `0` |
+| 报账币种 | 付款币种转 ISO 码 |
+| 报账金额 | 明细表付款金额 |
 
-完整逐列说明见 `ap_qichu.py` 顶部与 `build_output()` 注释。
+## 新增任务规范
 
-## 新增一个清洗任务
+1. 在 `etl/tasks/` 下新建任务文件，文件名使用清晰英文名，不使用拼音。
+2. 在 `data/source/<任务名>/` 放源表。
+3. 在 `data/templates/<任务名>/` 放导入模板。
+4. 任务运行后输出到 `output/<任务名>/`。
+5. 在 `run.py` 的 `TASKS` 字典登记任务名。
 
-1. 复制 `ap_qichu.py` 为新任务(如 `ar_qichu.py` 应收期初);
-2. 改三处:源表/模版路径、`filter_main` 的过滤口径、`build_output` 的字段映射;
-   公共映射(工号/供应商/主体/科目/币种)直接调 `common.py`,无需重写;
-3. 在 `run.py` 的 `TASKS` 字典登记新任务名。
+公共逻辑尽量复用 `etl/common.py`，例如数据库连接、工号映射、供应商映射、主体映射、科目映射、币种转换、模板写入和未匹配清单输出。
 
-## 数据问题排查记录(应付期初)
+## 排查输出
 
-清洗中发现并已处理:
-- 全角/半角括号导致主体、供应商名称匹配失败 → 归一化 `nz()` 统一;
-- 费用科目层级名内部含 `/`(如"讲台/展柜")被误当分隔符 → 两侧统一去 `/`;
-- 剩余未匹配多为海外英文主体/供应商、或规则表未维护的新科目 → 见 `output/未匹配清单`。
+任务会额外生成 `output/ap_opening_payment/未匹配清单_应付期初_v2.xlsx`，用于核对以下问题：
+
+- 未匹配工号
+- 未匹配供应商
+- 未匹配核算主体
+- 未匹配费用科目
+- 分组合并待核对数据

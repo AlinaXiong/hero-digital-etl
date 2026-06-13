@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """公共能力:路径配置、数据库只读连接、各类映射、归一化、Excel 读写、行过滤/去重。
 
-所有清洗任务(ap_qichu 应付期初,以及将来的应收/预付/预收)都从这里取用,
+所有清洗任务(ap_opening_payment 应付期初,以及将来的应收/预付/预收)都从这里取用,
 避免在每个任务里重复写数据库查询和映射逻辑。任务文件本身只关心"过滤 + 字段映射"。
 
 数据库账密从环境变量读取;若项目根有 .env 则自动加载(.env 不提交版本库)。
@@ -16,7 +16,7 @@ import pymysql
 from openpyxl import load_workbook
 
 # ============================ 路径 ============================
-ROOT      = Path(__file__).resolve().parent
+ROOT      = Path(__file__).resolve().parents[1]
 SRC_DIR   = ROOT / 'data' / 'source'       # 源表(泛微导出)
 RULES_DIR = ROOT / 'data' / 'rules'        # 映射规则
 TPL_DIR   = ROOT / 'data' / 'templates'    # 导入模版
