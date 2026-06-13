@@ -9,6 +9,7 @@
 """
 import os
 import re
+import unicodedata
 from datetime import date
 from pathlib import Path
 
@@ -58,11 +59,26 @@ def today_suffix():
 
 # ============================ 归一化 / 格式化 ============================
 _PARENTHESIS_TRANSLATION = str.maketrans('（）', '()')
+# NFKD 折不掉的特殊拉丁字母(无组合记号),显式映射到基础字母。覆盖土耳其语等外文供应商/人名。
+_SPECIAL_LETTERS = str.maketrans({
+    'ı': 'i', 'İ': 'I', 'ø': 'o', 'Ø': 'O', 'ł': 'l', 'Ł': 'L',
+    'đ': 'd', 'Đ': 'D', 'ð': 'd', 'Ð': 'D', 'ħ': 'h', 'ŧ': 't',
+    'ß': 'ss', 'æ': 'ae', 'Æ': 'AE', 'œ': 'oe', 'Œ': 'OE',
+})
+
+
+def _fold_accents(text):
+    """去掉变音符号:ş->s、ç->c、ö->o、ı->i…,把外文名折成基础拉丁字母。"""
+    text = text.translate(_SPECIAL_LETTERS)
+    decomposed = unicodedata.normalize('NFKD', text)
+    return ''.join(ch for ch in decomposed if not unicodedata.combining(ch))
 
 
 def normalize_name(value):
-    """名称归一化:全角括号->半角、去所有空格。消除主体/供应商/人名的全半角差异。"""
-    return re.sub(r'\s+', '', str(value).strip().translate(_PARENTHESIS_TRANSLATION))
+    """名称归一化(用于按名称匹配):全角括号->半角、去所有空格、折叠变音符号、忽略大小写。
+    消除主体/供应商/人名在两套系统间的全半角、特殊字符(如土耳其语 ş/ı)、大小写差异。"""
+    text = re.sub(r'\s+', '', str(value).strip().translate(_PARENTHESIS_TRANSLATION))
+    return _fold_accents(text).casefold()
 
 
 def remove_slashes(value):
