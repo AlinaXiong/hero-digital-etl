@@ -58,7 +58,6 @@ def today_suffix():
 
 
 # ============================ 归一化 / 格式化 ============================
-_PARENTHESIS_TRANSLATION = str.maketrans('（）', '()')
 # NFKD 折不掉的特殊拉丁字母(无组合记号),显式映射到基础字母。覆盖土耳其语等外文供应商/人名。
 _SPECIAL_LETTERS = str.maketrans({
     'ı': 'i', 'İ': 'I', 'ø': 'o', 'Ø': 'O', 'ł': 'l', 'Ł': 'L',
@@ -68,17 +67,21 @@ _SPECIAL_LETTERS = str.maketrans({
 
 
 def _fold_accents(text):
-    """去掉变音符号:ş->s、ç->c、ö->o、ı->i…,把外文名折成基础拉丁字母。"""
+    """去掉变音符号:ş->s、ç->c、ö->o、ı->i…,把外文名折成基础拉丁字母(并把全角等兼容字符规整)。"""
     text = text.translate(_SPECIAL_LETTERS)
     decomposed = unicodedata.normalize('NFKD', text)
     return ''.join(ch for ch in decomposed if not unicodedata.combining(ch))
 
 
 def normalize_name(value):
-    """名称归一化(用于按名称匹配):全角括号->半角、去所有空格、折叠变音符号、忽略大小写。
-    消除主体/供应商/人名在两套系统间的全半角、特殊字符(如土耳其语 ş/ı)、大小写差异。"""
-    text = re.sub(r'\s+', '', str(value).strip().translate(_PARENTHESIS_TRANSLATION))
-    return _fold_accents(text).casefold()
+    """名称归一化(用于按名称匹配):折叠变音符号(土耳其语 ş/ı 等)、去掉所有空格/标点/符号
+    (含 & 、,。()（）等)、忽略大小写;只保留字母数字与中文。
+    消除主体/供应商/人名在两套系统间的全半角、特殊字符、标点、大小写差异。"""
+    text = _fold_accents(str(value).strip())
+    # 去掉空白、标点(category P*)、符号(category S*,含 &);保留字母/数字/中文
+    text = ''.join(ch for ch in text
+                   if not (ch.isspace() or unicodedata.category(ch)[0] in ('P', 'S')))
+    return text.casefold()
 
 
 def remove_slashes(value):
@@ -223,7 +226,11 @@ def filter_main(main_df, sources, date_from='2026-01-01', status='审批完成',
         void_count = int((keep_mask & void_mask).sum())
         keep_mask = keep_mask & ~void_mask
     result_df = filtered_main_df[keep_mask].copy()
-    print(f'过滤: 范围+日期+状态={total_count}单; 作废剔除={void_count}单; 最终主表={len(result_df)}单')
+    conditions = f"流程来源∈{sources} 且 {date_col}>={date_from} 且 流程状态='{status}'"
+    if drop_void:
+        conditions += " 且 是否作废≠是"
+    print('过滤条件:', conditions)
+    print(f'  满足前三项 {total_count} 单; 其中剔除作废 {void_count} 单; 最终保留主表 {len(result_df)} 单')
     return result_df
 
 
@@ -258,9 +265,13 @@ def write_to_template(output_df, template_path, output_path, sheet_name):
 
 
 def write_exceptions(output_path, sheets):
-    """导出未匹配/待核对清单。sheets: {sheet名: DataFrame}。"""
+    """导出未匹配/待核对清单。sheets: {sheet名: DataFrame}。空表的 sheet 不生成。"""
+    non_empty = {name: df for name, df in sheets.items() if len(df) > 0}
+    if not non_empty:
+        print('  (无任何未匹配/待核对项,跳过清单文件)')
+        return None
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(output_path) as writer:
-        for sheet_name, sheet_df in sheets.items():
+        for sheet_name, sheet_df in non_empty.items():
             sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
     return output_path
