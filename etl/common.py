@@ -108,12 +108,12 @@ def to_iso_currency(currency_name):
 
 def build_employee_code_map():
     """经办人姓名 -> 工号。来源:泛微 vspn_xtyy。
-    直接取 hrmresource.LASTNAME 和 hrmresource.WORKCODE;键用 normalize_name 归一化(外籍名带空格也能对上)。"""
+    hrmresource.JOBTITLE 关联 hrmjobtitles.id 后取 hrmjobtitles.JOBTITLENAME;键用 normalize_name 归一化。"""
     conn = _db_connect('FW', 'vspn_xtyy')
     try:
         employee_df = pd.read_sql(
-            'SELECT LASTNAME employee_name, WORKCODE employee_code '
-            'FROM hrmresource',
+            'SELECT r.LASTNAME employee_name, j.JOBTITLENAME employee_code '
+            'FROM hrmresource r LEFT JOIN hrmjobtitles j ON r.JOBTITLE=j.id',
             conn)
     finally:
         conn.close()
@@ -121,7 +121,7 @@ def build_employee_code_map():
     employee_code_map = {}
     for key, employee_codes in employee_df.groupby('key')['employee_code']:
         valid_codes = [str(code).strip() for code in employee_codes.dropna().unique()
-                       if str(code).strip() not in ('', 'nan')]
+                       if str(code).strip() not in ('', 'Default', 'nan')]
         if key and valid_codes:
             employee_code_map[key] = valid_codes[0]
     return employee_code_map
