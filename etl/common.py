@@ -9,6 +9,7 @@
 """
 import os
 import re
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -48,6 +49,11 @@ def _db_connect(prefix, database):
 
 _load_env()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def today_suffix():
+    """Return the run-date suffix used by generated files."""
+    return date.today().strftime('%Y%m%d')
 
 
 # ============================ 归一化 / 格式化 ============================

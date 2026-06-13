@@ -27,11 +27,13 @@ hero-digital-etl/
 │           └── 英雄期初对公付款单导入模版.xlsx
 └── output/
     └── ap_opening_payment/             # 当前任务产出文件
-        ├── 英雄期初对公付款单导入_应付期初_v2.xlsx
-        └── 未匹配清单_应付期初_v2.xlsx
+        ├── 英雄期初对公付款单导入_应付期初_<YYYYMMDD>.xlsx
+        └── 未匹配清单_应付期初_<YYYYMMDD>.xlsx
 ```
 
 约定：每个清洗任务都使用同一个任务名作为目录名，`data/source/`、`data/templates/`、`output/` 下都要建同名文件夹，避免后续任务多了之后找不到对应 Excel。
+
+产出文件统一使用运行当天日期后缀，不再使用固定版本号，例如 `_20260614.xlsx`。
 
 ## 快速开始
 
@@ -102,7 +104,7 @@ python etl/tasks/ap_opening_payment.py
 
 ## 排查输出
 
-任务会额外生成 `output/ap_opening_payment/未匹配清单_应付期初_v2.xlsx`，用于核对以下问题：
+任务会额外生成 `output/ap_opening_payment/未匹配清单_应付期初_<YYYYMMDD>.xlsx`，用于核对以下问题：
 
 - 未匹配工号
 - 未匹配供应商

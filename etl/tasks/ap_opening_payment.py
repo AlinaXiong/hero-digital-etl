@@ -7,7 +7,7 @@
     规则 data/rules/业财项目_数据映射规则.xlsx
     泛微 vspn_xtyy(工号)   中台 hfins_base(供应商编码)
 模版 data/templates/ap_opening_payment/英雄期初对公付款单导入模版.xlsx
-产出 output/ap_opening_payment/英雄期初对公付款单导入_应付期初_v2.xlsx + output/ap_opening_payment/未匹配清单_应付期初_v2.xlsx
+产出 output/ap_opening_payment/英雄期初对公付款单导入_应付期初_<YYYYMMDD>.xlsx + output/ap_opening_payment/未匹配清单_应付期初_<YYYYMMDD>.xlsx
 
 行过滤:流程来源∈{对公付款,个人劳务付款} 且 申请日期>=2026-01-01 且 流程状态=审批完成 且 非作废
 行粒度:主子按 ID 合并(一行=一条费用明细),再按 单头键+付款行键+费用行键 分组去重
@@ -29,12 +29,13 @@ TASK_NAME = 'ap_opening_payment'
 SRC_DIR = c.SRC_DIR / TASK_NAME
 TPL_DIR = c.TPL_DIR / TASK_NAME
 OUT_DIR = c.OUT_DIR / TASK_NAME
+DATE_SUFFIX = c.today_suffix()
 
 SRC_M = SRC_DIR / 'uf_dgfktz-主表.xlsx'
 SRC_D = SRC_DIR / 'uf_dgfktz_dt1-明细表.xlsx'
 TMPL  = TPL_DIR / '英雄期初对公付款单导入模版.xlsx'
-OUT   = OUT_DIR / '英雄期初对公付款单导入_应付期初_v2.xlsx'
-EXC   = OUT_DIR / '未匹配清单_应付期初_v2.xlsx'
+OUT   = OUT_DIR / f'英雄期初对公付款单导入_应付期初_{DATE_SUFFIX}.xlsx'
+EXC   = OUT_DIR / f'未匹配清单_应付期初_{DATE_SUFFIX}.xlsx'
 TMPL_SHEET = '期初对公付款单导入'
 
 # ---- 口径 ----
