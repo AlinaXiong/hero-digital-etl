@@ -84,7 +84,7 @@ python etl/tasks/ap_opening_payment.py
 | 来源系统 | 固定 `FW` |
 | 来源单据编号、申请日期、备注、合同号、银行账号、计划付款日期 | 泛微主表 |
 | 单据类型 | 固定 `AP01-1` |
-| 申请人工号 | 泛微 `hrmresource` / `hrmjobtitles` |
+| 申请人工号 | 泛微 `vspn_xtyy.hrmresource.WORKCODE` |
 | 核算主体编号 | 中台 `hfins_base_account.hfac_accounting_entity.acc_entity_code`，仅按 `acc_entity_name` 建映射 |
 | 收款方编码 | 中台 `hfbs_system_vender.vender_code` |
 | 费用项目编码、费用项目描述 | 预算科目映射规则 |
