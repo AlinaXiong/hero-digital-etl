@@ -85,7 +85,7 @@ python etl/tasks/ap_opening_payment.py
 | 来源单据编号、申请日期、备注、合同号、银行账号、计划付款日期 | 泛微主表 |
 | 单据类型 | 固定 `AP01-1` |
 | 申请人工号 | 泛微 `hrmresource` / `hrmjobtitles` |
-| 核算主体编号 | `业财项目_数据映射规则.xlsx` 的新旧主体映射 |
+| 核算主体编号 | 中台 `hfins_base_account.hfac_accounting_entity.acc_entity_code`，仅按 `acc_entity_name` 建映射 |
 | 收款方编码 | 中台 `hfbs_system_vender.vender_code` |
 | 费用项目编码、费用项目描述 | 预算科目映射规则 |
 | 实际已支付金额 | 支付状态为已支付时取本行报账金额，否则为 `0` |
@@ -100,7 +100,14 @@ python etl/tasks/ap_opening_payment.py
 4. 任务运行后输出到 `output/<任务名>/`。
 5. 在 `run.py` 的 `TASKS` 字典登记任务名。
 
-公共逻辑尽量复用 `etl/common.py`，例如数据库连接、工号映射、供应商映射、主体映射、科目映射、币种转换、模板写入和未匹配清单输出。
+公共逻辑尽量复用 `etl/common.py`，例如数据库连接、工号映射、供应商映射、核算主体映射、科目映射、币种转换、模板写入和未匹配清单输出。
+
+## 代码规范
+
+- 代码注释和说明性 docstring 统一写中文，方便业务同学核对口径。
+- 文件名、目录名、函数名、变量名、常量名必须使用英文，不使用中文，也不使用拼音。
+- 业务字段名、Excel 表头、sheet 名和文件展示名可以保留来源系统或模板里的中文。
+- 新任务命名要能直接表达业务含义，例如 `ap_opening_payment`，不要使用 `qichu`、`yingfu` 这类拼音。
 
 ## 排查输出
 

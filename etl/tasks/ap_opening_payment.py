@@ -5,7 +5,7 @@
     主表 data/source/ap_opening_payment/uf_dgfktz-主表.xlsx        一行=一张付款申请单
     明细 data/source/ap_opening_payment/uf_dgfktz_dt1-明细表.xlsx   一行=一条费用明细(与主表按 ID 关联)
     规则 data/rules/业财项目_数据映射规则.xlsx
-    泛微 vspn_xtyy(工号)   中台 hfins_base(供应商编码)
+    泛微 vspn_xtyy(工号)   中台 hfins_base(供应商编码) / hfins_base_account(核算主体编码)
 模版 data/templates/ap_opening_payment/英雄期初对公付款单导入模版.xlsx
 产出 output/ap_opening_payment/英雄期初对公付款单导入_应付期初_<YYYYMMDD>.xlsx + output/ap_opening_payment/未匹配清单_应付期初_<YYYYMMDD>.xlsx
 
@@ -26,104 +26,127 @@ from etl import common as c
 
 # ---- 文件路径 ----
 TASK_NAME = 'ap_opening_payment'
-SRC_DIR = c.SRC_DIR / TASK_NAME
-TPL_DIR = c.TPL_DIR / TASK_NAME
-OUT_DIR = c.OUT_DIR / TASK_NAME
+SOURCE_DIR = c.SRC_DIR / TASK_NAME
+TEMPLATE_DIR = c.TPL_DIR / TASK_NAME
+OUTPUT_DIR = c.OUT_DIR / TASK_NAME
 DATE_SUFFIX = c.today_suffix()
 
-SRC_M = SRC_DIR / 'uf_dgfktz-主表.xlsx'
-SRC_D = SRC_DIR / 'uf_dgfktz_dt1-明细表.xlsx'
-TMPL  = TPL_DIR / '英雄期初对公付款单导入模版.xlsx'
-OUT   = OUT_DIR / f'英雄期初对公付款单导入_应付期初_{DATE_SUFFIX}.xlsx'
-EXC   = OUT_DIR / f'未匹配清单_应付期初_{DATE_SUFFIX}.xlsx'
-TMPL_SHEET = '期初对公付款单导入'
+SOURCE_MAIN_FILE = SOURCE_DIR / 'uf_dgfktz-主表.xlsx'
+SOURCE_DETAIL_FILE = SOURCE_DIR / 'uf_dgfktz_dt1-明细表.xlsx'
+TEMPLATE_FILE = TEMPLATE_DIR / '英雄期初对公付款单导入模版.xlsx'
+OUTPUT_FILE = OUTPUT_DIR / f'英雄期初对公付款单导入_应付期初_{DATE_SUFFIX}.xlsx'
+EXCEPTION_FILE = OUTPUT_DIR / f'未匹配清单_应付期初_{DATE_SUFFIX}.xlsx'
+TEMPLATE_SHEET = '期初对公付款单导入'
 
 # ---- 口径 ----
 SOURCES = ['对公付款', '个人劳务付款']
-# 分组去重键(整体说明 点1/2/3:单头键+付款行键+费用行键)
-DEDUP_KEY = ['来源系统', '来源单据编号', '申请日期', '单据类型', '申请人工号', '订单编号',
-             '核算主体编号', '备注', '收款方编码', '报账币种', '计划付款日期', '合同号',
-             '合同收支计划行', '银行转账备注', '报账金额（支付币种）', '费用项目编码', '主播房间号']
+DEDUP_KEY = [
+    '来源系统', '来源单据编号', '申请日期', '单据类型', '申请人工号', '订单编号',
+    '核算主体编号', '备注', '收款方编码', '报账币种', '计划付款日期', '合同号',
+    '合同收支计划行', '银行转账备注', '报账金额（支付币种）', '费用项目编码', '主播房间号',
+]
 
 
-def build_output(df, gh_map, ven_map, ent_map, sub_map):
-    """主子合并表 df -> 导入模版 24 列。每行注释 = 该字段取数来源。"""
-    def by_name(d, x):                      # 按归一化名称查映射字典
-        return '' if pd.isna(x) else d.get(c.nz(x), '')
+def build_output(merged_df, employee_code_map, vendor_map, entity_map, subject_map):
+    """主子合并表 -> 导入模版 24 列。每行注释说明该字段取数来源。"""
+    def lookup_by_name(mapping, value):  # 按归一化名称查映射字典
+        return '' if pd.isna(value) else mapping.get(c.normalize_name(value), '')
 
-    def subj(x, i):                         # 费用科目 -> (编码, 描述)
-        return sub_map.get(c.no_slash(x), ('', ''))[i] if pd.notna(x) else ''
+    def subject_item(value, index):  # 费用科目 -> (编码, 描述)
+        return subject_map.get(c.remove_slashes(value), ('', ''))[index] if pd.notna(value) else ''
 
-    pay = df['付款金额']                                                 # [明细] 本行付款金额
-    paid = df['支付状态'].astype(str).str.strip() == '已支付'
+    payment_amount = merged_df['付款金额']  # [明细] 本行付款金额
+    paid_mask = merged_df['支付状态'].astype(str).str.strip() == '已支付'
 
-    out = pd.DataFrame(index=df.index)      # 先定行索引,否则首个标量列会变空
-    out['来源系统']        = 'FW'                                          # 固定
-    out['来源单据编号']    = df['流程编号']                                 # [主表] 流程编号
-    out['申请日期']        = df['申请日期'].map(c.fdate)                    # [主表] 申请日期
-    out['单据类型']        = 'AP01-1'                                      # 固定
-    out['申请人工号']      = df['经办人'].map(lambda x: by_name(gh_map, x))  # [主表]经办人->泛微工号
-    out['申请人姓名']      = df['经办人']                                   # [主表] 经办人
-    out['订单编号']        = ''                                            # 留空(待项目->订单映射)
-    out['订单名称']        = ''
-    out['核算主体编号']    = df['公司主体'].map(lambda x: by_name(ent_map, x))  # [主表]公司主体->新主体编码
-    out['核算主体描述']    = df['公司主体']                                 # [主表] 公司主体
-    out['备注']            = df['备注'].astype(str).where(df['备注'].notna(), '').str.slice(0, 150)  # 截150字
-    out['合同号']          = df['相关合同'].where(df['相关合同'].notna(), '')  # [主表] 相关合同
-    out['合同收支计划行']  = ''                                            # 不涉及
-    out['收款方编码']      = df['供应商-文本'].map(lambda x: by_name(ven_map, x))  # [主表]供应商->中台编码
-    out['收款方描述']      = df['供应商-文本'].where(df['供应商-文本'].notna(), '')
-    out['银行账号']        = df['银行账号'].where(df['银行账号'].notna(), '')  # [主表] 银行账号
-    out['计划付款日期']    = df['预计付款日期'].map(c.fdate)                 # [主表] 预计付款日期
-    out['银行转账备注']    = ''                                            # 不涉及
-    out['实际已支付金额']  = [c.amt2(v) if p else 0 for v, p in zip(pay, paid)]  # 已支付?报账金额:0
-    out['费用项目编码']    = df['预算科目'].map(lambda x: subj(x, 0))        # [明细]预算科目->科目编码
-    out['费用项目描述']    = df['预算科目'].map(lambda x: subj(x, 1))
-    out['主播房间号']      = ''                                            # 不涉及(MCN才有)
-    out['报账币种']        = df['付款币种'].map(c.to_iso_currency)          # [主表]付款币种->ISO
-    out['报账金额（支付币种）'] = pay.map(c.amt2)                           # [明细] 付款金额
-    return out
+    output_df = pd.DataFrame(index=merged_df.index)  # 先定行索引,否则首个标量列会变空
+    output_df['来源系统'] = 'FW'  # 固定
+    output_df['来源单据编号'] = merged_df['流程编号']  # [主表] 流程编号
+    output_df['申请日期'] = merged_df['申请日期'].map(c.format_date)  # [主表] 申请日期
+    output_df['单据类型'] = 'AP01-1'  # 固定
+    output_df['申请人工号'] = merged_df['经办人'].map(
+        lambda value: lookup_by_name(employee_code_map, value))  # [主表] 经办人 -> 泛微工号
+    output_df['申请人姓名'] = merged_df['经办人']  # [主表] 经办人
+    output_df['订单编号'] = ''  # 留空(待项目 -> 订单映射)
+    output_df['订单名称'] = ''
+    output_df['核算主体编号'] = merged_df['公司主体'].map(
+        lambda value: lookup_by_name(entity_map, value))  # [主表] 公司主体 -> 中台核算主体编码
+    output_df['核算主体描述'] = merged_df['公司主体']  # [主表] 公司主体
+    output_df['备注'] = merged_df['备注'].astype(str).where(
+        merged_df['备注'].notna(), '').str.slice(0, 150)  # 截 150 字
+    output_df['合同号'] = merged_df['相关合同'].where(merged_df['相关合同'].notna(), '')  # [主表] 相关合同
+    output_df['合同收支计划行'] = ''  # 不涉及
+    output_df['收款方编码'] = merged_df['供应商-文本'].map(
+        lambda value: lookup_by_name(vendor_map, value))  # [主表] 供应商 -> 中台编码
+    output_df['收款方描述'] = merged_df['供应商-文本'].where(merged_df['供应商-文本'].notna(), '')
+    output_df['银行账号'] = merged_df['银行账号'].where(merged_df['银行账号'].notna(), '')  # [主表] 银行账号
+    output_df['计划付款日期'] = merged_df['预计付款日期'].map(c.format_date)  # [主表] 预计付款日期
+    output_df['银行转账备注'] = ''  # 不涉及
+    output_df['实际已支付金额'] = [
+        c.round_amount(value) if is_paid else 0 for value, is_paid in zip(payment_amount, paid_mask)
+    ]  # 已支付则取报账金额,否则为 0
+    output_df['费用项目编码'] = merged_df['预算科目'].map(
+        lambda value: subject_item(value, 0))  # [明细] 预算科目 -> 科目编码
+    output_df['费用项目描述'] = merged_df['预算科目'].map(lambda value: subject_item(value, 1))
+    output_df['主播房间号'] = ''  # 不涉及(MCN 才有)
+    output_df['报账币种'] = merged_df['付款币种'].map(c.to_iso_currency)  # [主表] 付款币种 -> ISO
+    output_df['报账金额（支付币种）'] = payment_amount.map(c.round_amount)  # [明细] 付款金额
+    return output_df
 
 
 def run():
     # 1. 读源表 + 过滤主表
-    m = pd.read_excel(SRC_M)
-    d = pd.read_excel(SRC_D)
-    mf = c.filter_main(m, SOURCES)
+    main_df = pd.read_excel(SOURCE_MAIN_FILE)
+    detail_df = pd.read_excel(SOURCE_DETAIL_FILE)
+    filtered_main_df = c.filter_main(main_df, SOURCES)
 
     # 2. 构建映射(数据库 + 规则表)
-    gh_map  = c.build_gonghao_map()
-    ven_map = c.build_vendor_map()
-    ent_map = c.build_entity_map(code_col='新主体编码')
-    sub_map = c.build_subject_map()
+    employee_code_map = c.build_employee_code_map()
+    vendor_map = c.build_vendor_map()
+    entity_map = c.build_accounting_entity_map()
+    subject_map = c.build_subject_map()
 
     # 3. 主子按 ID 合并 + 构建输出
-    df = d[d['ID'].isin(set(mf['ID']))].merge(mf, on='ID', suffixes=('_d', ''), how='inner')
-    out = build_output(df, gh_map, ven_map, ent_map, sub_map)
-    print('合并前明细行数:', len(out))
+    merged_df = detail_df[detail_df['ID'].isin(set(filtered_main_df['ID']))].merge(
+        filtered_main_df, on='ID', suffixes=('_detail', ''), how='inner')
+    output_df = build_output(merged_df, employee_code_map, vendor_map, entity_map, subject_map)
+    print('合并前明细行数:', len(output_df))
 
     # 4. 分组去重 + 填充率
-    out, collapsed = c.dedup_rows(out, DEDUP_KEY)
-    c.report_fill(out, ['申请人工号', '收款方编码', '核算主体编号', '费用项目编码'])
+    output_df, merged_duplicate_rows = c.dedup_rows(output_df, DEDUP_KEY)
+    c.report_fill(output_df, ['申请人工号', '收款方编码', '核算主体编号', '费用项目编码'])
 
     # 5. 写模版
-    c.write_to_template(out, TMPL, OUT, TMPL_SHEET)
-    print('已写出:', OUT)
+    c.write_to_template(output_df, TEMPLATE_FILE, OUTPUT_FILE, TEMPLATE_SHEET)
+    print('已写出:', OUTPUT_FILE)
 
     # 6. 未匹配 / 待核对清单
-    sup  = set(mf['供应商-文本'].dropna().astype(str).str.strip())
-    comp = set(mf['公司主体'].dropna().astype(str).str.strip())
-    subjs = set(df['预算科目'].dropna().astype(str).str.strip())
-    emp  = set(mf['经办人'].dropna().astype(str).str.strip())
+    vendor_names = set(filtered_main_df['供应商-文本'].dropna().astype(str).str.strip())
+    company_names = set(filtered_main_df['公司主体'].dropna().astype(str).str.strip())
+    subject_names = set(merged_df['预算科目'].dropna().astype(str).str.strip())
+    employee_names = set(filtered_main_df['经办人'].dropna().astype(str).str.strip())
     sheets = {
-        '未匹配_工号':     pd.DataFrame({'未匹配_经办人(工号)':   sorted(s for s in emp if c.nz(s) not in gh_map)}),
-        '未匹配_供应商':   pd.DataFrame({'未匹配_供应商(收款方编码)': sorted(s for s in sup if c.nz(s) not in ven_map)}),
-        '未匹配_核算主体': pd.DataFrame({'未匹配_公司主体(核算主体)': sorted(s for s in comp if c.nz(s) not in ent_map)}),
-        '未匹配_费用科目': pd.DataFrame({'未匹配_预算科目(费用项目)': sorted(s for s in subjs if c.no_slash(s) not in sub_map)}),
-        '分组合并_待核对': collapsed,
+        '未匹配_工号': pd.DataFrame({
+            '未匹配_经办人(工号)': sorted(
+                name for name in employee_names if c.normalize_name(name) not in employee_code_map)
+        }),
+        '未匹配_供应商': pd.DataFrame({
+            '未匹配_供应商(收款方编码)': sorted(
+                name for name in vendor_names if c.normalize_name(name) not in vendor_map)
+        }),
+        '未匹配_核算主体': pd.DataFrame({
+            '未匹配_公司主体(核算主体)': sorted(
+                name for name in company_names if c.normalize_name(name) not in entity_map)
+        }),
+        '未匹配_费用科目': pd.DataFrame({
+            '未匹配_预算科目(费用项目)': sorted(
+                name for name in subject_names if c.remove_slashes(name) not in subject_map)
+        }),
+        '分组合并_待核对': merged_duplicate_rows,
     }
-    c.write_exceptions(EXC, sheets)
-    print('已写出:', EXC, '| 各清单条数:', {k: len(v) for k, v in sheets.items()})
+    c.write_exceptions(EXCEPTION_FILE, sheets)
+    print('已写出:', EXCEPTION_FILE, '| 各清单条数:', {
+        sheet_name: len(sheet_df) for sheet_name, sheet_df in sheets.items()
+    })
 
 
 if __name__ == '__main__':
