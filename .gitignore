@@ -1,0 +1,13 @@
+# 密钥
+.env
+# 产出
+output/
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+# IDE
+.idea/
+# 临时
+~$*.xlsx
