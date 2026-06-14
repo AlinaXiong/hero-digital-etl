@@ -127,7 +127,8 @@ def to_iso_currency(currency_name):
 
 def build_employee_code_map():
     """经办人姓名 -> 工号。来源:泛微 vspn_xtyy。
-    hrmresource.JOBTITLE 关联 hrmjobtitles.id 后取 hrmjobtitles.JOBTITLENAME;键用 normalize_name 归一化。"""
+    hrmresource.JOBTITLE 关联 hrmjobtitles.id 后取 hrmjobtitles.JOBTITLENAME;键用 normalize_name 归一化。
+    取到占位值 'Default' 也算匹配、不留空(同名有真实工号时优先真实工号)-- 20260614Leo确认。"""
     conn = _db_connect('FW', 'vspn_xtyy')
     try:
         employee_df = pd.read_sql(
@@ -139,10 +140,13 @@ def build_employee_code_map():
     employee_df['key'] = employee_df['employee_name'].map(normalize_name)
     employee_code_map = {}
     for key, employee_codes in employee_df.groupby('key')['employee_code']:
-        valid_codes = [str(code).strip() for code in employee_codes.dropna().unique()
-                       if str(code).strip() not in ('', 'Default', 'nan')]
-        if key and valid_codes:
-            employee_code_map[key] = valid_codes[0]
+        values = [str(code).strip() for code in employee_codes.dropna().unique()
+                  if str(code).strip() not in ('', 'nan')]
+        real_codes = [code for code in values if code != 'Default']
+        # 取到 Default 也算匹配、不留空;同名有真实工号时优先真实工号 -- Leo确认
+        chosen = real_codes[0] if real_codes else (values[0] if values else None)
+        if key and chosen:
+            employee_code_map[key] = chosen
     return employee_code_map
 
 
@@ -188,24 +192,109 @@ def build_accounting_entity_map():
     return entity_map
 
 
+def build_fw_company_map():
+    """泛微公司主体ID -> 公司主体名称。来源:泛微 vspn_xtyy.uf_gstt。"""
+    conn = _db_connect('FW', 'vspn_xtyy')
+    try:
+        company_df = pd.read_sql(
+            'SELECT id company_id, gsmc company_name '
+            'FROM uf_gstt',
+            conn)
+    finally:
+        conn.close()
+    company_map = {}
+    for _, row in company_df.iterrows():
+        company_id = format_code(row['company_id'])
+        company_name = str(row['company_name']).strip()
+        if company_id and company_name and company_name != 'nan':
+            company_map[company_id] = company_name
+    return company_map
+
+
+def _cell_text(value):
+    """Excel 单元格文本归一化: 空值/nan/None -> ''。"""
+    if pd.isna(value):
+        return ''
+    text = str(value).strip()
+    return '' if text in ('', 'nan', 'None', 'NaT') else text
+
+
+def _joined_row_key(row, columns):
+    return remove_slashes(''.join(_cell_text(row[column]) for column in columns if column < len(row)))
+
+
+def _first_subject_pair(row, pairs):
+    """按优先级读取 (费用项目编码, 费用项目描述) 列对。"""
+    for code_column, name_column in pairs:
+        code = _cell_text(row[code_column]) if code_column < len(row) else ''
+        name = _cell_text(row[name_column]) if name_column < len(row) else ''
+        if code and code != '\\':
+            return code, name
+    return '', ''
+
+
+def _read_rule_sheet(sheet_name):
+    return pd.read_excel(RULE_XLSX, sheet_name=sheet_name, header=None, engine='calamine')
+
+
 def build_subject_map():
     """费用科目(预算科目)-> (费用项目编码, 费用项目描述)。
     来源:规则表「赛事/MCN 新旧预算项科目-调整后」。键=各级科目名拼接去'/';值=调整后三级预算编码+三级费用项。"""
     subject_map = {}
-    event_budget_df = pd.read_excel(RULE_XLSX, sheet_name='赛事新旧预算项科目-调整后', header=None)
+    event_base_df = _read_rule_sheet('赛事泛微新旧科目映射底表')
+    event_base_map = {}
+    for _, row in event_base_df.iloc[1:].iterrows():
+        key = remove_slashes(_cell_text(row[5]))
+        code, name = _first_subject_pair(row, ((6, 7),))
+        if key and code:
+            event_base_map[key] = (code, name)
+
+    event_budget_df = _read_rule_sheet('赛事新旧预算项科目-调整后')
     for _, row in event_budget_df.iloc[2:].iterrows():
-        key = remove_slashes(row[15])
-        subject_code = str(row[21]).strip()
-        subject_name = str(row[22]).strip()
-        if key and key != 'nan' and subject_code != 'nan':
-            subject_map[key] = (subject_code, subject_name)
-    mcn_budget_df = pd.read_excel(RULE_XLSX, sheet_name='MCN新旧预算项科目-调整后', header=None)
+        keys = {_joined_row_key(row, (2, 5, 8, 11, 14)), remove_slashes(_cell_text(row[15]))}
+        for key in (k for k in keys if k):
+            subject_code, subject_name = _first_subject_pair(row, ((21, 22), (19, 20), (17, 18)))
+            if not subject_code:
+                subject_code, subject_name = event_base_map.get(key, ('', ''))
+            if subject_code:
+                subject_map[key] = (subject_code, subject_name)
+
+    mcn_base_df = _read_rule_sheet('MCN泛微新旧科目映射底表')
+    mcn_code_to_name = {}
+    mcn_code_to_subject = {}
+    mcn_name_to_subject = {}
+    for _, row in mcn_base_df.iloc[2:].iterrows():
+        old_code = _cell_text(row[1])
+        old_name = _cell_text(row[2])
+        subject_code, subject_name = _first_subject_pair(row, ((5, 6),))
+        if old_code and old_name:
+            mcn_code_to_name[old_code] = old_name
+        if old_code and subject_code:
+            mcn_code_to_subject[old_code] = (subject_code, subject_name)
+        if old_name and subject_code:
+            mcn_name_to_subject[old_name] = (subject_code, subject_name)
+
+    mcn_budget_df = _read_rule_sheet('MCN新旧预算项科目-调整后')
     for _, row in mcn_budget_df.iloc[2:].iterrows():
-        key = remove_slashes(''.join(str(row[column]) for column in (1, 3, 5) if str(row[column]) != 'nan'))
-        subject_code = str(row[11]).strip() if str(row[11]) != 'nan' else str(row[7]).strip()
-        subject_name = str(row[8]).strip()
-        if key and subject_code != 'nan':
-            subject_map.setdefault(key, (subject_code, subject_name))
+        codes = [_cell_text(row[column]) for column in (0, 2, 4) if column < len(row)]
+        names = [_cell_text(row[column]) or mcn_code_to_name.get(code, '') for column, code in zip((1, 3, 5), codes)]
+        keys = {
+            _joined_row_key(row, (1, 3, 5)),
+            remove_slashes(''.join(name for name in names if name)),
+            remove_slashes(''.join(code for code in codes if code)),
+        }
+        subject_code, subject_name = _first_subject_pair(row, ((11, 12), (9, 10), (7, 8)))
+        if not subject_code:
+            deepest_code = next((code for code in reversed(codes) if code), '')
+            deepest_name = next((name for name in reversed(names) if name), '')
+            subject_code, subject_name = (
+                mcn_code_to_subject.get(deepest_code)
+                or mcn_name_to_subject.get(deepest_name)
+                or ('', '')
+            )
+        if subject_code:
+            for key in (k for k in keys if k):
+                subject_map.setdefault(key, (subject_code, subject_name))
     return subject_map
 
 
@@ -224,18 +313,17 @@ def dedup_rows(output_df, key_cols):
     return deduped_rows, merged_rows
 
 
-def required_columns(template_path, sheet_name, header_row=1):
-    """读模版表头,返回有底色(必输)的列名列表。模版里黄色等实心底色=必输字段。"""
-    worksheet = load_workbook(template_path)[sheet_name]
+def required_columns(rule_sheet, table_name):
+    """必输字段以【规则表的「是否必填」列=Y】。
+    从规则表 rule_sheet 内、表名列=table_name 的行里,取「是否必填」=Y 的字段名。
+    规则列:0=模块 1=表名 2=字段名 3=是否必填。"""
+    df = pd.read_excel(RULE_XLSX, sheet_name=rule_sheet, header=None, engine='calamine')
     columns = []
-    for col in range(1, worksheet.max_column + 1):
-        cell = worksheet.cell(header_row, col)
-        fill = cell.fill
-        rgb = fill.fgColor.rgb if (fill is not None and fill.fgColor is not None) else None
-        is_colored = (fill is not None and fill.patternType == 'solid'
-                      and str(rgb) not in ('00000000', 'FFFFFFFF', 'None', 'None'))
-        if is_colored and cell.value not in (None, ''):
-            columns.append(str(cell.value))
+    for _, row in df.iloc[2:].iterrows():
+        if str(row[1]).strip() == table_name and str(row[3]).strip() == 'Y':
+            field = str(row[2]).strip()
+            if field and field != 'nan' and field not in columns:
+                columns.append(field)
     return columns
 
 
@@ -290,14 +378,29 @@ def fill_summary(output_df, columns):
 
 
 # ============================ Excel 输出 ============================
-def write_to_template(output_df, template_path, output_path, sheet_name):
-    """写进导入模版(保留表头与 lov 下拉页),从第 2 行覆盖写入。"""
-    wb = load_workbook(template_path)
-    ws = wb[sheet_name]
-    if ws.max_row > 1:
-        ws.delete_rows(2, ws.max_row)
+def _fill_sheet(worksheet, output_df):
+    """把 output_df 按列顺序写进 worksheet(保留表头第1行,清空旧数据行)。列名不影响,只看顺序。"""
+    if worksheet.max_row > 1:
+        worksheet.delete_rows(2, worksheet.max_row)
     for _, row in output_df.iterrows():
-        ws.append(['' if pd.isna(v) else v for v in row.tolist()])
+        worksheet.append(['' if pd.isna(v) else v for v in row.tolist()])
+
+
+def write_to_template(output_df, template_path, output_path, sheet_name):
+    """写进导入模版单个 sheet(保留表头与 lov 下拉页),从第 2 行覆盖写入。"""
+    wb = load_workbook(template_path)
+    _fill_sheet(wb[sheet_name], output_df)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(output_path)
+    return output_path
+
+
+def write_template_sheets(template_path, output_path, sheet_to_df):
+    """一次把多个 sheet 写进同一个导入模版(保留各表头与 lov 页)。
+    sheet_to_df: {sheet名: DataFrame};DataFrame 列顺序需与该 sheet 表头一致(列名不影响)。"""
+    wb = load_workbook(template_path)
+    for sheet_name, output_df in sheet_to_df.items():
+        _fill_sheet(wb[sheet_name], output_df)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
     return output_path

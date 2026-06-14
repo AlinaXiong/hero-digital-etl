@@ -37,6 +37,8 @@ TEMPLATE_FILE = TEMPLATE_DIR / '英雄期初对公付款单导入模版.xlsx'
 OUTPUT_FILE = OUTPUT_DIR / f'英雄期初对公付款单导入_应付期初_{DATE_SUFFIX}.xlsx'
 EXCEPTION_FILE = OUTPUT_DIR / f'未匹配清单_应付期初_{DATE_SUFFIX}.xlsx'
 TEMPLATE_SHEET = '期初对公付款单导入'
+RULE_SHEET = '应付期初'              # 规则表 sheet(必填字段以其「是否必填」列为准)
+RULE_TABLE = '期初对公付款单'        # 规则表内本任务目标表名
 
 # ---- 口径 ----
 SOURCES = ['对公付款', '个人劳务付款']
@@ -135,8 +137,8 @@ def run():
     output_df = build_output(merged_df, employee_code_map, vendor_map, entity_map, subject_map)
     print('输出明细行数:', len(output_df))
 
-    # 4. 填充率(模版中所有有底色的必输字段)
-    required_cols = c.required_columns(TEMPLATE_FILE, TEMPLATE_SHEET)
+    # 4. 填充率(必输字段以规则表「是否必填」=Y 为准)
+    required_cols = c.required_columns(RULE_SHEET, RULE_TABLE)
     c.report_fill(output_df, required_cols)
 
     # 5. 写模版

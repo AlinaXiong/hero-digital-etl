@@ -8,8 +8,8 @@
     泛微 vspn_xtyy(工号)   中台 hfins_base(供应商编码) / hfins_base_account(核算主体编码)
 模版 data/templates/ap_prepayment_opening/英雄期初预付款单导入模版.xlsx
     - Tab「期初供应商预付款单&期初投资付款单导入」:本任务输出(26 列)
-    - Tab「期初灵工预付款单导入」:灵工(零工平台付款)专用,数据源为对外付款主表 + 零工实际收款人明细,
-      不在本任务的源文件内,暂不生成(见文末说明)。
+    - Tab「期初灵工预付款单导入」:灵工(零工平台付款),源 = 零工平台付款_收款人明细_2026.xlsx
+      (付款头数据=uf_lgptfk + 实际收款人明细),过滤 流程状态=2(审批完成)+ 申请日期>=2026-01-01 + 非作废。
 产出 output/ap_prepayment_opening/英雄期初预付款单导入_预付期初_<YYYYMMDD>.xlsx + 未匹配清单_预付期初_<YYYYMMDD>.xlsx
 
 行过滤:申请日期>=2026-01-01(今年)且 流程状态=审批完成 且 非作废
@@ -45,6 +45,8 @@ TEMPLATE_FILE = TEMPLATE_DIR / '英雄期初预付款单导入模版.xlsx'
 OUTPUT_FILE = OUTPUT_DIR / f'英雄期初预付款单导入_预付期初_{DATE_SUFFIX}.xlsx'
 EXCEPTION_FILE = OUTPUT_DIR / f'未匹配清单_预付期初_{DATE_SUFFIX}.xlsx'
 TEMPLATE_SHEET_SUPPLIER = '期初供应商预付款单&期初投资付款单导入'
+RULE_SHEET = '预付期初'                                       # 规则表 sheet
+RULE_TABLE_SUPPLIER = '期初供应商预付款单&期初投资付款单导入'  # 规则表内供应商预付目标表名
 
 # ---- 口径 ----
 APPROVED_STATUS = '审批完成'
@@ -61,6 +63,22 @@ ISSUE_SOURCE_FIELDS = {
     '订单编号': '项目编号',
 }
 
+# ======== 灵工预付款单(模版第二个 tab:期初灵工预付款单导入)========
+GIG_SOURCE_FILE = SOURCE_DIR / '零工平台付款_收款人明细_2026.xlsx'
+GIG_HEADER_SHEET = '付款头数据'        # 单头(uf_lgptfk,已含申请人工号V码、公司主体ID等)
+GIG_DETAIL_SHEET = '实际收款人明细'    # 收款人(按 建模付款ID 关联单头)
+TEMPLATE_SHEET_GIG = '期初灵工预付款单导入'
+RULE_TABLE_GIG = '期初灵工预付款单导入'  # 规则表内灵工预付目标表名
+GIG_DOCUMENT_TYPE = 'PP01-2'           # 灵工预付款单(期初)
+GIG_APPROVED_CODE = 2                  # 付款头数据 流程状态数字码:2=审批完成(经与 uf_dgfktz 中文状态交叉验证)
+# 灵工平台收款方编码:按收款方文本关键字映射(规则 R40)
+GIG_PLATFORM_VENDOR = {'云账户': 'V-C-CN-HR-PAY-0001', '赛利得': 'V-C-CN-OT-OTH-6573'}
+GIG_ISSUE_SOURCE_FIELDS = {
+    '申请人工号': '经办人',
+    '灵工平台收款方编码': '收款方文本',
+    '核算主体编号': '公司主体ID',
+}
+
 
 def filter_main(main_df):
     """预付主表行过滤:申请日期>=DATE_FROM(今年)且 流程状态=审批完成 且 非作废。"""
@@ -71,7 +89,7 @@ def filter_main(main_df):
     void_mask = df['是否作废'].astype(str).str.strip() == '是'
     void_count = int((keep_mask & void_mask).sum())
     result_df = df[keep_mask & ~void_mask].copy()
-    print(f"过滤条件: 申请日期>={DATE_FROM} 且 流程状态='{APPROVED_STATUS}' 且 是否作废≠是")
+    print(f"供应商过滤条件: 申请日期>={DATE_FROM} 且 流程状态='{APPROVED_STATUS}' 且 是否作废≠是")
     print(f'  满足前两项 {matched_count} 单; 其中剔除作废 {void_count} 单; 最终保留主表 {len(result_df)} 单')
     return result_df
 
@@ -128,6 +146,84 @@ def build_output(merged_df, employee_code_map, vendor_map, entity_map, subject_m
     return output_df
 
 
+# ======================= 灵工预付款单(模版第二个 tab) =======================
+def gig_platform_vendor(name):
+    """收款方文本 -> 灵工平台收款方编码(规则 R40:云账户/赛利得)。"""
+    text = '' if pd.isna(name) else str(name)
+    for keyword, code in GIG_PLATFORM_VENDOR.items():
+        if keyword in text:
+            return code
+    return ''
+
+
+def gig_recipient_remark(name, id_number, phone):
+    """收款人备注(规则 R50):姓名-身份证-手机号 拼接,限 30 字。"""
+    parts = [str(v).strip() for v in (name, id_number, phone) if pd.notna(v) and str(v).strip() not in ('', 'nan')]
+    return '-'.join(parts)[:30]
+
+
+def build_gig_output(header_df, detail_df, company_map, entity_map):
+    """灵工:付款头数据(单头)+ 实际收款人明细(收款人)-> 模版「期初灵工预付款单导入」29 列。
+    一行=一个收款人。返回 (输出表, 关联后明细表)。"""
+    header = header_df.copy()
+    header['申请日期'] = pd.to_datetime(header['申请日期'], errors='coerce')
+    matched_mask = (header['流程状态'] == GIG_APPROVED_CODE) & (header['申请日期'] >= DATE_FROM)
+    matched_count = int(matched_mask.sum())
+    void_mask = header['是否作废'].astype(str).str.strip().isin(['是', '1', '1.0'])
+    void_count = int((matched_mask & void_mask).sum())
+    header_kept = header[matched_mask & ~void_mask]
+    print(f"零工过滤条件: 申请日期>={DATE_FROM} 且 流程状态={GIG_APPROVED_CODE}(审批完成) 且 是否作废≠是")
+    print(f'  满足前两项 {matched_count} 单; 其中剔除作废 {void_count} 单; 最终保留主表 {len(header_kept)} 单')
+
+    # 取单头补充字段,与明细按 建模付款ID 关联(明细已含 流程编号/申请日期/收款人/金额/银行账号)
+    header_cols = ['建模付款ID', '经办人', '经办人工号', '收款方文本', '备注', '合同名称', '预计付款日期', '公司主体ID']
+    merged = detail_df.merge(header_kept[header_cols], on='建模付款ID', how='inner')
+    if '公司主体ID' not in merged.columns:
+        for column in ('公司主体ID_y', '公司主体ID_x'):
+            if column in merged.columns:
+                merged['公司主体ID'] = merged[column]
+                break
+    if '公司主体ID' not in merged.columns:
+        merged['公司主体ID'] = ''
+    print('[零工预付款] 输出明细行数:', len(merged))
+
+    company_names = merged['公司主体ID'].map(lambda value: company_map.get(c.format_code(value), ''))
+
+    out = pd.DataFrame(index=merged.index)
+    out['来源系统'] = 'FW'                                                      # 固定
+    out['来源单据编号'] = merged['流程编号']                                     # [头/明细] 流程编号
+    out['申请日期'] = merged['申请日期'].map(c.format_date)                      # [明细] 申请日期
+    out['单据类型'] = GIG_DOCUMENT_TYPE                                         # PP01-2
+    out['申请人工号'] = merged['经办人工号']                                     # [头] 经办人工号(V码,现成)
+    out['申请人姓名'] = merged['经办人']                                         # [头] 经办人
+    out['订单编号'] = ''                                                        # 留空(待项目->订单映射)
+    out['订单名称'] = ''
+    out['核算主体编号'] = company_names.map(
+        lambda value: entity_map.get(c.normalize_name(value), '') if value else '')  # 公司主体ID -> 泛微公司名 -> 中台核算主体编码
+    out['核算主体描述'] = company_names
+    out['备注_单头'] = merged['备注'].astype(str).where(merged['备注'].notna(), '').str.slice(0, 150)  # 模版第11列(单头备注)
+    out['灵工平台收款方编码'] = merged['收款方文本'].map(gig_platform_vendor)      # [头] 收款方文本 -> 平台编码
+    out['合同号'] = merged['合同名称'].where(merged['合同名称'].notna(), '')      # [头] 合同名称
+    out['合同收支计划行'] = ''                                                  # 不涉及
+    out['保证金标志'] = '否'                                                    # 默认否(R43)
+    out['计划付款日期'] = merged['预计付款日期'].map(c.format_date)              # [头] 预计付款日期
+    out['银行转账备注'] = ''                                                    # 不涉及
+    out['费用项目编码'] = ''                                                    # 规则R46缺表,无来源,暂空
+    out['费用项目描述'] = ''
+    out['收款方类别'] = '供应商'                                                # 默认供应商(R48)
+    out['收款方编码'] = ''                                                      # 规则R49造虚拟供应商,上线后停用,暂空
+    out['备注'] = [gig_recipient_remark(n, i, p)                                # 模版第22列:姓名-身份证-手机号(R50)
+                  for n, i, p in zip(merged['实际收款方'], merged['身份证号'], merged['手机号'])]
+    out['银行账号'] = merged['银行账号'].where(merged['银行账号'].notna(), '')   # [明细] 银行账号
+    out['预付款支付币种'] = 'CNY'                                               # 默认CNY(R52)
+    out['预付款金额（支付币种）'] = pd.to_numeric(merged['付给三方平台金额'], errors='coerce').map(c.round_amount)  # [明细] 付给三方平台金额
+    out['传送状态'] = '传送成功'                                                # 默认(R54)
+    out['支付状态'] = '支付成功'                                                # 默认支付成功(R55)
+    out['退款状态'] = ''                                                        # 不涉及(R56)
+    out['核销状态'] = '已核销'                                                  # 默认已核销(R57)
+    return out, merged
+
+
 def run():
     # 1. 读源表 + 过滤主表
     main_df = pd.read_excel(SOURCE_MAIN_FILE)
@@ -138,29 +234,45 @@ def run():
     employee_code_map = c.build_employee_code_map()
     vendor_map = c.build_vendor_map()
     entity_map = c.build_accounting_entity_map()
+    company_map = c.build_fw_company_map()
     subject_map = c.build_subject_map()
 
-    # 3. 主子按 ID 合并 + 构建输出
+    # 3. 供应商预付款 tab:主子按 ID 合并 + 构建输出
     merged_df = detail_df[detail_df['ID'].isin(set(filtered_main_df['ID']))].merge(
         filtered_main_df, on='ID', suffixes=('_detail', ''), how='inner')
     output_df = build_output(merged_df, employee_code_map, vendor_map, entity_map, subject_map)
-    print('输出明细行数:', len(output_df))
+    print('[供应商预付款] 输出明细行数:', len(output_df))
 
-    # 4. 填充率(模版中所有有底色的必输字段)
-    required_cols = c.required_columns(TEMPLATE_FILE, TEMPLATE_SHEET_SUPPLIER)
-    c.report_fill(output_df, required_cols)
+    # 4. 灵工预付款 tab:付款头数据 + 实际收款人明细
+    gig_header_df = pd.read_excel(GIG_SOURCE_FILE, sheet_name=GIG_HEADER_SHEET)
+    gig_detail_df = pd.read_excel(GIG_SOURCE_FILE, sheet_name=GIG_DETAIL_SHEET)
+    gig_output_df, gig_merged_df = build_gig_output(gig_header_df, gig_detail_df, company_map, entity_map)
 
-    # 5. 写模版(只写供应商预付款 tab;灵工 tab 与 lov 页保留不动)
-    c.write_to_template(output_df, TEMPLATE_FILE, OUTPUT_FILE, TEMPLATE_SHEET_SUPPLIER)
+    # 5. 填充率(必输字段以规则表「是否必填」=Y 为准)
+    supplier_required = c.required_columns(RULE_SHEET, RULE_TABLE_SUPPLIER)
+    gig_required = c.required_columns(RULE_SHEET, RULE_TABLE_GIG)
+    print('— 供应商预付款 填充率 —')
+    c.report_fill(output_df, supplier_required)
+    print('— 灵工预付款 填充率 —')
+    c.report_fill(gig_output_df, gig_required)
+
+    # 6. 写模版(两个 tab 一次写入,lov 页保留)
+    c.write_template_sheets(TEMPLATE_FILE, OUTPUT_FILE, {
+        TEMPLATE_SHEET_SUPPLIER: output_df,
+        TEMPLATE_SHEET_GIG: gig_output_df,
+    })
     print('已写出:', OUTPUT_FILE)
 
-    # 6. 问题清单:必输字段未达100%汇总 + 每个有缺失的必输字段的缺失明细(自动覆盖全部必输字段)
-    sheets = {'必输字段未达100%': c.fill_summary(output_df, required_cols)}
-    sheets.update(c.collect_field_issues(output_df, merged_df, required_cols, ISSUE_SOURCE_FIELDS))
-    c.write_exceptions(EXCEPTION_FILE, sheets)
-    print('已写出:', EXCEPTION_FILE, '| 各清单条数:', {
-        sheet_name: len(sheet_df) for sheet_name, sheet_df in sheets.items()
-    })
+    # 7. 问题清单(一个文件,sheet 名按 tab 前缀「供应商_」「灵工_」区分):必输字段未达100% + 缺失明细
+    exception_sheets = {}
+    supplier_sheets = {'必输字段未达100%': c.fill_summary(output_df, supplier_required)}
+    supplier_sheets.update(c.collect_field_issues(output_df, merged_df, supplier_required, ISSUE_SOURCE_FIELDS))
+    exception_sheets.update({f'供应商_{name}': df for name, df in supplier_sheets.items()})
+    gig_sheets = {'必输字段未达100%': c.fill_summary(gig_output_df, gig_required)}
+    gig_sheets.update(c.collect_field_issues(gig_output_df, gig_merged_df, gig_required, GIG_ISSUE_SOURCE_FIELDS))
+    exception_sheets.update({f'灵工_{name}': df for name, df in gig_sheets.items()})
+    c.write_exceptions(EXCEPTION_FILE, exception_sheets)
+    print('已写出:', EXCEPTION_FILE, '| 各清单条数:', {k: len(v) for k, v in exception_sheets.items()})
 
 
 if __name__ == '__main__':
