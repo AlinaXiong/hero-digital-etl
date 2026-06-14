@@ -248,15 +248,30 @@ def report_fill(output_df, columns):
         print(f'  {column} 填充率: {filled_count}/{len(output_df)} = {filled_count/len(output_df)*100:.1f}%')
 
 
-def collect_unmatched(checks):
-    """按映射检查清单收集未匹配名称,只为【有未匹配项】的检查生成 sheet(没匹配上才加)。
-    checks: 可迭代,每项 = (sheet名, 列标题, 名称集合, 映射字典, 归一化函数)。
-    返回 {sheet名: DataFrame}。新增一类检查 = 在调用处的清单里加一行即可。"""
+def collect_field_issues(output_df, source_df, required_cols, source_field_map, doc_col='来源单据编号'):
+    """驱动于必输字段:遍历所有必输字段,凡【部分缺失】(0<缺失<全部)的,各生成一张
+    「缺失_<字段>」明细 sheet。每张只两列:来源单据编号 + 泛微原表-<源字段>(没匹配上的原始值)。
+    不写死具体字段;以后新增必输字段自动纳入。
+    全空字段(如尚未映射的订单编号)只在「必输字段未达100%」汇总里体现,不出明细(避免整表导出)。
+        output_df         输出宽表(含 doc_col;用于判断缺失)
+        source_df         与 output_df 同索引的主子合并表(取泛微原始字段值)
+        required_cols     必输字段(通常来自 required_columns(模版))
+        source_field_map  {输出必输字段: source_df 里对应的泛微源字段名}
+        doc_col           单据编号列(默认输出里的「来源单据编号」)"""
     sheets = {}
-    for sheet_name, column_label, names, mapping, key_func in checks:
-        missing = sorted(name for name in names if key_func(name) not in mapping)
-        if missing:
-            sheets[sheet_name] = pd.DataFrame({column_label: missing})
+    total = len(output_df)
+    for column in required_cols:
+        if column not in output_df.columns:
+            continue
+        blank_mask = output_df[column].astype(str).str.strip() == ''
+        missing_count = int(blank_mask.sum())
+        if not (0 < missing_count < total):
+            continue
+        data = {doc_col: output_df.loc[blank_mask, doc_col].astype(str)}
+        source_field = source_field_map.get(column)
+        if source_field and source_field in source_df.columns:
+            data[f'泛微原表-{source_field}'] = source_df.loc[blank_mask, source_field].astype(str)
+        sheets[f'缺失_{column}'] = pd.DataFrame(data).drop_duplicates().reset_index(drop=True)
     return sheets
 
 

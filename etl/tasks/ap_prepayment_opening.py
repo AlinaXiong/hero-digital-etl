@@ -51,6 +51,15 @@ APPROVED_STATUS = '审批完成'
 DATE_FROM = '2026-01-01'           # 只取今年(申请日期>=本日期)
 DOCUMENT_TYPE = 'JK01-2'           # 供应商预付单(期初);投资付款单为 PP02-2,规则未给判定标准,暂统一 JK01-2,待业务确认
 DEPOSIT_PAYMENT_NATURES = ['押金', '质保金']  # 付款性质命中这些 -> 保证金标志=是
+# 缺失明细第二列:{输出必输字段: 泛微源字段};缺失明细展示 来源单据编号 + 泛微原表-<源字段>
+ISSUE_SOURCE_FIELDS = {
+    '申请人工号': '填单人',
+    '收款方编码': '付款对象',
+    '核算主体编号': '开票单位',
+    '费用项目编码': '预算科目',
+    '预付款支付币种': '付款币种',
+    '订单编号': '项目编号',
+}
 
 
 def filter_main(main_df):
@@ -145,20 +154,9 @@ def run():
     c.write_to_template(output_df, TEMPLATE_FILE, OUTPUT_FILE, TEMPLATE_SHEET_SUPPLIER)
     print('已写出:', OUTPUT_FILE)
 
-    # 6. 未匹配清单
-    employee_names = set(filtered_main_df['填单人'].dropna().astype(str).str.strip())
-    vendor_names = set(filtered_main_df['付款对象'].dropna().astype(str).str.strip())
-    entity_names = set(filtered_main_df['开票单位'].dropna().astype(str).str.strip())
-    subject_names = set(merged_df['预算科目'].dropna().astype(str).str.strip())
-    # 映射检查清单:(sheet名, 列标题, 名称集合, 映射字典, 归一化函数);新增一类检查在此加一行
-    unmatched_checks = [
-        ('未匹配_工号', '未匹配_填单人(工号)', employee_names, employee_code_map, c.normalize_name),
-        ('未匹配_供应商', '未匹配_付款对象(收款方编码)', vendor_names, vendor_map, c.normalize_name),
-        ('未匹配_核算主体', '未匹配_开票单位(核算主体)', entity_names, entity_map, c.normalize_name),
-        ('未匹配_费用科目', '未匹配_预算科目(费用项目)', subject_names, subject_map, c.remove_slashes),
-    ]
+    # 6. 问题清单:必输字段未达100%汇总 + 每个有缺失的必输字段的缺失明细(自动覆盖全部必输字段)
     sheets = {'必输字段未达100%': c.fill_summary(output_df, required_cols)}
-    sheets.update(c.collect_unmatched(unmatched_checks))  # 没匹配上的才会生成对应 sheet
+    sheets.update(c.collect_field_issues(output_df, merged_df, required_cols, ISSUE_SOURCE_FIELDS))
     c.write_exceptions(EXCEPTION_FILE, sheets)
     print('已写出:', EXCEPTION_FILE, '| 各清单条数:', {
         sheet_name: len(sheet_df) for sheet_name, sheet_df in sheets.items()
