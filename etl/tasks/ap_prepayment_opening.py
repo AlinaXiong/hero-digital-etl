@@ -77,6 +77,7 @@ GIG_ISSUE_SOURCE_FIELDS = {
     '申请人工号': '经办人',
     '灵工平台收款方编码': '收款方文本',
     '核算主体编号': '公司主体ID',
+    '收款方编码': '实际收款方',
 }
 
 
@@ -162,7 +163,7 @@ def gig_recipient_remark(name, id_number, phone):
     return '-'.join(parts)[:30]
 
 
-def build_gig_output(header_df, detail_df, company_map, entity_map):
+def build_gig_output(header_df, detail_df, vendor_map, company_map, entity_map):
     """灵工:付款头数据(单头)+ 实际收款人明细(收款人)-> 模版「期初灵工预付款单导入」29 列。
     一行=一个收款人。返回 (输出表, 关联后明细表)。"""
     header = header_df.copy()
@@ -189,6 +190,15 @@ def build_gig_output(header_df, detail_df, company_map, entity_map):
 
     company_names = merged['公司主体ID'].map(lambda value: company_map.get(c.format_code(value), ''))
 
+    def gig_payee_code(value):
+        if pd.isna(value):
+            return ''
+        payee = str(value).strip()
+        if not payee or payee == 'nan':
+            return ''
+        key = c.normalize_name(value)
+        return vendor_map.get(key) or payee
+
     out = pd.DataFrame(index=merged.index)
     out['来源系统'] = 'FW'                                                      # 固定
     out['来源单据编号'] = merged['流程编号']                                     # [头/明细] 流程编号
@@ -211,7 +221,7 @@ def build_gig_output(header_df, detail_df, company_map, entity_map):
     out['费用项目编码'] = ''                                                    # 规则R46缺表,无来源,暂空
     out['费用项目描述'] = ''
     out['收款方类别'] = '供应商'                                                # 默认供应商(R48)
-    out['收款方编码'] = ''                                                      # 规则R49造虚拟供应商,上线后停用,暂空
+    out['收款方编码'] = merged['实际收款方'].map(gig_payee_code)                 # [明细] 实际收款方 -> 中台供应商编码;未命中则保留实际收款方
     out['备注'] = [gig_recipient_remark(n, i, p)                                # 模版第22列:姓名-身份证-手机号(R50)
                   for n, i, p in zip(merged['实际收款方'], merged['身份证号'], merged['手机号'])]
     out['银行账号'] = merged['银行账号'].where(merged['银行账号'].notna(), '')   # [明细] 银行账号
@@ -246,7 +256,7 @@ def run():
     # 4. 灵工预付款 tab:付款头数据 + 实际收款人明细
     gig_header_df = pd.read_excel(GIG_SOURCE_FILE, sheet_name=GIG_HEADER_SHEET)
     gig_detail_df = pd.read_excel(GIG_SOURCE_FILE, sheet_name=GIG_DETAIL_SHEET)
-    gig_output_df, gig_merged_df = build_gig_output(gig_header_df, gig_detail_df, company_map, entity_map)
+    gig_output_df, gig_merged_df = build_gig_output(gig_header_df, gig_detail_df, vendor_map, company_map, entity_map)
 
     # 5. 填充率(必输字段以规则表「是否必填」=Y 为准)
     supplier_required = c.required_columns(RULE_SHEET, RULE_TABLE_SUPPLIER)
