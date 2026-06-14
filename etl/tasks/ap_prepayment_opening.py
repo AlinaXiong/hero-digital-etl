@@ -110,35 +110,35 @@ def build_output(merged_df, employee_code_map, vendor_map, entity_map, subject_m
     ratio = (detail_amount / main_amount).where(main_amount != 0, 0)                     # 明细占比
     unsettled_amount = remaining * ratio                                                 # 已付未核(费用行)
     settled_amount = detail_amount - unsettled_amount                                    # 已到票核销(费用行)
-    is_deposit = merged_df['付款性质'].isin(DEPOSIT_PAYMENT_NATURES)
+    is_deposit = merged_df['付款性质'].isin(DEPOSIT_PAYMENT_NATURES)                    # [主表] 付款性质命中押金/质保金 -> 保证金标志=是
 
     output_df = pd.DataFrame(index=merged_df.index)  # 先定行索引,否则首个标量列会变空
     output_df['来源系统'] = 'FW'  # 固定
     output_df['来源单据编号'] = merged_df['流程编号']  # [主表] 流程编号
     output_df['申请日期'] = merged_df['申请日期'].map(c.format_date)  # [主表] 申请日期
     output_df['单据类型'] = DOCUMENT_TYPE  # 供应商预付单(期初) JK01-2
-    output_df['申请人工号'] = merged_df['填单人'].map(
-        lambda value: lookup_by_name(employee_code_map, value))  # [主表] 填单人 -> 泛微工号
+    output_df['申请人工号'] = merged_df['填单人'].map(  # [主表] 填单人 -> 泛微工号
+        lambda value: lookup_by_name(employee_code_map, value))
     output_df['申请人姓名'] = merged_df['填单人']  # [主表] 填单人
     output_df['订单编号'] = ''  # 留空(待项目 -> 订单映射)
-    output_df['订单名称'] = ''
-    output_df['核算主体编号'] = merged_df['开票单位'].map(
-        lambda value: lookup_by_name(entity_map, value))  # [主表] 开票单位 -> 中台核算主体编码
+    output_df['订单名称'] = ''  # 留空(待项目 -> 订单映射)
+    output_df['核算主体编号'] = merged_df['开票单位'].map(  # [主表] 开票单位 -> 中台核算主体编码
+        lambda value: lookup_by_name(entity_map, value))
     output_df['核算主体描述'] = merged_df['开票单位']  # [主表] 开票单位
-    output_df['备注'] = merged_df['备注'].astype(str).where(
-        merged_df['备注'].notna(), '').str.slice(0, 150)  # 截 150 字
+    output_df['备注'] = merged_df['备注'].astype(str).where(  # [主表] 备注,截 150 字
+        merged_df['备注'].notna(), '').str.slice(0, 150)
     output_df['合同号'] = merged_df['相关合同'].where(merged_df['相关合同'].notna(), '')  # [主表] 相关合同
     output_df['合同收支计划行'] = ''  # 不涉及
     output_df['保证金标志'] = ['是' if flag else '否' for flag in is_deposit]  # [主表] 付款性质=押金/质保金 -> 是
-    output_df['收款方编码'] = merged_df['付款对象'].map(
-        lambda value: lookup_by_name(vendor_map, value))  # [主表] 付款对象 -> 中台供应商编码
-    output_df['收款方描述'] = merged_df['付款对象'].where(merged_df['付款对象'].notna(), '')
+    output_df['收款方编码'] = merged_df['付款对象'].map(  # [主表] 付款对象 -> 中台供应商编码
+        lambda value: lookup_by_name(vendor_map, value))
+    output_df['收款方描述'] = merged_df['付款对象'].where(merged_df['付款对象'].notna(), '')  # [主表] 付款对象
     output_df['银行账号'] = merged_df['银行卡号'].where(merged_df['银行卡号'].notna(), '')  # [主表] 银行卡号
     output_df['计划付款日期'] = ''  # 不涉及
     output_df['银行转账备注'] = ''  # 不涉及
-    output_df['费用项目编码'] = merged_df['预算科目'].map(
-        lambda value: subject_item(value, 0))  # [明细] 预算科目 -> 科目编码
-    output_df['费用项目描述'] = merged_df['预算科目'].map(lambda value: subject_item(value, 1))
+    output_df['费用项目编码'] = merged_df['预算科目'].map(  # [明细] 预算科目 -> 科目编码
+        lambda value: subject_item(value, 0))
+    output_df['费用项目描述'] = merged_df['预算科目'].map(lambda value: subject_item(value, 1))  # [明细] 预算科目 -> 科目描述
     output_df['主播房间号'] = ''  # 不涉及(MCN 主播才有)
     output_df['预付款支付币种'] = merged_df['付款币种'].map(c.to_iso_currency)  # [主表] 付款币种 -> ISO
     output_df['预付款金额（支付币种）'] = detail_amount.map(c.round_amount)  # [明细] 预付金额
@@ -207,10 +207,10 @@ def build_gig_output(header_df, detail_df, vendor_map, company_map, entity_map):
     out['申请人工号'] = merged['经办人工号']                                     # [头] 经办人工号(V码,现成)
     out['申请人姓名'] = merged['经办人']                                         # [头] 经办人
     out['订单编号'] = ''                                                        # 留空(待项目->订单映射)
-    out['订单名称'] = ''
-    out['核算主体编号'] = company_names.map(
-        lambda value: entity_map.get(c.normalize_name(value), '') if value else '')  # 公司主体ID -> 泛微公司名 -> 中台核算主体编码
-    out['核算主体描述'] = company_names
+    out['订单名称'] = ''                                                        # 留空(待项目->订单映射)
+    out['核算主体编号'] = company_names.map(                                    # [头] 公司主体ID -> 泛微公司名 -> 中台核算主体编码
+        lambda value: entity_map.get(c.normalize_name(value), '') if value else '')
+    out['核算主体描述'] = company_names                                         # [头] 公司主体ID -> 泛微公司名
     out['备注_单头'] = merged['备注'].astype(str).where(merged['备注'].notna(), '').str.slice(0, 150)  # 模版第11列(单头备注)
     out['灵工平台收款方编码'] = merged['收款方文本'].map(gig_platform_vendor)      # [头] 收款方文本 -> 平台编码
     out['合同号'] = merged['合同名称'].where(merged['合同名称'].notna(), '')      # [头] 合同名称
@@ -219,7 +219,7 @@ def build_gig_output(header_df, detail_df, vendor_map, company_map, entity_map):
     out['计划付款日期'] = merged['预计付款日期'].map(c.format_date)              # [头] 预计付款日期
     out['银行转账备注'] = ''                                                    # 不涉及
     out['费用项目编码'] = ''                                                    # 规则R46缺表,无来源,暂空
-    out['费用项目描述'] = ''
+    out['费用项目描述'] = ''                                                    # 规则R46缺表,无来源,暂空
     out['收款方类别'] = '供应商'                                                # 默认供应商(R48)
     out['收款方编码'] = merged['实际收款方'].map(gig_payee_code)                 # [明细] 实际收款方 -> 中台供应商编码;未命中则保留实际收款方
     out['备注'] = [gig_recipient_remark(n, i, p)                                # 模版第22列:姓名-身份证-手机号(R50)
@@ -275,10 +275,12 @@ def run():
 
     # 7. 问题清单(一个文件,sheet 名按 tab 前缀「供应商_」「灵工_」区分):必输字段未达100% + 缺失明细
     exception_sheets = {}
-    supplier_sheets = {'必输字段未达100%': c.fill_summary(output_df, supplier_required)}
+    supplier_sheets = {'必输字段未达100%': c.fill_summary(
+        output_df, supplier_required, RULE_SHEET, RULE_TABLE_SUPPLIER)}
     supplier_sheets.update(c.collect_field_issues(output_df, merged_df, supplier_required, ISSUE_SOURCE_FIELDS))
     exception_sheets.update({f'供应商_{name}': df for name, df in supplier_sheets.items()})
-    gig_sheets = {'必输字段未达100%': c.fill_summary(gig_output_df, gig_required)}
+    gig_sheets = {'必输字段未达100%': c.fill_summary(
+        gig_output_df, gig_required, RULE_SHEET, RULE_TABLE_GIG)}
     gig_sheets.update(c.collect_field_issues(gig_output_df, gig_merged_df, gig_required, GIG_ISSUE_SOURCE_FIELDS))
     exception_sheets.update({f'灵工_{name}': df for name, df in gig_sheets.items()})
     c.write_exceptions(EXCEPTION_FILE, exception_sheets)

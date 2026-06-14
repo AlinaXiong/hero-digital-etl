@@ -170,6 +170,86 @@ def build_vendor_map():
     return vendor_map
 
 
+def build_customer_map():
+    """客户名称 -> 中台客户编码 customer_code。来源:中台 hfins_base.hfbs_system_customer。
+    按 description / taxpayer_name 建键(均 normalize_name 归一化)。"""
+    conn = _db_connect('ZT', 'hfins_base')
+    try:
+        customer_df = pd.read_sql(
+            'SELECT customer_code, description customer_name, taxpayer_name '
+            'FROM hfbs_system_customer',
+            conn)
+    finally:
+        conn.close()
+    customer_map = {}
+    for _, row in customer_df.iterrows():
+        for name in (row['customer_name'], row['taxpayer_name']):
+            key = normalize_name(name)
+            if key and key not in ('nan', 'none') and key not in customer_map:
+                customer_map[key] = str(row['customer_code']).strip()
+    return customer_map
+
+
+def build_lov_meaning_map(lov_code):
+    """HZero 值集 meaning -> value。用于把业务侧展示值转成汉得编码。"""
+    conn = _db_connect('ZT', 'hzero_platform')
+    try:
+        lov_df = pd.read_sql(
+            'SELECT v.value, v.meaning '
+            'FROM hpfm_lov l JOIN hpfm_lov_value v ON v.lov_id = l.lov_id '
+            'WHERE l.lov_code = %s AND v.enabled_flag = 1 '
+            'ORDER BY v.order_seq, v.value',
+            conn,
+            params=[lov_code])
+    finally:
+        conn.close()
+    return {
+        str(row['meaning']).strip(): str(row['value']).strip()
+        for _, row in lov_df.iterrows()
+        if str(row['meaning']).strip() and str(row['meaning']).strip() != 'nan'
+    }
+
+
+def build_tax_type_description_map(preferred_descriptions=None):
+    """税率 -> 汉得税率类型描述。preferred_descriptions 可指定每个税率优先使用的 description。
+    键统一为小数税率,例如 6% 为 0.06。"""
+    conn = _db_connect('ZT', 'hfins_base')
+    try:
+        tax_df = pd.read_sql(
+            'SELECT tax_type_code, description, tax_type_rate, sale_tax_flag, input_tax_flag, enabled_flag '
+            'FROM hfbs_tax_type '
+            'WHERE enabled_flag = 1',
+            conn)
+    finally:
+        conn.close()
+
+    tax_df['rate_key'] = pd.to_numeric(tax_df['tax_type_rate'], errors='coerce').round(4)
+    description_to_rate = {
+        str(row['description']).strip(): float(row['rate_key'])
+        for _, row in tax_df.iterrows()
+        if pd.notna(row['rate_key']) and str(row['description']).strip()
+    }
+
+    tax_map = {}
+    for rate, descriptions in (preferred_descriptions or {}).items():
+        for description in descriptions:
+            if description in description_to_rate:
+                tax_map[round(float(rate), 4)] = description
+                break
+
+    # 未显式指定的税率,优先取销项税、再取非进项税,最后保底取该税率第一条。
+    sort_df = tax_df.assign(
+        sale_priority=(tax_df['sale_tax_flag'] == 1).astype(int),
+        non_input_priority=(tax_df['input_tax_flag'] == 0).astype(int),
+    ).sort_values(['rate_key', 'sale_priority', 'non_input_priority', 'tax_type_code'],
+                  ascending=[True, False, False, True])
+    for _, row in sort_df.iterrows():
+        if pd.isna(row['rate_key']):
+            continue
+        tax_map.setdefault(round(float(row['rate_key']), 4), str(row['description']).strip())
+    return tax_map
+
+
 def build_accounting_entity_map():
     """公司主体名称 -> 核算主体编号。来源:中台 hfins_base_account.hfac_accounting_entity。
     按 acc_entity_name 建键。"""
@@ -319,12 +399,34 @@ def required_columns(rule_sheet, table_name):
     规则列:0=模块 1=表名 2=字段名 3=是否必填。"""
     df = pd.read_excel(RULE_XLSX, sheet_name=rule_sheet, header=None, engine='calamine')
     columns = []
+    current_table = ''
     for _, row in df.iloc[2:].iterrows():
-        if str(row[1]).strip() == table_name and str(row[3]).strip() == 'Y':
+        table = str(row[1]).strip()
+        if table and table != 'nan':
+            current_table = table
+        if current_table == table_name and str(row[3]).strip() == 'Y':
             field = str(row[2]).strip()
             if field and field != 'nan' and field not in columns:
                 columns.append(field)
     return columns
+
+
+def required_column_remarks(rule_sheet, table_name):
+    """读取规则表目标表下各字段的备注。用于问题清单汇总页补充说明。"""
+    df = pd.read_excel(RULE_XLSX, sheet_name=rule_sheet, header=None, engine='calamine')
+    remarks = {}
+    current_table = ''
+    for _, row in df.iloc[2:].iterrows():
+        table = str(row[1]).strip()
+        if table and table != 'nan':
+            current_table = table
+        if current_table != table_name:
+            continue
+        field = str(row[2]).strip()
+        if not field or field == 'nan' or field in remarks:
+            continue
+        remarks[field] = _cell_text(row[5] if len(row) > 5 else '')
+    return remarks
 
 
 def report_fill(output_df, columns):
@@ -363,18 +465,21 @@ def collect_field_issues(output_df, source_df, required_cols, source_field_map, 
     return sheets
 
 
-def fill_summary(output_df, columns):
-    """返回必输字段中【填充率未达100%】的汇总(供问题清单)。全部满 100% 时返回空表。"""
+def fill_summary(output_df, columns, rule_sheet=None, table_name=None):
+    """返回必输字段中【填充率未达100%】的汇总(供问题清单)。全部满 100% 时返回空表。
+    若规则备注含「无需填写」且该必输字段整列为空,汇总页备注写「无需填写」。"""
     total = len(output_df)
+    rule_remarks = required_column_remarks(rule_sheet, table_name) if rule_sheet and table_name else {}
     rows = []
     for column in columns:
         if column not in output_df.columns:
             continue
         filled = int((output_df[column].astype(str).str.strip() != '').sum())
         if filled < total:
+            remark = '无需填写' if filled == 0 and '无需填写' in rule_remarks.get(column, '') else ''
             rows.append({'必输字段': column, '填充数': filled, '缺失数': total - filled,
-                         '总数': total, '填充率': f'{filled / total * 100:.1f}%'})
-    return pd.DataFrame(rows, columns=['必输字段', '填充数', '缺失数', '总数', '填充率'])
+                         '总数': total, '填充率': f'{filled / total * 100:.1f}%', '备注': remark})
+    return pd.DataFrame(rows, columns=['必输字段', '填充数', '缺失数', '总数', '填充率', '备注'])
 
 
 # ============================ Excel 输出 ============================

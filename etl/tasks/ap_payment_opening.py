@@ -82,37 +82,37 @@ def build_output(merged_df, employee_code_map, vendor_map, entity_map, subject_m
         return subject_map.get(c.remove_slashes(value), ('', ''))[index] if pd.notna(value) else ''
 
     payment_amount = merged_df['付款金额']  # [明细] 本行付款金额
-    paid_mask = merged_df['支付状态'].astype(str).str.strip() == '已支付'
+    paid_mask = merged_df['支付状态'].astype(str).str.strip() == '已支付'  # [明细] 支付状态=已支付 -> 实际已支付金额取付款金额
 
     output_df = pd.DataFrame(index=merged_df.index)  # 先定行索引,否则首个标量列会变空
     output_df['来源系统'] = 'FW'  # 固定
     output_df['来源单据编号'] = merged_df['流程编号']  # [主表] 流程编号
     output_df['申请日期'] = merged_df['申请日期'].map(c.format_date)  # [主表] 申请日期
     output_df['单据类型'] = 'AP01-1'  # 固定
-    output_df['申请人工号'] = merged_df['经办人'].map(
-        lambda value: lookup_by_name(employee_code_map, value))  # [主表] 经办人 -> 泛微工号
+    output_df['申请人工号'] = merged_df['经办人'].map(  # [主表] 经办人 -> 泛微工号
+        lambda value: lookup_by_name(employee_code_map, value))
     output_df['申请人姓名'] = merged_df['经办人']  # [主表] 经办人
     output_df['订单编号'] = ''  # 留空(待项目 -> 订单映射)
-    output_df['订单名称'] = ''
-    output_df['核算主体编号'] = merged_df['公司主体'].map(
-        lambda value: lookup_by_name(entity_map, value))  # [主表] 公司主体 -> 中台核算主体编码
+    output_df['订单名称'] = ''  # 留空(待项目 -> 订单映射)
+    output_df['核算主体编号'] = merged_df['公司主体'].map(  # [主表] 公司主体 -> 中台核算主体编码
+        lambda value: lookup_by_name(entity_map, value))
     output_df['核算主体描述'] = merged_df['公司主体']  # [主表] 公司主体
-    output_df['备注'] = merged_df['备注'].astype(str).where(
-        merged_df['备注'].notna(), '').str.slice(0, 150)  # 截 150 字
+    output_df['备注'] = merged_df['备注'].astype(str).where(  # [主表] 备注,截 150 字
+        merged_df['备注'].notna(), '').str.slice(0, 150)
     output_df['合同号'] = merged_df['相关合同'].where(merged_df['相关合同'].notna(), '')  # [主表] 相关合同
     output_df['合同收支计划行'] = ''  # 不涉及
-    output_df['收款方编码'] = merged_df['供应商-文本'].map(
-        lambda value: lookup_by_name(vendor_map, value))  # [主表] 供应商 -> 中台编码
-    output_df['收款方描述'] = merged_df['供应商-文本'].where(merged_df['供应商-文本'].notna(), '')
+    output_df['收款方编码'] = merged_df['供应商-文本'].map(  # [主表] 供应商-文本 -> 中台供应商编码
+        lambda value: lookup_by_name(vendor_map, value))
+    output_df['收款方描述'] = merged_df['供应商-文本'].where(merged_df['供应商-文本'].notna(), '')  # [主表] 供应商-文本
     output_df['银行账号'] = merged_df['银行账号'].where(merged_df['银行账号'].notna(), '')  # [主表] 银行账号
     output_df['计划付款日期'] = merged_df['预计付款日期'].map(c.format_date)  # [主表] 预计付款日期
     output_df['银行转账备注'] = ''  # 不涉及
-    output_df['实际已支付金额'] = [
+    output_df['实际已支付金额'] = [  # [明细] 支付状态=已支付取付款金额,否则为 0
         c.round_amount(value) if is_paid else 0 for value, is_paid in zip(payment_amount, paid_mask)
-    ]  # 已支付则取报账金额,否则为 0
-    output_df['费用项目编码'] = merged_df['预算科目'].map(
-        lambda value: subject_item(value, 0))  # [明细] 预算科目 -> 科目编码
-    output_df['费用项目描述'] = merged_df['预算科目'].map(lambda value: subject_item(value, 1))
+    ]
+    output_df['费用项目编码'] = merged_df['预算科目'].map(  # [明细] 预算科目 -> 科目编码
+        lambda value: subject_item(value, 0))
+    output_df['费用项目描述'] = merged_df['预算科目'].map(lambda value: subject_item(value, 1))  # [明细] 预算科目 -> 科目描述
     output_df['主播房间号'] = ''  # 不涉及(MCN 才有)
     output_df['报账币种'] = merged_df['付款币种'].map(c.to_iso_currency)  # [主表] 付款币种 -> ISO
     output_df['报账金额（支付币种）'] = payment_amount.map(c.round_amount)  # [明细] 付款金额
@@ -146,7 +146,7 @@ def run():
     print('已写出:', OUTPUT_FILE)
 
     # 6. 问题清单:必输字段未达100%汇总 + 每个有缺失的必输字段的缺失明细(自动覆盖全部必输字段)
-    sheets = {'必输字段未达100%': c.fill_summary(output_df, required_cols)}
+    sheets = {'必输字段未达100%': c.fill_summary(output_df, required_cols, RULE_SHEET, RULE_TABLE)}
     sheets.update(c.collect_field_issues(output_df, merged_df, required_cols, ISSUE_SOURCE_FIELDS))
     c.write_exceptions(EXCEPTION_FILE, sheets)
     print('已写出:', EXCEPTION_FILE, '| 各清单条数:', {
