@@ -1,5 +1,3 @@
-# 密钥
-.env
 # python
 __pycache__/
 *.pyc
