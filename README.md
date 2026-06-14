@@ -51,47 +51,6 @@ python run.py --list
 
 `.env` 读取真实数据库连接信息，本地使用即可，不要提交到 GitHub。脚本只执行 `SELECT` 查询，不写入数据库。
 
-## 当前任务
-
-任务名：`ap_opening_payment`
-
-入口文件：`etl/tasks/ap_opening_payment.py`
-
-运行方式：
-
-```bash
-python run.py ap_opening_payment
-```
-
-直接运行任务文件也支持：
-
-```bash
-python etl/tasks/ap_opening_payment.py
-```
-
-数据口径：
-
-- 流程来源：`对公付款`、`个人劳务付款`
-- 申请日期：`>= 2026-01-01`
-- 流程状态：`审批完成`
-- 作废单据：剔除
-- 行粒度：主表和明细表按 `ID` 合并，一行对应一条费用明细
-
-主要映射：
-
-| 模板字段 | 取数来源 |
-|---|---|
-| 来源系统 | 固定 `FW` |
-| 来源单据编号、申请日期、备注、合同号、银行账号、计划付款日期 | 泛微主表 |
-| 单据类型 | 固定 `AP01-1` |
-| 申请人工号 | 泛微 `vspn_xtyy.hrmresource.JOBTITLE` 关联 `hrmjobtitles.id` 后取 `hrmjobtitles.JOBTITLENAME` |
-| 核算主体编号 | 中台 `hfins_base_account.hfac_accounting_entity.acc_entity_code`，仅按 `acc_entity_name` 建映射 |
-| 收款方编码 | 中台 `hfbs_system_vender.vender_code` |
-| 费用项目编码、费用项目描述 | 预算科目映射规则 |
-| 实际已支付金额 | 支付状态为已支付时取本行报账金额，否则为 `0` |
-| 报账币种 | 付款币种转 ISO 码 |
-| 报账金额 | 明细表付款金额 |
-
 ## 新增任务规范
 
 1. 在 `etl/tasks/` 下新建任务文件，文件名使用清晰英文名，不使用拼音。

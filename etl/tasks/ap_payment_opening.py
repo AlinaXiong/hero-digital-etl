@@ -2,17 +2,17 @@
 """应付期初 —— 对公付款单。整条 ETL 从上到下读完即可。
 
 数据源:
-    主表 data/source/ap_opening_payment/uf_dgfktz-主表.xlsx        一行=一张付款申请单
-    明细 data/source/ap_opening_payment/uf_dgfktz_dt1-明细表.xlsx   一行=一条费用明细(与主表按 ID 关联)
+    主表 data/source/ap_payment_opening/uf_dgfktz-主表.xlsx        一行=一张付款申请单
+    明细 data/source/ap_payment_opening/uf_dgfktz_dt1-明细表.xlsx   一行=一条费用明细(与主表按 ID 关联)
     规则 data/rules/业财项目_数据映射规则.xlsx
     泛微 vspn_xtyy(工号)   中台 hfins_base(供应商编码) / hfins_base_account(核算主体编码)
-模版 data/templates/ap_opening_payment/英雄期初对公付款单导入模版.xlsx
-产出 output/ap_opening_payment/英雄期初对公付款单导入_应付期初_<YYYYMMDD>.xlsx + output/ap_opening_payment/未匹配清单_应付期初_<YYYYMMDD>.xlsx
+模版 data/templates/ap_payment_opening/英雄期初对公付款单导入模版.xlsx
+产出 output/ap_payment_opening/英雄期初对公付款单导入_应付期初_<YYYYMMDD>.xlsx + output/ap_payment_opening/未匹配清单_应付期初_<YYYYMMDD>.xlsx
 
 行过滤:流程来源∈{对公付款,个人劳务付款} 且 申请日期>=2026-01-01 且 流程状态=审批完成 且 非作废
-行粒度:主子按 ID 合并(一行=一条费用明细),再按 单头键+付款行键+费用行键 分组去重
+行粒度:主子按 ID 合并,一行=一条费用明细(不做分组去重)
 
-跑法:在项目根执行  python run.py ap_opening_payment
+跑法:在项目根执行  python run.py ap_payment_opening
 """
 import sys
 from pathlib import Path
@@ -25,7 +25,7 @@ if __package__ is None or __package__ == '':
 from etl import common as c
 
 # ---- 文件路径 ----
-TASK_NAME = 'ap_opening_payment'
+TASK_NAME = 'ap_payment_opening'
 SOURCE_DIR = c.SRC_DIR / TASK_NAME
 TEMPLATE_DIR = c.TPL_DIR / TASK_NAME
 OUTPUT_DIR = c.OUT_DIR / TASK_NAME
@@ -40,11 +40,26 @@ TEMPLATE_SHEET = '期初对公付款单导入'
 
 # ---- 口径 ----
 SOURCES = ['对公付款', '个人劳务付款']
-DEDUP_KEY = [
-    '来源系统', '来源单据编号', '申请日期', '单据类型', '申请人工号', '订单编号',
-    '核算主体编号', '备注', '收款方编码', '报账币种', '计划付款日期', '合同号',
-    '合同收支计划行', '银行转账备注', '报账金额（支付币种）', '费用项目编码', '主播房间号',
-]
+DATE_FROM = '2026-01-01'
+APPROVED_STATUS = '审批完成'
+
+
+def filter_main(main_df):
+    """主表行过滤:流程来源∈SOURCES 且 申请日期>=DATE_FROM 且 流程状态=审批完成 且 非作废。"""
+    df = main_df.copy()
+    df['申请日期'] = pd.to_datetime(df['申请日期'], errors='coerce')
+    keep_mask = (
+        df['流程来源'].isin(SOURCES)
+        & (df['申请日期'] >= DATE_FROM)
+        & (df['流程状态'] == APPROVED_STATUS)
+    )
+    matched_count = int(keep_mask.sum())
+    void_mask = df['是否作废'].astype(str).str.strip() == '是'
+    void_count = int((keep_mask & void_mask).sum())
+    result_df = df[keep_mask & ~void_mask].copy()
+    print(f"过滤条件: 流程来源∈{SOURCES} 且 申请日期>={DATE_FROM} 且 流程状态='{APPROVED_STATUS}' 且 是否作废≠是")
+    print(f'  满足前三项 {matched_count} 单; 其中剔除作废 {void_count} 单; 最终保留主表 {len(result_df)} 单')
+    return result_df
 
 
 def build_output(merged_df, employee_code_map, vendor_map, entity_map, subject_map):
@@ -97,7 +112,7 @@ def run():
     # 1. 读源表 + 过滤主表
     main_df = pd.read_excel(SOURCE_MAIN_FILE)
     detail_df = pd.read_excel(SOURCE_DETAIL_FILE)
-    filtered_main_df = c.filter_main(main_df, SOURCES)
+    filtered_main_df = filter_main(main_df)
 
     # 2. 构建映射(数据库 + 规则表)
     employee_code_map = c.build_employee_code_map()
@@ -109,17 +124,16 @@ def run():
     merged_df = detail_df[detail_df['ID'].isin(set(filtered_main_df['ID']))].merge(
         filtered_main_df, on='ID', suffixes=('_detail', ''), how='inner')
     output_df = build_output(merged_df, employee_code_map, vendor_map, entity_map, subject_map)
-    print('合并前明细行数:', len(output_df))
+    print('输出明细行数:', len(output_df))
 
-    # 4. 分组去重 + 填充率
-    output_df, merged_duplicate_rows = c.dedup_rows(output_df, DEDUP_KEY)
-    c.report_fill(output_df, ['申请人工号', '收款方编码', '核算主体编号', '费用项目编码'])
+    # 4. 填充率(模版中所有有底色的必输字段)
+    c.report_fill(output_df, c.required_columns(TEMPLATE_FILE, TEMPLATE_SHEET))
 
     # 5. 写模版
     c.write_to_template(output_df, TEMPLATE_FILE, OUTPUT_FILE, TEMPLATE_SHEET)
     print('已写出:', OUTPUT_FILE)
 
-    # 6. 未匹配 / 待核对清单
+    # 6. 未匹配清单
     vendor_names = set(filtered_main_df['供应商-文本'].dropna().astype(str).str.strip())
     company_names = set(filtered_main_df['公司主体'].dropna().astype(str).str.strip())
     subject_names = set(merged_df['预算科目'].dropna().astype(str).str.strip())
@@ -141,7 +155,6 @@ def run():
             '未匹配_预算科目(费用项目)': sorted(
                 name for name in subject_names if c.remove_slashes(name) not in subject_map)
         }),
-        '分组合并_待核对': merged_duplicate_rows,
     }
     c.write_exceptions(EXCEPTION_FILE, sheets)
     print('已写出:', EXCEPTION_FILE, '| 各清单条数:', {

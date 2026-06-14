@@ -209,43 +209,41 @@ def build_subject_map():
     return subject_map
 
 
-# ============================ 行过滤 / 去重 / 统计 ============================
-def filter_main(main_df, sources, date_from='2026-01-01', status='审批完成',
-                date_col='申请日期', drop_void=True):
-    """主表标准行过滤,返回过滤后副本。"""
-    filtered_main_df = main_df.copy()
-    filtered_main_df[date_col] = pd.to_datetime(filtered_main_df[date_col], errors='coerce')
-    keep_mask = (
-        filtered_main_df['流程来源'].isin(sources)
-        & (filtered_main_df[date_col] >= date_from)
-        & (filtered_main_df['流程状态'] == status)
-    )
-    total_count, void_count = int(keep_mask.sum()), 0
-    if drop_void and '是否作废' in filtered_main_df.columns:
-        void_mask = filtered_main_df['是否作废'].astype(str).str.strip() == '是'
-        void_count = int((keep_mask & void_mask).sum())
-        keep_mask = keep_mask & ~void_mask
-    result_df = filtered_main_df[keep_mask].copy()
-    conditions = f"流程来源∈{sources} 且 {date_col}>={date_from} 且 流程状态='{status}'"
-    if drop_void:
-        conditions += " 且 是否作废≠是"
-    print('过滤条件:', conditions)
-    print(f'  满足前三项 {total_count} 单; 其中剔除作废 {void_count} 单; 最终保留主表 {len(result_df)} 单')
-    return result_df
-
-
+# ============================ 去重 / 统计 ============================
+# 行过滤口径(流程来源/日期/状态等)各任务差异较大,放在各任务文件内的 filter_main,不在此公共层。
 def dedup_rows(output_df, key_cols):
     """按 key_cols 完全相同则合并为一条。返回(去重后, 参与合并的全部行[供核对])。"""
     group_key = output_df[key_cols].apply(lambda row: '|'.join(map(str, row.tolist())), axis=1)
     duplicate_mask = group_key.duplicated(keep=False)
-    merged_rows = output_df[duplicate_mask].assign(_key=group_key).sort_values('_key').drop(columns='_key')
+    # 注意:key 要对齐到 mask 子集;否则 0 重复时空表 .assign 整列会把空表撑回全部行
+    merged_rows = output_df[duplicate_mask].copy()
+    merged_rows['_key'] = group_key[duplicate_mask]
+    merged_rows = merged_rows.sort_values('_key').drop(columns='_key')
     deduped_rows = output_df[~group_key.duplicated(keep='first')].reset_index(drop=True)
     print(f'分组去重: 参与合并 {int(duplicate_mask.sum())} 行 -> 最终输出 {len(deduped_rows)} 行')
     return deduped_rows, merged_rows
 
 
+def required_columns(template_path, sheet_name, header_row=1):
+    """读模版表头,返回有底色(必输)的列名列表。模版里黄色等实心底色=必输字段。"""
+    worksheet = load_workbook(template_path)[sheet_name]
+    columns = []
+    for col in range(1, worksheet.max_column + 1):
+        cell = worksheet.cell(header_row, col)
+        fill = cell.fill
+        rgb = fill.fgColor.rgb if (fill is not None and fill.fgColor is not None) else None
+        is_colored = (fill is not None and fill.patternType == 'solid'
+                      and str(rgb) not in ('00000000', 'FFFFFFFF', 'None', 'None'))
+        if is_colored and cell.value not in (None, ''):
+            columns.append(str(cell.value))
+    return columns
+
+
 def report_fill(output_df, columns):
+    """打印各列非空填充率。只统计 output_df 里存在的列。"""
     for column in columns:
+        if column not in output_df.columns:
+            continue
         filled_count = (output_df[column].astype(str).str.strip() != '').sum()
         print(f'  {column} 填充率: {filled_count}/{len(output_df)} = {filled_count/len(output_df)*100:.1f}%')
 
