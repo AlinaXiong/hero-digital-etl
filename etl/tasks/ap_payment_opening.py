@@ -68,7 +68,7 @@ def filter_main(main_df):
     void_mask = df['是否作废'].astype(str).str.strip() == '是'
     void_count = int((keep_mask & void_mask).sum())
     result_df = df[keep_mask & ~void_mask].copy()
-    print(f"过滤条件: 流程来源∈{SOURCES} 且 申请日期>={DATE_FROM} 且 流程状态='{APPROVED_STATUS}' 且 是否作废≠是")
+    print(f"[应付期初-供应商付款] 过滤条件: 流程来源∈{SOURCES} 且 申请日期>={DATE_FROM} 且 流程状态='{APPROVED_STATUS}' 且 是否作废≠是")
     print(f'  满足前三项 {matched_count} 单; 其中剔除作废 {void_count} 单; 最终保留主表 {len(result_df)} 单')
     return result_df
 
@@ -135,7 +135,7 @@ def run():
     merged_df = detail_df[detail_df['ID'].isin(set(filtered_main_df['ID']))].merge(
         filtered_main_df, on='ID', suffixes=('_detail', ''), how='inner')
     output_df = build_output(merged_df, employee_code_map, vendor_map, entity_map, subject_map)
-    print('输出明细行数:', len(output_df))
+    print('[应付期初-供应商付款] 输出明细行数:', len(output_df))
 
     # 4. 填充率(必输字段以规则表「是否必填」=Y 为准)
     required_cols = c.required_columns(RULE_SHEET, RULE_TABLE)

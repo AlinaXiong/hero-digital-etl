@@ -90,7 +90,7 @@ def filter_main(main_df):
     void_mask = df['是否作废'].astype(str).str.strip() == '是'
     void_count = int((keep_mask & void_mask).sum())
     result_df = df[keep_mask & ~void_mask].copy()
-    print(f"供应商过滤条件: 申请日期>={DATE_FROM} 且 流程状态='{APPROVED_STATUS}' 且 是否作废≠是")
+    print(f"[预付期初-供应商预付款] 过滤条件: 申请日期>={DATE_FROM} 且 流程状态='{APPROVED_STATUS}' 且 是否作废≠是")
     print(f'  满足前两项 {matched_count} 单; 其中剔除作废 {void_count} 单; 最终保留主表 {len(result_df)} 单')
     return result_df
 
@@ -173,7 +173,7 @@ def build_gig_output(header_df, detail_df, vendor_map, company_map, entity_map):
     void_mask = header['是否作废'].astype(str).str.strip().isin(['是', '1', '1.0'])
     void_count = int((matched_mask & void_mask).sum())
     header_kept = header[matched_mask & ~void_mask]
-    print(f"零工过滤条件: 申请日期>={DATE_FROM} 且 流程状态={GIG_APPROVED_CODE}(审批完成) 且 是否作废≠是")
+    print(f"[预付期初-零工预付款] 过滤条件: 申请日期>={DATE_FROM} 且 流程状态={GIG_APPROVED_CODE}(审批完成) 且 是否作废≠是")
     print(f'  满足前两项 {matched_count} 单; 其中剔除作废 {void_count} 单; 最终保留主表 {len(header_kept)} 单')
 
     # 取单头补充字段,与明细按 建模付款ID 关联(明细已含 流程编号/申请日期/收款人/金额/银行账号)
@@ -186,7 +186,7 @@ def build_gig_output(header_df, detail_df, vendor_map, company_map, entity_map):
                 break
     if '公司主体ID' not in merged.columns:
         merged['公司主体ID'] = ''
-    print('[零工预付款] 输出明细行数:', len(merged))
+    print('[预付期初-零工预付款] 输出明细行数:', len(merged))
 
     company_names = merged['公司主体ID'].map(lambda value: company_map.get(c.format_code(value), ''))
 
@@ -251,7 +251,7 @@ def run():
     merged_df = detail_df[detail_df['ID'].isin(set(filtered_main_df['ID']))].merge(
         filtered_main_df, on='ID', suffixes=('_detail', ''), how='inner')
     output_df = build_output(merged_df, employee_code_map, vendor_map, entity_map, subject_map)
-    print('[供应商预付款] 输出明细行数:', len(output_df))
+    print('[预付期初-供应商预付款] 输出明细行数:', len(output_df))
 
     # 4. 灵工预付款 tab:付款头数据 + 实际收款人明细
     gig_header_df = pd.read_excel(GIG_SOURCE_FILE, sheet_name=GIG_HEADER_SHEET)
