@@ -442,7 +442,7 @@ def collect_field_issues(output_df, source_df, required_cols, source_field_map, 
     """驱动于必输字段:遍历所有必输字段,凡【部分缺失】(0<缺失<全部)的,各生成一张
     「缺失_<字段>」明细 sheet。每张只两列:来源单据编号 + 泛微原表-<源字段>(没匹配上的原始值)。
     不写死具体字段;以后新增必输字段自动纳入。
-    全空字段(如尚未映射的订单编号)只在「必输字段未达100%」汇总里体现,不出明细(避免整表导出)。
+    全空字段(如规则说明无需填写/暂未映射的字段)只在「必输字段未达100%」汇总里体现,不导出整表明细。
         output_df         输出宽表(含 doc_col;用于判断缺失)
         source_df         与 output_df 同索引的主子合并表(取泛微原始字段值)
         required_cols     必输字段(通常来自 required_columns(模版))
@@ -472,11 +472,15 @@ def fill_summary(output_df, columns, rule_sheet=None, table_name=None):
     rule_remarks = required_column_remarks(rule_sheet, table_name) if rule_sheet and table_name else {}
     rows = []
     for column in columns:
-        if column not in output_df.columns:
-            continue
-        filled = int((output_df[column].astype(str).str.strip() != '').sum())
+        column_exists = column in output_df.columns
+        filled = int((output_df[column].astype(str).str.strip() != '').sum()) if column_exists else 0
         if filled < total:
-            remark = '无需填写' if filled == 0 and '无需填写' in rule_remarks.get(column, '') else ''
+            if filled == 0 and '无需填写' in rule_remarks.get(column, ''):
+                remark = '无需填写'
+            elif not column_exists:
+                remark = '输出表缺少该列'
+            else:
+                remark = ''
             rows.append({'必输字段': column, '填充数': filled, '缺失数': total - filled,
                          '总数': total, '填充率': f'{filled / total * 100:.1f}%', '备注': remark})
     return pd.DataFrame(rows, columns=['必输字段', '填充数', '缺失数', '总数', '填充率', '备注'])

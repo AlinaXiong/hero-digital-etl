@@ -66,8 +66,9 @@ TAX_PREFERRED_DESCRIPTIONS = {
     0.13: ['13%税率(价外)', '13%销项税，中国', '13%'],
 }
 
-# 缺失明细第二列:{输出必输字段: 泛微源字段};缺失明细展示 来源单据号 + 泛微原表-<源字段>
-ISSUE_SOURCE_FIELDS = {
+# 缺失明细源字段映射,不是必输字段清单;必输字段统一从规则表「是否必填=Y」读取。
+# 这里只配置明细 sheet 第二列展示哪个泛微原始字段: 来源单据号 + 泛微原表-<源字段>。
+ISSUE_SOURCE_FIELD_MAP = {
     '来源单据号': '流程编号',
     '核算主体': '公司主体',
     '申请人': '申请人',
@@ -232,7 +233,7 @@ def run():
     # 6. 问题清单:必输字段未达100%汇总 + 每个有缺失的必输字段的缺失明细
     sheets = {'必输字段未达100%': c.fill_summary(output_df, required_cols, RULE_SHEET, RULE_TABLE)}
     sheets.update(c.collect_field_issues(output_df, enriched_invoice_df, required_cols,
-                                         ISSUE_SOURCE_FIELDS, doc_col='来源单据号'))
+                                         ISSUE_SOURCE_FIELD_MAP, doc_col='来源单据号'))
     c.write_exceptions(EXCEPTION_FILE, sheets)
     print('已写出:', EXCEPTION_FILE, '| 各清单条数:', {
         sheet_name: len(sheet_df) for sheet_name, sheet_df in sheets.items()
