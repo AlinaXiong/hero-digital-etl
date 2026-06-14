@@ -127,7 +127,8 @@ def run():
     print('输出明细行数:', len(output_df))
 
     # 4. 填充率(模版中所有有底色的必输字段)
-    c.report_fill(output_df, c.required_columns(TEMPLATE_FILE, TEMPLATE_SHEET))
+    required_cols = c.required_columns(TEMPLATE_FILE, TEMPLATE_SHEET)
+    c.report_fill(output_df, required_cols)
 
     # 5. 写模版
     c.write_to_template(output_df, TEMPLATE_FILE, OUTPUT_FILE, TEMPLATE_SHEET)
@@ -138,24 +139,15 @@ def run():
     company_names = set(filtered_main_df['公司主体'].dropna().astype(str).str.strip())
     subject_names = set(merged_df['预算科目'].dropna().astype(str).str.strip())
     employee_names = set(filtered_main_df['经办人'].dropna().astype(str).str.strip())
-    sheets = {
-        '未匹配_工号': pd.DataFrame({
-            '未匹配_经办人(工号)': sorted(
-                name for name in employee_names if c.normalize_name(name) not in employee_code_map)
-        }),
-        '未匹配_供应商': pd.DataFrame({
-            '未匹配_供应商(收款方编码)': sorted(
-                name for name in vendor_names if c.normalize_name(name) not in vendor_map)
-        }),
-        '未匹配_核算主体': pd.DataFrame({
-            '未匹配_公司主体(核算主体)': sorted(
-                name for name in company_names if c.normalize_name(name) not in entity_map)
-        }),
-        '未匹配_费用科目': pd.DataFrame({
-            '未匹配_预算科目(费用项目)': sorted(
-                name for name in subject_names if c.remove_slashes(name) not in subject_map)
-        }),
-    }
+    # 映射检查清单:(sheet名, 列标题, 名称集合, 映射字典, 归一化函数);新增一类检查在此加一行
+    unmatched_checks = [
+        ('未匹配_工号', '未匹配_经办人(工号)', employee_names, employee_code_map, c.normalize_name),
+        ('未匹配_供应商', '未匹配_供应商(收款方编码)', vendor_names, vendor_map, c.normalize_name),
+        ('未匹配_核算主体', '未匹配_公司主体(核算主体)', company_names, entity_map, c.normalize_name),
+        ('未匹配_费用科目', '未匹配_预算科目(费用项目)', subject_names, subject_map, c.remove_slashes),
+    ]
+    sheets = {'必输字段未达100%': c.fill_summary(output_df, required_cols)}
+    sheets.update(c.collect_unmatched(unmatched_checks))  # 没匹配上的才会生成对应 sheet
     c.write_exceptions(EXCEPTION_FILE, sheets)
     print('已写出:', EXCEPTION_FILE, '| 各清单条数:', {
         sheet_name: len(sheet_df) for sheet_name, sheet_df in sheets.items()

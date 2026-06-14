@@ -248,6 +248,32 @@ def report_fill(output_df, columns):
         print(f'  {column} 填充率: {filled_count}/{len(output_df)} = {filled_count/len(output_df)*100:.1f}%')
 
 
+def collect_unmatched(checks):
+    """按映射检查清单收集未匹配名称,只为【有未匹配项】的检查生成 sheet(没匹配上才加)。
+    checks: 可迭代,每项 = (sheet名, 列标题, 名称集合, 映射字典, 归一化函数)。
+    返回 {sheet名: DataFrame}。新增一类检查 = 在调用处的清单里加一行即可。"""
+    sheets = {}
+    for sheet_name, column_label, names, mapping, key_func in checks:
+        missing = sorted(name for name in names if key_func(name) not in mapping)
+        if missing:
+            sheets[sheet_name] = pd.DataFrame({column_label: missing})
+    return sheets
+
+
+def fill_summary(output_df, columns):
+    """返回必输字段中【填充率未达100%】的汇总(供问题清单)。全部满 100% 时返回空表。"""
+    total = len(output_df)
+    rows = []
+    for column in columns:
+        if column not in output_df.columns:
+            continue
+        filled = int((output_df[column].astype(str).str.strip() != '').sum())
+        if filled < total:
+            rows.append({'必输字段': column, '填充数': filled, '缺失数': total - filled,
+                         '总数': total, '填充率': f'{filled / total * 100:.1f}%'})
+    return pd.DataFrame(rows, columns=['必输字段', '填充数', '缺失数', '总数', '填充率'])
+
+
 # ============================ Excel 输出 ============================
 def write_to_template(output_df, template_path, output_path, sheet_name):
     """写进导入模版(保留表头与 lov 下拉页),从第 2 行覆盖写入。"""
