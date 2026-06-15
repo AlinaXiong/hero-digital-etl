@@ -492,8 +492,9 @@ def build_fw_customer_name_map_for_ids(customer_values):
 def build_fw_contract_code_map_for_ids(contract_values):
     """泛微合同ID -> 合同编号。
 
-    browser.xtyy_httz 的配置是: select id,htbh,htbh from uf_htsp。
-    少量历史字段可能来自 uf_htk,因此 uf_htsp 未命中的 ID 再用 uf_htk 兜底。
+    开票表 uf_xtyykp.kpht 字段 (type=161 浏览框) 绑定 browser.xtyy_httz,
+    其配置为 select id,htbh,htbh from uf_htsp,故合同 ID 一定落在 uf_htsp(协同运营-合同台账)。
+    uf_htsp 查不到的 ID 视为源系统已删除的孤儿合同,留空走异常清单。
     """
     contract_ids = clean_codes(
         contract_id
@@ -517,22 +518,6 @@ def build_fw_contract_code_map_for_ids(contract_values):
         contract_code = _cell_text(row['contract_code'])
         if contract_id and contract_code:
             result[contract_id] = contract_code
-
-    missing_ids = [contract_id for contract_id in contract_ids if contract_id not in result]
-    if missing_ids:
-        legacy_df = query_db(
-            'FW',
-            'vspn_xtyy',
-            'SELECT id, htbh contract_code '
-            'FROM uf_htk '
-            f'WHERE id IN ({in_placeholders(missing_ids)})',
-            missing_ids,
-        )
-        for _, row in legacy_df.iterrows():
-            contract_id = format_code(row['id'])
-            contract_code = _cell_text(row['contract_code'])
-            if contract_id and contract_code:
-                result[contract_id] = contract_code
     return result
 
 
