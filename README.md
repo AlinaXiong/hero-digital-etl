@@ -9,6 +9,7 @@
 | 任务名 | 业务含义 | 数据源 | 产出模板 |
 | --- | --- | --- | --- |
 | `ap_payment_opening` | 应付期初 - 对公付款单 | 对公付款主表 + 明细 | 英雄期初对公付款单导入模版 |
+| `ap_payment_opening_db` | 应付期初 - 对公付款单(DB直连版) | 泛微 `uf_dgfktz` + `uf_dgfktz_dt1` | 英雄期初对公付款单导入模版 |
 | `ap_prepayment_opening` | 预付期初 - 供应商预付款单 + 零工预付款单 | 预付款主表 + 明细；零工平台付款头数据 + 实际收款人明细 | 英雄期初预付款单导入模版 |
 | `ar_invoice_opening` | 应收期初 - 应收报账单 | 开票记录 + 收款登记 | 应收报账单期初数据导入模板 |
 
@@ -21,6 +22,10 @@
 - **行粒度**：主子按 ID 合并，一行=一条费用明细
 - **关键映射**：经办人→工号(泛微)、公司主体→核算主体编码(中台)、供应商→收款方编码(中台)、预算科目→费用项目编码(规则表)、付款币种→ISO；实际已支付金额按支付状态判定
 - **产出**：`英雄期初对公付款单导入_应付期初_<YYYYMMDD>.xlsx`（24 列单 tab）
+
+### ap_payment_opening_db（应付期初 - 对公付款单 DB 直连版）
+
+与 `ap_payment_opening` 使用同一套过滤、输出和问题清单口径；源数据不读 Excel，直接从泛微库读取 `uf_dgfktz` / `uf_dgfktz_dt1`，并把人员、部门、枚举、币种、预算科目、公司主体等 ID 转成原 Excel 导出同款展示值。
 
 ### ap_prepayment_opening（预付期初 - 供应商预付款单 / 零工预付款单）
 
@@ -100,6 +105,7 @@ hero-digital-etl/
 │   ├── common.py                       # 公共能力：路径/数据库/各类映射/归一化/Excel读写/过滤统计
 │   └── tasks/
 │       ├── ap_payment_opening.py       # 应付期初 - 对公付款单
+│       ├── ap_payment_opening_db.py    # 应付期初 - 对公付款单(DB直连版)
 │       ├── ap_prepayment_opening.py    # 预付期初 - 供应商预付款单
 │       └── ar_invoice_opening.py       # 应收期初 - 应收报账单
 ├── data/
@@ -120,6 +126,47 @@ python run.py ap_payment_opening        # 或 ap_prepayment_opening / ar_invoice
 ```
 
 `.env` 读取真实数据库连接信息，本地使用即可，不要提交到 GitHub。脚本只执行 `SELECT` 查询，不写入数据库。
+
+数据库访问统一走 SQLAlchemy。调试时可打印已代入参数、可直接复制到 MySQL 执行的 SQL：
+
+```bash
+SQL_ECHO=1 python run.py ap_payment_opening_db
+```
+
+如需 SQLAlchemy 原生日志，可使用 `SQLALCHEMY_ECHO=1`。
+
+## 泛微字段含义查询
+
+泛微表字段含义以 `workflow_bill` / `workflow_billfield` / `htmllabelinfo` 为准。代码里优先用公共方法：
+
+```python
+from etl import common as c
+
+field_df = c.read_fw_field_dictionary('uf_dgfktz')
+```
+
+返回列使用代码友好的英文名：`field_id`、`field_name`、`label_name`、`field_db_type`、`field_html_type`、`field_type`、`detail_table`、`display_order`。
+
+主表和明细表字段都从同一个建模表名查，明细字段用 `detail_table` 区分。底层 SQL 口径如下：
+
+```sql
+SELECT
+    f.id AS field_id,
+    f.fieldname AS field_name,
+    l.labelname AS label_name,
+    f.fielddbtype AS field_db_type,
+    f.fieldhtmltype AS field_html_type,
+    f.type AS field_type,
+    f.detailtable AS detail_table,
+    f.dsporder AS display_order
+FROM workflow_bill b
+JOIN workflow_billfield f
+    ON f.billid = b.id
+LEFT JOIN htmllabelinfo l
+    ON l.indexid = f.fieldlabel
+   AND l.languageid = 7
+WHERE b.tablename = 'uf_dgfktz';
+```
 
 ## 排查输出（未匹配清单）
 

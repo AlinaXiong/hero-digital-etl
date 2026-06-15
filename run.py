@@ -8,11 +8,12 @@
 """
 import sys
 
-from etl.tasks import ap_payment_opening, ap_prepayment_opening, ar_invoice_opening
+from etl.tasks import ap_payment_opening, ap_payment_opening_db, ap_prepayment_opening, ar_invoice_opening
 
 # 登记任务:任务名 -> run 函数。新增任务在这里加一行。
 TASKS = {
     'ap_payment_opening': ap_payment_opening.run,         # 应付期初 对公付款单
+    'ap_payment_opening_db': ap_payment_opening_db.run,   # 应付期初 对公付款单(DB直连版)
     'ap_prepayment_opening': ap_prepayment_opening.run,   # 预付期初 供应商预付款单
     'ar_invoice_opening': ar_invoice_opening.run,         # 应收期初 应收报账单
 }

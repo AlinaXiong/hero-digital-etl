@@ -9,13 +9,15 @@
 """
 import os
 import re
+import json
 import unicodedata
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
-import pymysql
 from openpyxl import load_workbook
+from sqlalchemy import create_engine
+from sqlalchemy.engine import URL
 
 # ============================ 路径 ============================
 ROOT      = Path(__file__).resolve().parents[1]
@@ -24,6 +26,7 @@ RULES_DIR = ROOT / 'data' / 'rules'        # 映射规则
 TPL_DIR   = ROOT / 'data' / 'templates'    # 导入模版
 OUT_DIR   = ROOT / 'output'                # 产出
 RULE_XLSX = RULES_DIR / '业财项目_数据映射规则.xlsx'
+SUPPLIER_VENDOR_MAPPING_JSON = SRC_DIR / 'supplier_vendor_aliases.json'
 
 
 # ============================ 配置 / 数据库 ============================
@@ -37,19 +40,139 @@ def _load_env():
                 os.environ.setdefault(k.strip(), v.strip())
 
 
-def _db_connect(prefix, database):
-    """按前缀(FW/ZT)建只读连接。只跑 SELECT,不写生产库。"""
+def _sql_echo_enabled():
+    return os.getenv('SQL_ECHO', '').strip() == '1' or os.getenv('DEBUG_SQL', '').strip() == '1'
+
+
+def _sqlalchemy_echo_enabled():
+    return os.getenv('SQLALCHEMY_ECHO', '').strip() == '1'
+
+
+_ENGINE_CACHE = {}
+
+
+def _db_engine(prefix, database):
+    """按前缀(FW/ZT)建 SQLAlchemy engine。只跑 SELECT,不写生产库。"""
     try:
-        return pymysql.connect(
-            host=os.environ[f'{prefix}_HOST'], port=int(os.environ[f'{prefix}_PORT']),
-            user=os.environ[f'{prefix}_USER'], password=os.environ[f'{prefix}_PASS'],
-            database=database, charset='utf8mb4', connect_timeout=20)
+        config = {
+            'host': os.environ[f'{prefix}_HOST'],
+            'port': int(os.environ[f'{prefix}_PORT']),
+            'username': os.environ[f'{prefix}_USER'],
+            'password': os.environ[f'{prefix}_PASS'],
+        }
     except KeyError as e:
         raise RuntimeError(f'缺少数据库环境变量 {e};请在 .env 或环境变量配置 {prefix}_HOST/PORT/USER/PASS') from e
+
+    cache_key = (prefix, database, _sqlalchemy_echo_enabled())
+    if cache_key not in _ENGINE_CACHE:
+        url = URL.create(
+            'mysql+pymysql',
+            username=config['username'],
+            password=config['password'],
+            host=config['host'],
+            port=config['port'],
+            database=database,
+            query={'charset': 'utf8mb4'},
+        )
+        _ENGINE_CACHE[cache_key] = create_engine(
+            url,
+            echo=_sqlalchemy_echo_enabled(),
+            pool_pre_ping=True,
+            connect_args={'connect_timeout': 20},
+        )
+    return _ENGINE_CACHE[cache_key]
+
+
+def render_sql(prefix, database, sql, params=None):
+    """渲染成可直接复制到 MySQL 执行的 SQL。仅用于调试输出。"""
+    if params is None:
+        params = ()
+    elif isinstance(params, list):
+        params = tuple(params)
+    raw_conn = _db_engine(prefix, database).raw_connection()
+    try:
+        with raw_conn.cursor() as cursor:
+            rendered = cursor.mogrify(sql, params)
+            return rendered.decode('utf-8') if isinstance(rendered, bytes) else rendered
+    finally:
+        raw_conn.close()
+
+
+def query_db(prefix, database, sql, params=None):
+    """执行 SELECT 并返回 DataFrame。SQL 可使用 PyMySQL 参数风格(%s / %(name)s)。
+
+    调试 SQL:运行前设置 SQL_ECHO=1 或 DEBUG_SQL=1。
+    """
+    if params is None:
+        params = ()
+    elif isinstance(params, list):
+        params = tuple(params)
+    if _sql_echo_enabled():
+        print(f'\n-- SQL [{prefix}.{database}] --')
+        print(render_sql(prefix, database, sql, params).strip())
+    with _db_engine(prefix, database).connect() as conn:
+        result = conn.exec_driver_sql(sql, params)
+        return pd.DataFrame(result.fetchall(), columns=result.keys())
 
 
 _load_env()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def read_fw_field_dictionary(table_name, language_id=7):
+    """查询泛微建模表字段含义。
+    主表和明细字段都按 workflow_bill.tablename 查;明细字段看返回列 detail_table。"""
+    return query_db(
+        'FW',
+        'vspn_xtyy',
+        '''
+        SELECT
+            f.id AS field_id,
+            f.fieldname AS field_name,
+            l.labelname AS label_name,
+            f.fielddbtype AS field_db_type,
+            f.fieldhtmltype AS field_html_type,
+            f.type AS field_type,
+            f.detailtable AS detail_table,
+            f.dsporder AS display_order
+        FROM workflow_bill b
+        JOIN workflow_billfield f
+            ON f.billid = b.id
+        LEFT JOIN htmllabelinfo l
+            ON l.indexid = f.fieldlabel
+           AND l.languageid = %s
+        WHERE b.tablename = %s
+        ORDER BY f.viewtype, f.detailtable, f.dsporder, f.id
+        ''',
+        [language_id, table_name],
+    )
+
+
+def validate_fw_fields(table_name, expected_fields, language_id=7):
+    """用泛微字段字典校验真实 SQL 字段名/含义。
+
+    expected_fields: {detail_table: {field_name: expected_label}};主表 detail_table 用空字符串。
+    """
+    field_df = read_fw_field_dictionary(table_name, language_id=language_id).assign(
+        detail_table=lambda df: df['detail_table'].fillna('').astype(str),
+        label_key=lambda df: df['label_name'].map(normalize_name),
+    )
+    actual_labels = {
+        (row['detail_table'], row['field_name']): row['label_name']
+        for _, row in field_df.iterrows()
+    }
+    problems = []
+    for detail_table, fields in expected_fields.items():
+        for field_name, expected_label in fields.items():
+            actual_label = actual_labels.get((detail_table or '', field_name))
+            if actual_label is None:
+                problems.append(f'{detail_table or table_name}.{field_name}: 字段不存在')
+            elif normalize_name(actual_label) != normalize_name(expected_label):
+                problems.append(
+                    f'{detail_table or table_name}.{field_name}: 期望含义={expected_label}, 实际含义={actual_label}')
+    if problems:
+        raise RuntimeError('泛微字段字典校验失败:\n' + '\n'.join(problems))
+    return True
 
 
 def today_suffix():
@@ -64,6 +187,16 @@ _SPECIAL_LETTERS = str.maketrans({
     'đ': 'd', 'Đ': 'D', 'ð': 'd', 'Ð': 'D', 'ħ': 'h', 'ŧ': 't',
     'ß': 'ss', 'æ': 'ae', 'Æ': 'AE', 'œ': 'oe', 'Œ': 'OE',
 })
+_SQL_FOLD_LETTERS = (
+    ('ı', 'i'), ('İ', 'i'), ('ø', 'o'), ('Ø', 'o'), ('ł', 'l'), ('Ł', 'l'),
+    ('ß', 'ss'), ('æ', 'ae'), ('Æ', 'ae'), ('œ', 'oe'), ('Œ', 'oe'),
+    ('á', 'a'), ('à', 'a'), ('â', 'a'), ('ä', 'a'), ('ã', 'a'), ('å', 'a'),
+    ('ç', 'c'), ('é', 'e'), ('è', 'e'), ('ê', 'e'), ('ë', 'e'),
+    ('í', 'i'), ('ì', 'i'), ('î', 'i'), ('ï', 'i'),
+    ('ñ', 'n'), ('ó', 'o'), ('ò', 'o'), ('ô', 'o'), ('ö', 'o'), ('õ', 'o'),
+    ('ú', 'u'), ('ù', 'u'), ('û', 'u'), ('ü', 'u'),
+    ('ğ', 'g'), ('ş', 's'),
+)
 
 
 def _fold_accents(text):
@@ -82,6 +215,15 @@ def normalize_name(value):
     text = ''.join(ch for ch in text
                    if not (ch.isspace() or unicodedata.category(ch)[0] in ('P', 'S')))
     return text.casefold()
+
+
+def sql_normalized_name(column):
+    """生成 MySQL 名称归一化表达式,用于 WHERE IN 缩小维表查询范围。
+    输出逻辑尽量贴近 normalize_name:小写、折叠常见拉丁变音字符、移除空白和标点。"""
+    expr = f'LOWER(COALESCE({column}, ""))'
+    for source, target in _SQL_FOLD_LETTERS:
+        expr = f"REPLACE({expr}, '{source}', '{target}')"
+    return f"REGEXP_REPLACE({expr}, '[[:space:][:punct:]]', '')"
 
 
 def remove_slashes(value):
@@ -110,6 +252,82 @@ def round_amount(value):
     return '' if pd.isna(value) else round(float(value), 2)
 
 
+def _ordered_unique(values):
+    result = []
+    seen = set()
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
+def clean_codes(values):
+    """把一组 ID/编码规整成去重后的字符串列表,用于 IN 查询参数。"""
+    result = []
+    seen = set()
+    for value in values:
+        code = format_code(value)
+        if code and code not in seen:
+            seen.add(code)
+            result.append(code)
+    return result
+
+
+def _clean_codes(values):
+    return clean_codes(values)
+
+
+def in_placeholders(values):
+    """按参数个数生成 PyMySQL IN 占位符: %s,%s,%s。"""
+    return ','.join(['%s'] * len(values))
+
+
+def _in_placeholders(values):
+    return in_placeholders(values)
+
+
+def clean_text_values(values):
+    """把一组文本值去空、去重后保留原始顺序。"""
+    result = []
+    seen = set()
+    for value in values:
+        if pd.isna(value):
+            continue
+        text = str(value).strip()
+        if not text or text in ('nan', 'None'):
+            continue
+        if text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
+
+
+def normalized_name_values(values):
+    """把一组名称规整成 normalize_name 后的去重列表,用于名称匹配查询。"""
+    result = []
+    seen = set()
+    for value in clean_text_values(values):
+        key = normalize_name(value)
+        if key and key not in seen:
+            seen.add(key)
+            result.append(key)
+    return result
+
+
+def parse_browser_ids(value):
+    """解析泛微 browser 字段里的 ID 列表,保持原始顺序并去重。"""
+    if pd.isna(value):
+        return []
+    text = str(value).strip()
+    if not text or text in ('nan', 'None'):
+        return []
+    return _ordered_unique(
+        format_code(part)
+        for part in re.split(r'[,，;；、|\s]+', text)
+    )
+
+
 # ============================ 映射字典 ============================
 # 币种 -> ISO 码
 CURRENCY_TO_ISO = {
@@ -129,14 +347,12 @@ def build_employee_code_map():
     """经办人姓名 -> 工号。来源:泛微 vspn_xtyy。
     hrmresource.JOBTITLE 关联 hrmjobtitles.id 后取 hrmjobtitles.JOBTITLENAME;键用 normalize_name 归一化。
     取到占位值 'Default' 也算匹配、不留空(同名有真实工号时优先真实工号)-- 20260614Leo确认。"""
-    conn = _db_connect('FW', 'vspn_xtyy')
-    try:
-        employee_df = pd.read_sql(
-            'SELECT r.LASTNAME employee_name, j.JOBTITLENAME employee_code '
-            'FROM hrmresource r LEFT JOIN hrmjobtitles j ON r.JOBTITLE=j.id',
-            conn)
-    finally:
-        conn.close()
+    employee_df = query_db(
+        'FW',
+        'vspn_xtyy',
+        'SELECT r.LASTNAME employee_name, j.JOBTITLENAME employee_code '
+        'FROM hrmresource r LEFT JOIN hrmjobtitles j ON r.JOBTITLE=j.id',
+    )
     employee_df['key'] = employee_df['employee_name'].map(normalize_name)
     employee_code_map = {}
     for key, employee_codes in employee_df.groupby('key')['employee_code']:
@@ -150,17 +366,138 @@ def build_employee_code_map():
     return employee_code_map
 
 
+def build_fw_employee_info_map_for_ids(user_ids):
+    """泛微用户ID -> 员工信息。
+
+    uf_dgfktz.jbr 存 hrmresource.id;姓名取 hrmresource.LASTNAME,
+    工号沿用现有口径取 hrmjobtitles.JOBTITLENAME。
+    """
+    user_ids = clean_codes(user_ids)
+    if not user_ids:
+        return {}
+    employee_df = query_db(
+        'FW',
+        'vspn_xtyy',
+        'SELECT r.id, r.LASTNAME employee_name, j.JOBTITLENAME employee_code '
+        'FROM hrmresource r LEFT JOIN hrmjobtitles j ON r.JOBTITLE = j.id '
+        f'WHERE r.id IN ({in_placeholders(user_ids)})',
+        user_ids,
+    )
+    employee_map = {}
+    for _, row in employee_df.iterrows():
+        employee_id = format_code(row['id'])
+        employee_name = _cell_text(row['employee_name'])
+        employee_code = _cell_text(row['employee_code'])
+        if employee_id:
+            employee_map[employee_id] = {
+                'name': employee_name,
+                'code': employee_code,
+            }
+    return employee_map
+
+
+def build_fw_company_name_map_for_ids(company_ids):
+    """泛微公司主体ID -> 公司主体名称。
+
+    uf_dgfktz.gszt 存 uf_gstt.id;名称取 uf_gstt.gsmc。
+    """
+    company_ids = clean_codes(company_ids)
+    if not company_ids:
+        return {}
+    company_df = query_db(
+        'FW',
+        'vspn_xtyy',
+        'SELECT id, gsmc company_name '
+        f'FROM uf_gstt WHERE id IN ({in_placeholders(company_ids)})',
+        company_ids,
+    )
+    return {
+        format_code(row['id']): _cell_text(row['company_name'])
+        for _, row in company_df.iterrows()
+        if _cell_text(row['company_name'])
+    }
+
+
+def build_fw_currency_name_map_for_ids(currency_ids):
+    """泛微币种ID -> 币种名称。
+
+    uf_dgfktz.fkbz 存 fnacurrency.id;名称取 fnacurrency.CURRENCYNAME。
+    """
+    currency_ids = clean_codes(currency_ids)
+    if not currency_ids:
+        return {}
+    currency_df = query_db(
+        'FW',
+        'vspn_xtyy',
+        'SELECT id, CURRENCYNAME currency_name '
+        f'FROM fnacurrency WHERE id IN ({in_placeholders(currency_ids)})',
+        currency_ids,
+    )
+    return {
+        format_code(row['id']): _cell_text(row['currency_name'])
+        for _, row in currency_df.iterrows()
+        if _cell_text(row['currency_name'])
+    }
+
+
+def build_fw_budget_subject_path_map_for_ids(subject_ids):
+    """泛微预算科目ID -> 预算科目完整路径。
+
+    uf_dgfktz_dt1.yskm 存 fnabudgetfeetype.id;
+    fnabudgetfeetype.ALLSUPSUBJECTIDS 存祖先ID链,再按 ID 查名称并拼出路径。
+    """
+    subject_ids = clean_codes(subject_ids)
+    if not subject_ids:
+        return {}
+    subject_df = query_db(
+        'FW',
+        'vspn_xtyy',
+        'SELECT id, NAME subject_name, ALLSUPSUBJECTIDS ancestor_ids '
+        f'FROM fnabudgetfeetype WHERE id IN ({in_placeholders(subject_ids)})',
+        subject_ids,
+    )
+    ancestor_ids = []
+    for value in subject_df['ancestor_ids']:
+        for part in str(value or '').split(','):
+            code = format_code(part)
+            if code:
+                ancestor_ids.append(code)
+    ancestor_ids = clean_codes(ancestor_ids)
+    if not ancestor_ids:
+        return {
+            format_code(row['id']): _cell_text(row['subject_name'])
+            for _, row in subject_df.iterrows()
+        }
+
+    ancestor_df = query_db(
+        'FW',
+        'vspn_xtyy',
+        'SELECT id, NAME subject_name '
+        f'FROM fnabudgetfeetype WHERE id IN ({in_placeholders(ancestor_ids)})',
+        ancestor_ids,
+    )
+    name_by_id = {
+        format_code(row['id']): _cell_text(row['subject_name'])
+        for _, row in ancestor_df.iterrows()
+        if _cell_text(row['subject_name'])
+    }
+    subject_map = {}
+    for _, row in subject_df.iterrows():
+        subject_id = format_code(row['id'])
+        ids = [format_code(part) for part in str(row['ancestor_ids'] or '').split(',') if format_code(part)]
+        subject_map[subject_id] = '/'.join(name_by_id.get(code, '') for code in ids if name_by_id.get(code))
+    return subject_map
+
+
 def build_vendor_map():
     """供应商名称 -> 中台供应商编码 vender_code。来源:中台 hfins_base.hfbs_system_vender。
     按 description / taxpayer_name 建键(均 normalize_name 归一化)。"""
-    conn = _db_connect('ZT', 'hfins_base')
-    try:
-        vendor_df = pd.read_sql(
-            'SELECT vender_code vendor_code, description vendor_name, taxpayer_name taxpayer_name '
-            'FROM hfbs_system_vender',
-            conn)
-    finally:
-        conn.close()
+    vendor_df = query_db(
+        'ZT',
+        'hfins_base',
+        'SELECT vender_code vendor_code, description vendor_name, taxpayer_name taxpayer_name '
+        'FROM hfbs_system_vender',
+    )
     vendor_map = {}
     for _, row in vendor_df.iterrows():
         for name in (row['vendor_name'], row['taxpayer_name']):
@@ -170,17 +507,253 @@ def build_vendor_map():
     return vendor_map
 
 
+def load_same_supplier_mapping(mapping_file=SUPPLIER_VENDOR_MAPPING_JSON, log_prefix=''):
+    """读取“视为同一个供应商”规则:供应商泛微Id -> targetId。"""
+    if not mapping_file.exists():
+        return {}
+
+    with mapping_file.open('r', encoding='utf-8-sig') as f:
+        data = json.load(f)
+    rows = data.values() if isinstance(data, dict) else data
+
+    mapping = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        source_id = format_code(
+            row.get('供应商泛微Id')
+            or row.get('Id')
+            or row.get('id')
+            or row.get('supplierId')
+        )
+        target_id = format_code(row.get('targetId') or row.get('target_id'))
+        if source_id and target_id:
+            mapping[source_id] = target_id
+    prefix = f'{log_prefix} ' if log_prefix else ''
+    print(f'{prefix}供应商ID归并规则: {mapping_file} ({len(mapping)} 条)')
+    return mapping
+
+
+def resolve_same_supplier_id(supplier_id, same_supplier_map):
+    """把 JSON 中声明为同一供应商的源ID归并到 targetId。"""
+    current_id = format_code(supplier_id)
+    seen = set()
+    while current_id and current_id in same_supplier_map and current_id not in seen:
+        seen.add(current_id)
+        current_id = same_supplier_map[current_id]
+    return current_id
+
+
+def build_fw_supplier_status_map(supplier_values):
+    """泛微供应商ID -> 供应商状态。
+
+    browser.gysk 的配置是: select id,khmc,khmc from uf_khgys where zt='0'。
+    所以多供应商时优先选 zt=0 的供应商,避开已失效供应商。
+    """
+    supplier_id_values = clean_codes(
+        supplier_id
+        for value in supplier_values
+        for supplier_id in parse_browser_ids(value)
+    )
+    if not supplier_id_values:
+        return {}
+
+    supplier_df = query_db(
+        'FW',
+        'vspn_xtyy',
+        'SELECT id, khmc supplier_name, zt status_code, rzzt certification_status '
+        'FROM uf_khgys '
+        f'WHERE id IN ({in_placeholders(supplier_id_values)})',
+        supplier_id_values,
+    )
+    result = {}
+    for _, row in supplier_df.iterrows():
+        supplier_id = format_code(row['id'])
+        if supplier_id:
+            result[supplier_id] = {
+                'name': '' if pd.isna(row['supplier_name']) else str(row['supplier_name']).strip(),
+                'status_code': format_code(row['status_code']),
+                'certification_status': format_code(row['certification_status']),
+            }
+    return result
+
+
+def choose_fw_supplier_id(supplier_id_values, supplier_status_map):
+    """多供应商ID时,优先选择泛微供应商库里未失效的供应商。"""
+    ids = _ordered_unique(format_code(value) for value in supplier_id_values)
+    if not ids:
+        return ''
+    if len(ids) == 1:
+        return ids[0]
+
+    def score(supplier_id):
+        status = supplier_status_map.get(supplier_id, {})
+        status_code = status.get('status_code', '')
+        certification_status = status.get('certification_status', '')
+        return (
+            0 if status_code == '0' else 1,
+            0 if certification_status == '0' else 1,
+            ids.index(supplier_id),
+        )
+
+    return min(ids, key=score)
+
+
+def build_hand_vendor_info_by_ids(target_ids):
+    """Hand 供应商ID(vender_id) -> 供应商信息。"""
+    target_ids = clean_codes(target_ids)
+    if not target_ids:
+        return {}
+
+    vendor_df = query_db(
+        'ZT',
+        'hfins_base',
+        'SELECT vender_id, vender_code, description vendor_name, taxpayer_name '
+        'FROM hfbs_system_vender '
+        f'WHERE vender_id IN ({in_placeholders(target_ids)})',
+        target_ids,
+    )
+    result = {}
+    for _, row in vendor_df.iterrows():
+        vendor_id = format_code(row['vender_id'])
+        vendor_code = '' if pd.isna(row['vender_code']) else str(row['vender_code']).strip()
+        vendor_name = '' if pd.isna(row['vendor_name']) else str(row['vendor_name']).strip()
+        taxpayer_name = '' if pd.isna(row['taxpayer_name']) else str(row['taxpayer_name']).strip()
+        if vendor_id:
+            result[vendor_id] = {
+                'code': '' if vendor_code in ('nan', 'None') else vendor_code,
+                'name': '' if vendor_name in ('nan', 'None') else vendor_name,
+                'taxpayer_name': '' if taxpayer_name in ('nan', 'None') else taxpayer_name,
+                'match_method': 'supplier_id',
+            }
+    return result
+
+
+def _series_like(values, index):
+    if values is None:
+        return pd.Series([''] * len(index), index=index)
+    if isinstance(values, pd.Series):
+        return values.reindex(index)
+    return pd.Series(values, index=index)
+
+
+def build_supplier_vendor_missing_report(
+        supplier_values, supplier_texts, document_numbers, selected_by_index, source_to_target, vendor_by_source_id):
+    """生成 Hand 按供应商ID查不到的诊断清单。"""
+    supplier_series = supplier_values if isinstance(supplier_values, pd.Series) else pd.Series(supplier_values)
+    text_series = _series_like(supplier_texts, supplier_series.index)
+    doc_series = _series_like(document_numbers, supplier_series.index)
+
+    grouped = {}
+    for index in supplier_series.index:
+        source_id = selected_by_index.get(index, '')
+        if not source_id or vendor_by_source_id.get(source_id):
+            continue
+        item = grouped.setdefault(source_id, {
+            '泛微供应商ID': source_id,
+            '泛微供应商文本': [],
+            '单据编号': [],
+        })
+        supplier_text = _cell_text(text_series.get(index, ''))
+        document_number = _cell_text(doc_series.get(index, ''))
+        if supplier_text and supplier_text not in item['泛微供应商文本']:
+            item['泛微供应商文本'].append(supplier_text)
+        if document_number and document_number not in item['单据编号']:
+            item['单据编号'].append(document_number)
+
+    rows = []
+    for item in grouped.values():
+        rows.append({
+            '泛微供应商ID': item['泛微供应商ID'],
+            '泛微供应商文本': ' | '.join(item['泛微供应商文本'][:3]),
+            '单据数': len(item['单据编号']),
+            '示例流程编号': ' | '.join(item['单据编号'][:5]),
+        })
+    report_df = pd.DataFrame(rows, columns=[
+        '泛微供应商ID', '泛微供应商文本', '单据数', '示例流程编号',
+    ])
+    if not report_df.empty:
+        report_df = report_df.sort_values(
+            '泛微供应商ID',
+            key=lambda series: pd.to_numeric(series, errors='coerce').fillna(float('inf')),
+        ).reset_index(drop=True)
+    return report_df
+
+
+def build_supplier_vendor_info_map_for_rows(
+        supplier_values, supplier_texts=None, document_numbers=None, same_supplier_map=None,
+        missing_report_file=None, log_prefix=''):
+    """逐行确定 Hand 供应商。
+
+    supplier_values 为泛微 gys 字段序列。多供应商ID时先查泛微供应商库 uf_khgys,
+    优先选择 zt=0 的有效供应商;选中的供应商ID再套同供应商归并规则,
+    最后用 Hand hfbs_system_vender.vender_id 查编码。
+
+    返回值按传入 Series 的 index 对齐: {index: {'code': ..., 'name': ...}}。
+    若传入 missing_report_file,每次额外输出 Hand 按ID查不到的供应商诊断 Excel。
+    """
+    supplier_series = supplier_values if isinstance(supplier_values, pd.Series) else pd.Series(supplier_values)
+    mapping = same_supplier_map if same_supplier_map is not None else load_same_supplier_mapping(log_prefix=log_prefix)
+    supplier_status_map = build_fw_supplier_status_map(supplier_series)
+
+    source_to_target = {}
+    candidate_ids_by_index = {}
+    for index, value in supplier_series.items():
+        ids = parse_browser_ids(value)
+        selected_id = choose_fw_supplier_id(ids, supplier_status_map)
+        candidate_ids = _ordered_unique([selected_id] + ids)
+        candidate_ids_by_index[index] = candidate_ids
+        for source_id in candidate_ids:
+            if source_id and source_id not in source_to_target:
+                source_to_target[source_id] = resolve_same_supplier_id(source_id, mapping)
+
+    vendor_by_target_id = build_hand_vendor_info_by_ids(source_to_target.values())
+    vendor_by_source_id = {
+        source_id: vendor_by_target_id.get(target_id, {})
+        for source_id, target_id in source_to_target.items()
+    }
+
+    vendor_by_row = {}
+    changed_multi_count = 0
+    hand_fallback_count = 0
+    selected_by_index = {}
+    for index, value in supplier_series.items():
+        ids = parse_browser_ids(value)
+        candidate_ids = candidate_ids_by_index.get(index, [])
+        preferred_id = candidate_ids[0] if candidate_ids else ''
+        selected_id = next((supplier_id for supplier_id in candidate_ids
+                            if vendor_by_source_id.get(supplier_id)), preferred_id)
+        selected_by_index[index] = selected_id
+        if len(ids) > 1 and selected_id and selected_id != ids[0]:
+            changed_multi_count += 1
+        if selected_id and preferred_id and selected_id != preferred_id:
+            hand_fallback_count += 1
+        vendor_by_row[index] = vendor_by_source_id.get(selected_id, {})
+
+    prefix = f'{log_prefix} ' if log_prefix else ''
+    print(f'{prefix}多供应商按有效状态改选: {changed_multi_count} 行')
+    print(f'{prefix}供应商首选ID未命中后续ID命中: {hand_fallback_count} 行')
+    if missing_report_file is not None:
+        report_file = Path(missing_report_file)
+        report_df = build_supplier_vendor_missing_report(
+            supplier_series, supplier_texts, document_numbers,
+            selected_by_index, source_to_target, vendor_by_source_id,
+        )
+        report_file.parent.mkdir(parents=True, exist_ok=True)
+        report_df.to_excel(report_file, index=False)
+        print(f'{prefix}Hand按ID查不到的供应商清单已写出: {report_file} ({len(report_df)} 条)')
+    return vendor_by_row
+
+
 def build_customer_map():
     """客户名称 -> 中台客户编码 customer_code。来源:中台 hfins_base.hfbs_system_customer。
     按 description / taxpayer_name 建键(均 normalize_name 归一化)。"""
-    conn = _db_connect('ZT', 'hfins_base')
-    try:
-        customer_df = pd.read_sql(
-            'SELECT customer_code, description customer_name, taxpayer_name '
-            'FROM hfbs_system_customer',
-            conn)
-    finally:
-        conn.close()
+    customer_df = query_db(
+        'ZT',
+        'hfins_base',
+        'SELECT customer_code, description customer_name, taxpayer_name '
+        'FROM hfbs_system_customer',
+    )
     customer_map = {}
     for _, row in customer_df.iterrows():
         for name in (row['customer_name'], row['taxpayer_name']):
@@ -192,17 +765,15 @@ def build_customer_map():
 
 def build_lov_meaning_map(lov_code):
     """HZero 值集 meaning -> value。用于把业务侧展示值转成汉得编码。"""
-    conn = _db_connect('ZT', 'hzero_platform')
-    try:
-        lov_df = pd.read_sql(
-            'SELECT v.value, v.meaning '
-            'FROM hpfm_lov l JOIN hpfm_lov_value v ON v.lov_id = l.lov_id '
-            'WHERE l.lov_code = %s AND v.enabled_flag = 1 '
-            'ORDER BY v.order_seq, v.value',
-            conn,
-            params=[lov_code])
-    finally:
-        conn.close()
+    lov_df = query_db(
+        'ZT',
+        'hzero_platform',
+        'SELECT v.value, v.meaning '
+        'FROM hpfm_lov l JOIN hpfm_lov_value v ON v.lov_id = l.lov_id '
+        'WHERE l.lov_code = %s AND v.enabled_flag = 1 '
+        'ORDER BY v.order_seq, v.value',
+        [lov_code],
+    )
     return {
         str(row['meaning']).strip(): str(row['value']).strip()
         for _, row in lov_df.iterrows()
@@ -213,15 +784,13 @@ def build_lov_meaning_map(lov_code):
 def build_tax_type_description_map(preferred_descriptions=None):
     """税率 -> 汉得税率类型描述。preferred_descriptions 可指定每个税率优先使用的 description。
     键统一为小数税率,例如 6% 为 0.06。"""
-    conn = _db_connect('ZT', 'hfins_base')
-    try:
-        tax_df = pd.read_sql(
-            'SELECT tax_type_code, description, tax_type_rate, sale_tax_flag, input_tax_flag, enabled_flag '
-            'FROM hfbs_tax_type '
-            'WHERE enabled_flag = 1',
-            conn)
-    finally:
-        conn.close()
+    tax_df = query_db(
+        'ZT',
+        'hfins_base',
+        'SELECT tax_type_code, description, tax_type_rate, sale_tax_flag, input_tax_flag, enabled_flag '
+        'FROM hfbs_tax_type '
+        'WHERE enabled_flag = 1',
+    )
 
     tax_df['rate_key'] = pd.to_numeric(tax_df['tax_type_rate'], errors='coerce').round(4)
     description_to_rate = {
@@ -253,14 +822,12 @@ def build_tax_type_description_map(preferred_descriptions=None):
 def build_accounting_entity_map():
     """公司主体名称 -> 核算主体编号。来源:中台 hfins_base_account.hfac_accounting_entity。
     按 acc_entity_name 建键。"""
-    conn = _db_connect('ZT', 'hfins_base_account')
-    try:
-        entity_df = pd.read_sql(
-            'SELECT acc_entity_code, acc_entity_name '
-            'FROM hfac_accounting_entity',
-            conn)
-    finally:
-        conn.close()
+    entity_df = query_db(
+        'ZT',
+        'hfins_base_account',
+        'SELECT acc_entity_code, acc_entity_name '
+        'FROM hfac_accounting_entity',
+    )
     entity_map = {}
     for _, row in entity_df.iterrows():
         code = str(row['acc_entity_code']).strip()
@@ -272,16 +839,40 @@ def build_accounting_entity_map():
     return entity_map
 
 
+def build_accounting_entity_map_for_names(names):
+    """公司主体名称 -> Hand 核算主体编号。
+
+    只按传入名称缩小查询范围,避免每个任务都全表读取 hfac_accounting_entity。
+    """
+    keys = normalized_name_values(names)
+    if not keys:
+        return {}
+    entity_key = sql_normalized_name('acc_entity_name')
+    entity_df = query_db(
+        'ZT',
+        'hfins_base_account',
+        'SELECT acc_entity_code, acc_entity_name '
+        'FROM hfac_accounting_entity '
+        f'WHERE {entity_key} IN ({in_placeholders(keys)})',
+        keys,
+    )
+    entity_map = {}
+    for _, row in entity_df.iterrows():
+        code = _cell_text(row['acc_entity_code'])
+        key = normalize_name(row['acc_entity_name'])
+        if key and code and key not in entity_map:
+            entity_map[key] = code
+    return entity_map
+
+
 def build_fw_company_map():
     """泛微公司主体ID -> 公司主体名称。来源:泛微 vspn_xtyy.uf_gstt。"""
-    conn = _db_connect('FW', 'vspn_xtyy')
-    try:
-        company_df = pd.read_sql(
-            'SELECT id company_id, gsmc company_name '
-            'FROM uf_gstt',
-            conn)
-    finally:
-        conn.close()
+    company_df = query_db(
+        'FW',
+        'vspn_xtyy',
+        'SELECT id company_id, gsmc company_name '
+        'FROM uf_gstt',
+    )
     company_map = {}
     for _, row in company_df.iterrows():
         company_id = format_code(row['company_id'])

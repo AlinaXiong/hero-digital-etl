@@ -1,4 +1,5 @@
 pandas>=2.0
 openpyxl>=3.1
 pymysql>=1.1
+SQLAlchemy>=2.0
 python-calamine>=0.2   # 读规则表(WPS保存后openpyxl会因颜色XML报错,calamine对样式更宽容)
