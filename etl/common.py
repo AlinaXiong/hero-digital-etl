@@ -440,6 +440,102 @@ def build_fw_currency_name_map_for_ids(currency_ids):
     }
 
 
+def build_fw_department_name_map_for_ids(department_ids):
+    """泛微部门ID -> 部门名称。
+
+    uf_xtyykp.sqrbm 等字段存 hrmdepartment.id;名称取 hrmdepartment.DEPARTMENTNAME。
+    """
+    department_ids = clean_codes(department_ids)
+    if not department_ids:
+        return {}
+    department_df = query_db(
+        'FW',
+        'vspn_xtyy',
+        'SELECT id, DEPARTMENTNAME department_name '
+        f'FROM hrmdepartment WHERE id IN ({in_placeholders(department_ids)})',
+        department_ids,
+    )
+    return {
+        format_code(row['id']): _cell_text(row['department_name'])
+        for _, row in department_df.iterrows()
+        if _cell_text(row['department_name'])
+    }
+
+
+def build_fw_customer_name_map_for_ids(customer_values):
+    """泛微客户ID -> 客户名称。
+
+    browser.khk 的配置是: select id,khmc,khmc from uf_khgys。
+    """
+    customer_ids = clean_codes(
+        customer_id
+        for value in customer_values
+        for customer_id in parse_browser_ids(value)
+    )
+    if not customer_ids:
+        return {}
+    customer_df = query_db(
+        'FW',
+        'vspn_xtyy',
+        'SELECT id, khmc customer_name '
+        'FROM uf_khgys '
+        f'WHERE id IN ({in_placeholders(customer_ids)})',
+        customer_ids,
+    )
+    return {
+        format_code(row['id']): _cell_text(row['customer_name'])
+        for _, row in customer_df.iterrows()
+        if _cell_text(row['customer_name'])
+    }
+
+
+def build_fw_contract_code_map_for_ids(contract_values):
+    """泛微合同ID -> 合同编号。
+
+    browser.xtyy_httz 的配置是: select id,htbh,htbh from uf_htsp。
+    少量历史字段可能来自 uf_htk,因此 uf_htsp 未命中的 ID 再用 uf_htk 兜底。
+    """
+    contract_ids = clean_codes(
+        contract_id
+        for value in contract_values
+        for contract_id in parse_browser_ids(value)
+    )
+    if not contract_ids:
+        return {}
+
+    result = {}
+    contract_df = query_db(
+        'FW',
+        'vspn_xtyy',
+        'SELECT id, htbh contract_code '
+        'FROM uf_htsp '
+        f'WHERE id IN ({in_placeholders(contract_ids)})',
+        contract_ids,
+    )
+    for _, row in contract_df.iterrows():
+        contract_id = format_code(row['id'])
+        contract_code = _cell_text(row['contract_code'])
+        if contract_id and contract_code:
+            result[contract_id] = contract_code
+
+    missing_ids = [contract_id for contract_id in contract_ids if contract_id not in result]
+    if missing_ids:
+        legacy_df = query_db(
+            'FW',
+            'vspn_xtyy',
+            'SELECT id, htbh contract_code '
+            'FROM uf_htk '
+            f'WHERE id IN ({in_placeholders(missing_ids)})',
+            missing_ids,
+        )
+        for _, row in legacy_df.iterrows():
+            contract_id = format_code(row['id'])
+            contract_code = _cell_text(row['contract_code'])
+            if contract_id and contract_code:
+                result[contract_id] = contract_code
+    return result
+
+
 def build_fw_budget_subject_path_map_for_ids(subject_ids):
     """泛微预算科目ID -> 预算科目完整路径。
 
@@ -760,6 +856,38 @@ def build_customer_map():
             key = normalize_name(name)
             if key and key not in ('nan', 'none') and key not in customer_map:
                 customer_map[key] = str(row['customer_code']).strip()
+    return customer_map
+
+
+def build_customer_map_for_names(names):
+    """客户名称 -> 中台客户编码。
+
+    只按传入名称缩小查询范围;按 description / taxpayer_name 建键。
+    """
+    keys = normalized_name_values(names)
+    if not keys:
+        return {}
+    description_key = sql_normalized_name('description')
+    taxpayer_key = sql_normalized_name('taxpayer_name')
+    placeholders = in_placeholders(keys)
+    customer_df = query_db(
+        'ZT',
+        'hfins_base',
+        'SELECT customer_code, description customer_name, taxpayer_name '
+        'FROM hfbs_system_customer '
+        f'WHERE {description_key} IN ({placeholders}) '
+        f'   OR {taxpayer_key} IN ({placeholders})',
+        keys + keys,
+    )
+    customer_map = {}
+    for _, row in customer_df.iterrows():
+        customer_code = _cell_text(row['customer_code'])
+        if not customer_code:
+            continue
+        for name in (row['customer_name'], row['taxpayer_name']):
+            key = normalize_name(name)
+            if key and key not in ('nan', 'none') and key not in customer_map:
+                customer_map[key] = customer_code
     return customer_map
 
 

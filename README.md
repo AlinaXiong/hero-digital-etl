@@ -12,6 +12,7 @@
 | `ap_payment_opening_db` | 应付期初 - 对公付款单(DB直连版) | 泛微 `uf_dgfktz` + `uf_dgfktz_dt1` | 英雄期初对公付款单导入模版 |
 | `ap_prepayment_opening` | 预付期初 - 供应商预付款单 + 零工预付款单 | 预付款主表 + 明细；零工平台付款头数据 + 实际收款人明细 | 英雄期初预付款单导入模版 |
 | `ar_invoice_opening` | 应收期初 - 应收报账单 | 开票记录 + 收款登记 | 应收报账单期初数据导入模板 |
+| `ar_invoice_opening_db` | 应收期初 - 应收报账单(DB直连版) | 泛微 `uf_xtyykp` + `uf_skdj` | 应收报账单期初数据导入模板 |
 
 ### ap_payment_opening（应付期初 - 对公付款单）
 
@@ -50,6 +51,10 @@
 - **行粒度**：一行=一条开票记录；收款登记按「开票/预收单号=流程编号」聚合已收款金额后回填核销金额
 - **关键映射**：申请人→工号、公司主体→核算主体编码、客户→付款对象编码、业务类型→`HERO.BUSINESS_TYPE` 编码、开票类型默认合同开票、税率→`hfbs_tax_type.description`
 - **产出**：`英雄应收报账单期初数据导入_应收期初_<YYYYMMDD>.xlsx`（71 列单 tab）
+
+### ar_invoice_opening_db（应收期初 - 应收报账单 DB 直连版）
+
+与 `ar_invoice_opening` 使用同一套过滤、输出和问题清单口径；源数据不读 Excel，直接从泛微库读取 `uf_xtyykp`，并按「开票/预收单号」关联 `uf_skdj` 汇总已收款金额。申请人、部门、公司主体、客户、合同、币种等 ID 在公共方法里批量解析。
 
 ## 当前清洗进度（2026-06-14）
 
@@ -107,7 +112,8 @@ hero-digital-etl/
 │       ├── ap_payment_opening.py       # 应付期初 - 对公付款单
 │       ├── ap_payment_opening_db.py    # 应付期初 - 对公付款单(DB直连版)
 │       ├── ap_prepayment_opening.py    # 预付期初 - 供应商预付款单
-│       └── ar_invoice_opening.py       # 应收期初 - 应收报账单
+│       ├── ar_invoice_opening.py       # 应收期初 - 应收报账单
+│       └── ar_invoice_opening_db.py    # 应收期初 - 应收报账单(DB直连版)
 ├── data/
 │   ├── source/<任务名>/                # 各任务源表(文件名保持来源系统原名)
 │   ├── rules/业财项目_数据映射规则.xlsx
