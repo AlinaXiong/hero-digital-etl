@@ -6,13 +6,14 @@
 
 查看当前所有任务：`python run.py --list`
 
-| 任务名 | 业务含义 | 数据源 | 产出模板 |
-| --- | --- | --- | --- |
-| `ap_payment_opening` | 应付期初 - 对公付款单 | 对公付款主表 + 明细 | 英雄期初对公付款单导入模版 |
-| `ap_payment_opening_db` | 应付期初 - 对公付款单(DB直连版) | 泛微 `uf_dgfktz` + `uf_dgfktz_dt1` | 英雄期初对公付款单导入模版 |
-| `ap_prepayment_opening` | 预付期初 - 供应商预付款单 + 零工预付款单 | 预付款主表 + 明细；零工平台付款头数据 + 实际收款人明细 | 英雄期初预付款单导入模版 |
-| `ar_invoice_opening` | 应收期初 - 应收报账单 | 开票记录 + 收款登记 | 应收报账单期初数据导入模板 |
-| `ar_invoice_opening_db` | 应收期初 - 应收报账单(DB直连版) | 泛微 `uf_xtyykp` + `uf_skdj` | 应收报账单期初数据导入模板 |
+| 任务名 | 业务含义 | 数据源                                                                                           | 产出模板 |
+| --- | --- |-----------------------------------------------------------------------------------------------| --- |
+| `ap_payment_opening` | 应付期初 - 对公付款单 | 对公付款主表 + 明细                                                                                   | 英雄期初对公付款单导入模版 |
+| `ap_payment_opening_db` | 应付期初 - 对公付款单(DB直连版) | 泛微 `uf_dgfktz` + `uf_dgfktz_dt1`                                                              | 英雄期初对公付款单导入模版 |
+| `ap_prepayment_opening` | 预付期初 - 供应商预付款单 + 零工预付款单 | 预付款主表 + 明细；零工平台付款头数据 + 实际收款人明细                                                                | 英雄期初预付款单导入模版 |
+| `ap_prepayment_opening_db` | 预付期初 - 供应商预付款单 + 零工预付款单(DB直连版) | 泛微 `uf_yfkxx` + `uf_yfkxx_dt1`；`uf_lgptfk` +  `formtable_main_279` + `formtable_main_279_dt4` | 英雄期初预付款单导入模版 |
+| `ar_invoice_opening` | 应收期初 - 应收报账单 | 开票记录 + 收款登记                                                                                   | 应收报账单期初数据导入模板 |
+| `ar_invoice_opening_db` | 应收期初 - 应收报账单(DB直连版) | 泛微 `uf_xtyykp` + `uf_skdj`                                                                    | 应收报账单期初数据导入模板 |
 
 ### ap_payment_opening（应付期初 - 对公付款单）
 
@@ -41,6 +42,10 @@
 - **零工预付款过滤**：付款头数据流程状态=2(审批完成) 且 申请日期 ≥ 2026-01-01 且 非作废
 - **零工预付款关键映射**：经办人工号直接取源表；公司主体ID→泛微 `uf_gstt.gsmc`→中台核算主体编码；收款方文本→灵工平台收款方编码；实际收款方→中台供应商编码，若中台暂未建档则保留实际收款方原值
 - **产出**：`英雄期初预付款单导入_预付期初_<YYYYMMDD>.xlsx`，写入「期初供应商预付款单&期初投资付款单导入」和「期初灵工预付款单导入」两个 tab
+
+### ap_prepayment_opening_db（预付期初 - 供应商预付款单 / 零工预付款单 DB 直连版）
+
+与 `ap_prepayment_opening` 使用同一套过滤、输出和问题清单口径；源数据不读 Excel，供应商预付直接从泛微 `uf_yfkxx` / `uf_yfkxx_dt1` 读取，零工预付从建模头表 `uf_lgptfk` 关联原流程主表 `formtable_main_279` 和收款人明细表 `formtable_main_279_dt4` 读取。人员、公司主体、合同、银行账号、币种、预算科目、供应商等 ID 在任务内批量解析。
 
 ### ar_invoice_opening（应收期初 - 应收报账单）
 
@@ -112,6 +117,7 @@ hero-digital-etl/
 │       ├── ap_payment_opening.py       # 应付期初 - 对公付款单
 │       ├── ap_payment_opening_db.py    # 应付期初 - 对公付款单(DB直连版)
 │       ├── ap_prepayment_opening.py    # 预付期初 - 供应商预付款单
+│       ├── ap_prepayment_opening_db.py # 预付期初 - 供应商预付款单/零工预付款单(DB直连版)
 │       ├── ar_invoice_opening.py       # 应收期初 - 应收报账单
 │       └── ar_invoice_opening_db.py    # 应收期初 - 应收报账单(DB直连版)
 ├── data/
