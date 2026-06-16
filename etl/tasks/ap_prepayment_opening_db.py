@@ -468,6 +468,45 @@ def resolve_gig_budget_values(budget_df):
     return df
 
 
+def merge_gig_budget_subjects(budget_df):
+    """同一流程内先合并同类预算科目,保留预算科目首次出现顺序。"""
+    if budget_df.empty:
+        return budget_df.copy()
+
+    df = budget_df.copy()
+    df['_预算科目合并键'] = [
+        c.format_code(subject_id) or c.remove_slashes(subject_path)
+        for subject_id, subject_path in zip(df['预算科目ID'], df['预算科目'])
+    ]
+
+    merged_rows = []
+    for _, group in df.groupby(['建模付款ID', '_预算科目合并键'], sort=False, dropna=False):
+        row = group.iloc[0].copy()
+        row['预算项金额'] = c.round_amount(
+            pd.to_numeric(group['预算项金额'], errors='coerce').fillna(0).sum())
+        if '预算项人民币金额' in group.columns:
+            row['预算项人民币金额'] = c.round_amount(
+                pd.to_numeric(group['预算项人民币金额'], errors='coerce').fillna(0).sum())
+        row = row.drop(labels=['_预算科目合并键'], errors='ignore')
+        merged_rows.append(row.to_dict())
+
+    return pd.DataFrame(merged_rows)
+
+
+def map_gig_budget_expense_items(budget_df):
+    """把合并后的零工预算科目映射成新费用项目。"""
+    if budget_df.empty:
+        return budget_df.copy()
+
+    df = budget_df.copy()
+    subject_map = c.build_subject_map()
+    mapped_items = df['预算科目'].map(
+        lambda value: subject_map.get(c.remove_slashes(value), ('', '')))
+    df['费用项目编码'] = mapped_items.map(lambda item: item[0])
+    df['费用项目描述'] = mapped_items.map(lambda item: item[1])
+    return df
+
+
 def allocate_gig_budget_to_recipients(recipient_df, budget_df):
     """把原流程预算项分配到实际收款人明细。
 
@@ -476,10 +515,14 @@ def allocate_gig_budget_to_recipients(recipient_df, budget_df):
     formtable_main_279_dt3(预算项明细),实际收款人对应 formtable_main_279_dt4。
 
     分配口径:
-    - 单个预算项:每个收款人继承该预算科目,金额取本收款人的 dt4.sl(付给三方平台金额)。
-    - 多个预算项:按 dt3.fkje(预算项金额)占预算项总额比例,拆分每个收款人的金额。
+    - 同一流程内先按 dt3 预算科目合并金额,保留该预算科目的首次出现顺序。
+    - 合并后的预算科目再映射新费用项目,并以映射后的项目形成预算金额池。
+    - 按 dt4 实际收款人明细顺序依次占用预算池; 收款人金额跨预算科目边界时拆成多行。
+    - 预算项金额用完后才进入下一预算项; 不再按预算项比例拆分每个收款人。
     """
     rows = []
+    raw_budget_count = len(budget_df)
+    budget_df = map_gig_budget_expense_items(merge_gig_budget_subjects(budget_df))
     budget_by_payment = {
         key: group.copy()
         for key, group in budget_df.groupby('建模付款ID', dropna=False)
@@ -497,19 +540,26 @@ def allocate_gig_budget_to_recipients(recipient_df, budget_df):
                     '预算明细ID': '',
                     '预算科目ID': '',
                     '预算科目': '',
+                    '费用项目编码': '',
+                    '费用项目描述': '',
                     '预算项金额': '',
                     '预付款金额分摊': pd.to_numeric(recipient_row['付给三方平台金额'], errors='coerce'),
                 })
                 rows.append(row)
             continue
 
-        budget_amount = pd.to_numeric(budget_group['预算项金额'], errors='coerce').fillna(0)
-        budget_total = float(budget_amount.sum())
+        budget_group = budget_group.copy()
+        budget_group['_剩余预算项金额'] = (
+            pd.to_numeric(budget_group['预算项金额'], errors='coerce')
+            .fillna(0)
+            .map(c.round_amount)
+        )
+        budget_total = float(budget_group['_剩余预算项金额'].sum())
         if len(budget_group) > 1:
             multi_budget_payment_count += 1
 
         if budget_total == 0:
-            # 没有可用金额比例时,保留收款人粒度并带第一条预算科目,避免制造无意义笛卡尔拆分。
+            # 没有可用预算项金额时,保留收款人粒度并带第一条预算科目。
             first_budget = budget_group.iloc[0]
             for _, recipient_row in recipient_group.iterrows():
                 row = recipient_row.to_dict()
@@ -517,40 +567,65 @@ def allocate_gig_budget_to_recipients(recipient_df, budget_df):
                     '预算明细ID': first_budget.get('预算明细ID', ''),
                     '预算科目ID': first_budget.get('预算科目ID', ''),
                     '预算科目': first_budget.get('预算科目', ''),
+                    '费用项目编码': first_budget.get('费用项目编码', ''),
+                    '费用项目描述': first_budget.get('费用项目描述', ''),
                     '预算项金额': first_budget.get('预算项金额', ''),
                     '预付款金额分摊': pd.to_numeric(recipient_row['付给三方平台金额'], errors='coerce'),
                 })
                 rows.append(row)
             continue
 
-        budget_rows = list(budget_group.iterrows())
+        budget_records = [row.to_dict() for _, row in budget_group.iterrows()]
+        budget_index = 0
+
+        def append_allocated_row(recipient_row, budget_row, allocated_amount):
+            row = recipient_row.to_dict()
+            row.update({
+                '预算明细ID': budget_row.get('预算明细ID', ''),
+                '预算科目ID': budget_row.get('预算科目ID', ''),
+                '预算科目': budget_row.get('预算科目', ''),
+                '费用项目编码': budget_row.get('费用项目编码', ''),
+                '费用项目描述': budget_row.get('费用项目描述', ''),
+                '预算项金额': budget_row.get('预算项金额', ''),
+                '预付款金额分摊': allocated_amount,
+            })
+            rows.append(row)
+
         for _, recipient_row in recipient_group.iterrows():
             recipient_amount = pd.to_numeric(recipient_row['付给三方平台金额'], errors='coerce')
-            recipient_total = c.round_amount(recipient_amount) if pd.notna(recipient_amount) else recipient_amount
-            allocated_so_far = 0
-            for position, (_, budget_row) in enumerate(budget_rows):
-                budget_value = pd.to_numeric(budget_row['预算项金额'], errors='coerce')
-                ratio = 0 if pd.isna(budget_value) else float(budget_value) / budget_total
-                if pd.isna(recipient_amount):
-                    allocated_amount = recipient_amount
-                elif position == len(budget_rows) - 1:
-                    allocated_amount = recipient_total - allocated_so_far
-                else:
-                    allocated_amount = c.round_amount(recipient_amount * ratio)
-                    allocated_so_far += allocated_amount
-                row = recipient_row.to_dict()
-                row.update({
-                    '预算明细ID': budget_row.get('预算明细ID', ''),
-                    '预算科目ID': budget_row.get('预算科目ID', ''),
-                    '预算科目': budget_row.get('预算科目', ''),
-                    '预算项金额': budget_row.get('预算项金额', ''),
-                    '预付款金额分摊': allocated_amount,
-                })
-                rows.append(row)
+            current_budget_index = min(budget_index, len(budget_records) - 1)
+            if pd.isna(recipient_amount):
+                append_allocated_row(recipient_row, budget_records[current_budget_index], recipient_amount)
+                continue
+
+            remaining_recipient_amount = c.round_amount(recipient_amount)
+            if remaining_recipient_amount <= 0:
+                append_allocated_row(recipient_row, budget_records[current_budget_index], remaining_recipient_amount)
+                continue
+
+            while remaining_recipient_amount > 0:
+                if budget_index >= len(budget_records):
+                    append_allocated_row(recipient_row, budget_records[-1], remaining_recipient_amount)
+                    break
+
+                budget_row = budget_records[budget_index]
+                remaining_budget_amount = budget_row['_剩余预算项金额']
+                if remaining_budget_amount <= 0:
+                    budget_index += 1
+                    continue
+
+                allocated_amount = c.round_amount(min(remaining_recipient_amount, remaining_budget_amount))
+                append_allocated_row(recipient_row, budget_row, allocated_amount)
+
+                remaining_recipient_amount = c.round_amount(remaining_recipient_amount - allocated_amount)
+                budget_row['_剩余预算项金额'] = c.round_amount(remaining_budget_amount - allocated_amount)
+                if budget_row['_剩余预算项金额'] <= 0:
+                    budget_index += 1
 
     allocated_df = pd.DataFrame(rows)
     print('[预付期初-零工预付款-DB] 未匹配预算项的收款人明细行数:', no_budget_count)
-    print('[预付期初-零工预付款-DB] 多预算项需分摊的单据数:', multi_budget_payment_count)
+    print('[预付期初-零工预付款-DB] 预算项按预算科目合并:', raw_budget_count, '->', len(budget_df))
+    print('[预付期初-零工预付款-DB] 多预算科目顺序分配的单据数:', multi_budget_payment_count)
     print('[预付期初-零工预付款-DB] 预算项分配后明细行数:', len(allocated_df))
     return allocated_df
 
@@ -662,7 +737,8 @@ def build_gig_output(merged_df):
     """零工 DB 源数据 -> 灵工预付款单导入模版 29 列。"""
     vendor_map = c.build_vendor_map()
     entity_map = c.build_accounting_entity_map_for_names(merged_df['公司主体'])
-    subject_map = c.build_subject_map()
+    has_mapped_expense_items = {'费用项目编码', '费用项目描述'}.issubset(merged_df.columns)
+    subject_map = {} if has_mapped_expense_items else c.build_subject_map()
 
     def gig_payee_code(value):
         payee = _text(value)
@@ -707,17 +783,23 @@ def build_gig_output(merged_df):
     output_df['银行账号'] = merged_df['银行账号'].where(
         merged_df['银行账号'].notna(), '')                              # [原流程明细] dt4.yhzh(银行账号)
     output_df['预付款金额（支付币种）'] = pd.to_numeric(
-        merged_df['预付款金额分摊'], errors='coerce').map(c.round_amount)  # [原流程明细] dt4.sl(付给三方平台金额) 按 [原流程预算项明细] dt3.fkje(预算项金额)占比分摊
+        merged_df['预付款金额分摊'], errors='coerce').map(c.round_amount)  # [原流程明细] dt4.sl(付给三方平台金额) 按合并预算科目顺序占用预算项金额
 
     # 当前源数据没有直接可用的订单/计划行/银行备注,按模板留空。
     output_df['订单编号'] = ''
     output_df['订单名称'] = ''
     output_df['合同收支计划行'] = ''
     output_df['银行转账备注'] = ''
-    output_df['费用项目编码'] = merged_df['预算科目'].map(
-        lambda value: subject_item(value, 0))                            # [原流程预算项明细] dt3.yskm(预算科目) -> 规则表费用项目编码
-    output_df['费用项目描述'] = merged_df['预算科目'].map(
-        lambda value: subject_item(value, 1))                            # [原流程预算项明细] dt3.yskm(预算科目) -> 规则表费用项目描述
+    if has_mapped_expense_items:
+        output_df['费用项目编码'] = merged_df['费用项目编码'].where(
+            merged_df['费用项目编码'].notna(), '')                        # [合并预算科目] 已映射的新费用项目编码
+        output_df['费用项目描述'] = merged_df['费用项目描述'].where(
+            merged_df['费用项目描述'].notna(), '')                        # [合并预算科目] 已映射的新费用项目描述
+    else:
+        output_df['费用项目编码'] = merged_df['预算科目'].map(
+            lambda value: subject_item(value, 0))                        # [原流程预算项明细] dt3.yskm(预算科目) -> 规则表费用项目编码
+        output_df['费用项目描述'] = merged_df['预算科目'].map(
+            lambda value: subject_item(value, 1))                        # [原流程预算项明细] dt3.yskm(预算科目) -> 规则表费用项目描述
 
     # 跨系统映射字段。
     output_df['核算主体编号'] = merged_df['公司主体'].map(
