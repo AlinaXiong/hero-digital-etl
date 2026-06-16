@@ -3,13 +3,14 @@
 
 处理流程:
 1. 校验泛微字段字典,避免 SQL 字段名/含义写错。
-2. 从泛微库读取供应商预付 uf_yfkxx/uf_yfkxx_dt1,以及零工付款 uf_lgptfk + 原流程收款人明细。
+2. 从泛微库读取供应商预付 uf_yfkxx/uf_yfkxx_dt1,以及零工付款 uf_lgptfk + 原流程收款人明细/预算项明细。
 3. 只对必须跨表/跨系统的 ID 做批量解析,例如人员、公司主体、币种、预算科目、供应商、银行账号。
 4. 按导入模版两个 tab 逐列生成输出,字段旁标注取值来源。
 
 跑法:在项目根执行  python run.py ap_prepayment_opening_db
 """
 import sys
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -112,6 +113,7 @@ GIG_ISSUE_SOURCE_FIELDS = {
     '申请人工号': '经办人',
     '灵工平台收款方编码': '收款方文本',
     '核算主体编号': '公司主体',
+    '费用项目编码': '预算科目',
     '收款方编码': '实际收款方',
 }
 
@@ -119,6 +121,7 @@ FW_SUPPLIER_TABLE = 'uf_yfkxx'
 FW_SUPPLIER_DETAIL_TABLE = 'uf_yfkxx_dt1'
 FW_GIG_HEADER_TABLE = 'uf_lgptfk'
 FW_GIG_WORKFLOW_TABLE = 'formtable_main_279'
+FW_GIG_BUDGET_TABLE = 'formtable_main_279_dt3'
 FW_GIG_RECIPIENT_TABLE = 'formtable_main_279_dt4'
 
 
@@ -191,7 +194,7 @@ SELECT
 FROM uf_yfkxx m
 """
 
-GIG_SOURCE_SQL = """
+GIG_RECIPIENT_SOURCE_SQL = """
 SELECT
     h.id AS `建模付款ID`,
     w.id AS `流程付款ID`,
@@ -230,6 +233,27 @@ WHERE h.sqrq >= %(date_from)s
   AND h.lczt = %(approved_status_code)s
   AND (h.sfzf IS NULL OR h.sfzf <> %(void_code)s)
 ORDER BY h.id, d.id
+"""
+
+GIG_BUDGET_SOURCE_SQL = """
+SELECT
+    h.id AS `建模付款ID`,
+    w.id AS `流程付款ID`,
+    b.id AS `预算明细ID`,
+    h.lcbh AS `流程编号`,
+    b.yskm AS `预算科目ID`,
+    b.fysx AS `费用事项`,
+    b.fkje AS `预算项金额`,
+    b.rmbje AS `预算项人民币金额`
+FROM uf_lgptfk h
+JOIN formtable_main_279 w
+  ON CAST(w.requestId AS CHAR) = h.lczsjqqid
+JOIN formtable_main_279_dt3 b
+  ON b.mainid = w.id
+WHERE h.sqrq >= %(date_from)s
+  AND h.lczt = %(approved_status_code)s
+  AND (h.sfzf IS NULL OR h.sfzf <> %(void_code)s)
+ORDER BY h.id, b.id
 """
 
 GIG_STATS_SQL = """
@@ -297,6 +321,12 @@ EXPECTED_GIG_WORKFLOW_FIELDS = {
         'lcbh': '流程编号',
         'skfmc': '收款方名称',
         'htmc': '合同名称',
+    },
+    FW_GIG_BUDGET_TABLE: {
+        'fysx': '费用事项',
+        'yskm': '预算科目',
+        'fkje': '付给三方平台金额',
+        'rmbje': '付款人民币金额',
     },
     FW_GIG_RECIPIENT_TABLE: {
         'skf': '收款方',
@@ -425,6 +455,106 @@ def resolve_gig_source_values(source_df):
     return df
 
 
+def resolve_gig_budget_values(budget_df):
+    """基于零工原流程预算项明细补充预算科目路径。
+
+    四合一 Excel 中「零工平台付款」的费用项目来源,对应原流程 formtable_main_279_dt3:
+    - yskm(预算科目)
+    - fkje(付给三方平台金额)
+    """
+    df = budget_df.copy()
+    subject_map = c.build_fw_budget_subject_path_map_for_ids(df['预算科目ID'])
+    df['预算科目'] = df['预算科目ID'].map(lambda value: subject_map.get(c.format_code(value), ''))
+    return df
+
+
+def allocate_gig_budget_to_recipients(recipient_df, budget_df):
+    """把原流程预算项分配到实际收款人明细。
+
+    规则表「预付期初」R47 要求:从「对公&报销&零工&批量四合一」取预算科目并分配到
+    「零工平台付款_实际收款人明细」。在 DB 中,四合一里「零工平台付款」对应
+    formtable_main_279_dt3(预算项明细),实际收款人对应 formtable_main_279_dt4。
+
+    分配口径:
+    - 单个预算项:每个收款人继承该预算科目,金额取本收款人的 dt4.sl(付给三方平台金额)。
+    - 多个预算项:按 dt3.fkje(预算项金额)占预算项总额比例,拆分每个收款人的金额。
+    """
+    rows = []
+    budget_by_payment = {
+        key: group.copy()
+        for key, group in budget_df.groupby('建模付款ID', dropna=False)
+    }
+    no_budget_count = 0
+    multi_budget_payment_count = 0
+
+    for payment_id, recipient_group in recipient_df.groupby('建模付款ID', sort=False, dropna=False):
+        budget_group = budget_by_payment.get(payment_id)
+        if budget_group is None or budget_group.empty:
+            no_budget_count += len(recipient_group)
+            for _, recipient_row in recipient_group.iterrows():
+                row = recipient_row.to_dict()
+                row.update({
+                    '预算明细ID': '',
+                    '预算科目ID': '',
+                    '预算科目': '',
+                    '预算项金额': '',
+                    '预付款金额分摊': pd.to_numeric(recipient_row['付给三方平台金额'], errors='coerce'),
+                })
+                rows.append(row)
+            continue
+
+        budget_amount = pd.to_numeric(budget_group['预算项金额'], errors='coerce').fillna(0)
+        budget_total = float(budget_amount.sum())
+        if len(budget_group) > 1:
+            multi_budget_payment_count += 1
+
+        if budget_total == 0:
+            # 没有可用金额比例时,保留收款人粒度并带第一条预算科目,避免制造无意义笛卡尔拆分。
+            first_budget = budget_group.iloc[0]
+            for _, recipient_row in recipient_group.iterrows():
+                row = recipient_row.to_dict()
+                row.update({
+                    '预算明细ID': first_budget.get('预算明细ID', ''),
+                    '预算科目ID': first_budget.get('预算科目ID', ''),
+                    '预算科目': first_budget.get('预算科目', ''),
+                    '预算项金额': first_budget.get('预算项金额', ''),
+                    '预付款金额分摊': pd.to_numeric(recipient_row['付给三方平台金额'], errors='coerce'),
+                })
+                rows.append(row)
+            continue
+
+        budget_rows = list(budget_group.iterrows())
+        for _, recipient_row in recipient_group.iterrows():
+            recipient_amount = pd.to_numeric(recipient_row['付给三方平台金额'], errors='coerce')
+            recipient_total = c.round_amount(recipient_amount) if pd.notna(recipient_amount) else recipient_amount
+            allocated_so_far = 0
+            for position, (_, budget_row) in enumerate(budget_rows):
+                budget_value = pd.to_numeric(budget_row['预算项金额'], errors='coerce')
+                ratio = 0 if pd.isna(budget_value) else float(budget_value) / budget_total
+                if pd.isna(recipient_amount):
+                    allocated_amount = recipient_amount
+                elif position == len(budget_rows) - 1:
+                    allocated_amount = recipient_total - allocated_so_far
+                else:
+                    allocated_amount = c.round_amount(recipient_amount * ratio)
+                    allocated_so_far += allocated_amount
+                row = recipient_row.to_dict()
+                row.update({
+                    '预算明细ID': budget_row.get('预算明细ID', ''),
+                    '预算科目ID': budget_row.get('预算科目ID', ''),
+                    '预算科目': budget_row.get('预算科目', ''),
+                    '预算项金额': budget_row.get('预算项金额', ''),
+                    '预付款金额分摊': allocated_amount,
+                })
+                rows.append(row)
+
+    allocated_df = pd.DataFrame(rows)
+    print('[预付期初-零工预付款-DB] 未匹配预算项的收款人明细行数:', no_budget_count)
+    print('[预付期初-零工预付款-DB] 多预算项需分摊的单据数:', multi_budget_payment_count)
+    print('[预付期初-零工预付款-DB] 预算项分配后明细行数:', len(allocated_df))
+    return allocated_df
+
+
 # ============================ 模板输出:供应商预付款 ============================
 def build_supplier_output(merged_df):
     """供应商预付 DB 源数据 -> 供应商预付款单导入模版 26 列。"""
@@ -532,12 +662,18 @@ def build_gig_output(merged_df):
     """零工 DB 源数据 -> 灵工预付款单导入模版 29 列。"""
     vendor_map = c.build_vendor_map()
     entity_map = c.build_accounting_entity_map_for_names(merged_df['公司主体'])
+    subject_map = c.build_subject_map()
 
     def gig_payee_code(value):
         payee = _text(value)
         if not payee:
             return ''
         return vendor_map.get(c.normalize_name(payee)) or payee
+
+    def subject_item(subject_path, index):
+        if pd.isna(subject_path):
+            return ''
+        return subject_map.get(c.remove_slashes(subject_path), ('', ''))[index]
 
     output_df = pd.DataFrame(index=merged_df.index)
 
@@ -571,15 +707,17 @@ def build_gig_output(merged_df):
     output_df['银行账号'] = merged_df['银行账号'].where(
         merged_df['银行账号'].notna(), '')                              # [原流程明细] dt4.yhzh(银行账号)
     output_df['预付款金额（支付币种）'] = pd.to_numeric(
-        merged_df['付给三方平台金额'], errors='coerce').map(c.round_amount)  # [原流程明细] dt4.sl(付给三方平台金额)
+        merged_df['预付款金额分摊'], errors='coerce').map(c.round_amount)  # [原流程明细] dt4.sl(付给三方平台金额) 按 [原流程预算项明细] dt3.fkje(预算项金额)占比分摊
 
-    # 当前源数据没有直接可用的订单/计划行/银行备注/费用项目,按模板留空。
+    # 当前源数据没有直接可用的订单/计划行/银行备注,按模板留空。
     output_df['订单编号'] = ''
     output_df['订单名称'] = ''
     output_df['合同收支计划行'] = ''
     output_df['银行转账备注'] = ''
-    output_df['费用项目编码'] = ''
-    output_df['费用项目描述'] = ''
+    output_df['费用项目编码'] = merged_df['预算科目'].map(
+        lambda value: subject_item(value, 0))                            # [原流程预算项明细] dt3.yskm(预算科目) -> 规则表费用项目编码
+    output_df['费用项目描述'] = merged_df['预算科目'].map(
+        lambda value: subject_item(value, 1))                            # [原流程预算项明细] dt3.yskm(预算科目) -> 规则表费用项目描述
 
     # 跨系统映射字段。
     output_df['核算主体编号'] = merged_df['公司主体'].map(
@@ -607,7 +745,7 @@ def read_supplier_source():
 
 
 def read_gig_source():
-    """从 DB 直接读取过滤后的零工付款头 + 原流程收款人明细。"""
+    """从 DB 直接读取过滤后的零工付款头 + 原流程收款人明细 + 原流程预算项明细。"""
     c.validate_fw_fields(FW_GIG_HEADER_TABLE, EXPECTED_GIG_HEADER_FIELDS)
     c.validate_fw_fields(FW_GIG_WORKFLOW_TABLE, EXPECTED_GIG_WORKFLOW_FIELDS)
     stats = _query_fw(GIG_STATS_SQL).iloc[0]
@@ -619,9 +757,11 @@ def read_gig_source():
           f"其中剔除作废 {int(stats['void_count'] or 0)} 单; "
           f"最终保留主表 {int(stats['kept_count'] or 0)} 单")
 
-    merged_df = resolve_gig_source_values(_query_fw(GIG_SOURCE_SQL))
-    print('[预付期初-零工预付款-DB] SQL收款人明细行数:', len(merged_df))
-    return merged_df
+    recipient_df = resolve_gig_source_values(_query_fw(GIG_RECIPIENT_SOURCE_SQL))
+    print('[预付期初-零工预付款-DB] SQL收款人明细行数:', len(recipient_df))
+    budget_df = resolve_gig_budget_values(_query_fw(GIG_BUDGET_SOURCE_SQL))
+    print('[预付期初-零工预付款-DB] SQL预算项明细行数:', len(budget_df))
+    return allocate_gig_budget_to_recipients(recipient_df, budget_df)
 
 
 def run():
