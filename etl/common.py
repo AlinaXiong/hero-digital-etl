@@ -1192,7 +1192,9 @@ def fill_summary(output_df, columns, rule_sheet=None, table_name=None):
 
 # ============================ Excel 输出 ============================
 def _fill_sheet(worksheet, output_df):
-    """把 output_df 按列顺序写进 worksheet(保留表头第1行,清空旧数据行)。列名不影响,只看顺序。"""
+    """把 output_df 按列顺序写进 worksheet(保留表头样式,清空旧数据行)。"""
+    for col_idx, column_name in enumerate(output_df.columns, start=1):
+        worksheet.cell(row=1, column=col_idx).value = column_name
     if worksheet.max_row > 1:
         worksheet.delete_rows(2, worksheet.max_row)
     for _, row in output_df.iterrows():
