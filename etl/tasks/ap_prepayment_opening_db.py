@@ -70,6 +70,7 @@ SUPPLIER_OUTPUT_COLUMNS = [
     '已到票核销金额（支付币种）',
     '已付未核（支付币种）',
     '泛微项目编号',
+    '泛微费用项目编码',
 ]
 GIG_OUTPUT_COLUMNS = [
     '来源系统',
@@ -102,6 +103,7 @@ GIG_OUTPUT_COLUMNS = [
     '退款状态',
     '核销状态',
     '泛微项目编号',
+    '泛微费用项目编码',
 ]
 
 SUPPLIER_ISSUE_SOURCE_FIELDS = {
@@ -129,11 +131,10 @@ FW_GIG_BUDGET_TABLE = 'formtable_main_279_dt3'
 FW_GIG_RECIPIENT_TABLE = 'formtable_main_279_dt4'
 FW_PROJECT_TABLE = 'uf_xtyyxmkp'
 ORDER_MAPPING_ENV = 'PROJECT_ORDER_MAPPING_XLSX'
-ORDER_MAPPING_XLSX_NAME = '业财项目_项目&订单清洗_0618.xlsx'
+ORDER_MAPPING_XLSX_NAME = '业财项目_项目&订单清洗_0619.xlsx'
 ORDER_MAPPING_SHEETS = {
-    '赛事本部订单': '赛事订单主表_清洗后',
-    'MCN本部订单': 'MCN订单主表_清洗后',
-    '全量协同订单': '全量协同订单_清洗后',
+    '全量项目': '全量项目_清洗后',
+    '全量订单': '全量订单主表_清洗后',
 }
 
 
@@ -438,156 +439,146 @@ def _read_cleaned_order_sheet(path, sheet_name, required_columns):
     return df
 
 
-def _append_order_mapping_rows(
-        rows, df, source_name, fanwei_column, order_column, title_column,
-        project_column, project_name_column=''):
-    for _, row in df.iterrows():
-        fanwei_project = _text(row.get(fanwei_column, ''))
-        order_code = _text(row.get(order_column, ''))
-        if not fanwei_project or not order_code:
-            continue
-        rows.append({
-            '泛微项目编号': fanwei_project,
-            '订单编号': order_code,
-            '订单标题': _text(row.get(title_column, '')),
-            '项目编号': _text(row.get(project_column, '')),
-            '项目名称': _text(row.get(project_name_column, '')) if project_name_column else '',
-            '映射来源': source_name,
-        })
+def _empty_order_presence_df():
+    return pd.DataFrame(columns=['泛微项目编号', '订单编号', '订单标题', '映射来源'])
 
 
-def _append_order_presence_rows(
-        rows, df, source_name, fanwei_column, order_column, title_column):
-    """收集订单表中出现过的泛微项目编号,用于解释未匹配原因。
+def _empty_order_candidates_df():
+    return pd.DataFrame(columns=['泛微项目编号', '订单编号', '订单标题', '项目编号', '项目名称', '映射来源'])
 
-    这里和 _append_order_mapping_rows 的区别是:
-    - 正式映射只保留「泛微项目编号 + 订单编号」都不为空的记录。
-    - presence 检查只要求泛微项目编号存在,即使订单编号为空也保留。
 
-    这样未匹配时可以区分两类情况:
-    1. 0618 三个订单表里完全没有这个泛微项目编号。
-    2. 订单表里有这个泛微项目编号,但订单编号为空,所以不能写入导入模板。
-    """
-    for _, row in df.iterrows():
-        # 不同订单表的泛微项目列名不同,通过 fanwei_column 参数统一读取。
-        fanwei_project = _text(row.get(fanwei_column, ''))
+def _build_full_project_lookup(mapping_file):
+    """读取 0619 新版全量项目表,建立 新项目编码 -> 原泛微项目编码 的映射。"""
+    project_df = _read_cleaned_order_sheet(
+        mapping_file,
+        ORDER_MAPPING_SHEETS['全量项目'],
+        ['原泛微项目编码', '项目编码', '项目名称'],
+    )
+
+    rows = []
+    project_lookup = {}
+    seen_lookup = set()
+    for _, row in project_df.iterrows():
+        fanwei_project = _text(row.get('原泛微项目编码', ''))
+        project_code = _text(row.get('项目编码', ''))
+        project_name = _text(row.get('项目名称', ''))
         if not fanwei_project:
             continue
 
-        # 订单编号允许为空:为空时也要保留,用于后续生成「订单编号为空」的未匹配原因。
         rows.append({
             '泛微项目编号': fanwei_project,
-            '订单编号': _text(row.get(order_column, '')),
-            '订单标题': _text(row.get(title_column, '')),
-            '映射来源': source_name,
+            '订单编号': '',
+            '订单标题': '',
+            '映射来源': ORDER_MAPPING_SHEETS['全量项目'],
         })
+
+        if not project_code:
+            continue
+        lookup_key = (project_code, fanwei_project)
+        if lookup_key in seen_lookup:
+            continue
+        seen_lookup.add(lookup_key)
+        project_lookup.setdefault(project_code, []).append({
+            '泛微项目编号': fanwei_project,
+            '项目编号': project_code,
+            '项目名称': project_name,
+        })
+
+    presence_df = pd.DataFrame(rows, columns=['泛微项目编号', '订单编号', '订单标题', '映射来源'])
+    return project_lookup, presence_df.drop_duplicates()
+
+
+def _order_project_items(order_row, project_lookup):
+    """取订单行关联的所有原泛微项目编号。
+
+    0619 全量订单表自身带「原泛微项目编码」;如果为空,用「项目编号」去全量项目表反查。
+    如果一个新项目编码对应多个原泛微项目编码,这些原编码都保留为订单候选。
+    """
+    items = []
+    seen_projects = set()
+    order_project_code = _text(order_row.get('项目编号', ''))
+    order_project_name = _text(order_row.get('项目名称', ''))
+    direct_fanwei_project = _text(order_row.get('原泛微项目编码', ''))
+
+    def add_item(fanwei_project, project_code, project_name, source):
+        fanwei_project = _text(fanwei_project)
+        if not fanwei_project or fanwei_project in seen_projects:
+            return
+        seen_projects.add(fanwei_project)
+        items.append({
+            '泛微项目编号': fanwei_project,
+            '项目编号': _text(project_code) or order_project_code,
+            '项目名称': _text(project_name) or order_project_name,
+            '映射来源': source,
+        })
+
+    add_item(
+        direct_fanwei_project,
+        order_project_code,
+        order_project_name,
+        ORDER_MAPPING_SHEETS['全量订单'],
+    )
+    if not direct_fanwei_project:
+        for project_item in project_lookup.get(order_project_code, []):
+            add_item(
+                project_item.get('泛微项目编号', ''),
+                project_item.get('项目编号', ''),
+                order_project_name or project_item.get('项目名称', ''),
+                f"{ORDER_MAPPING_SHEETS['全量项目']}+{ORDER_MAPPING_SHEETS['全量订单']}",
+            )
+
+    return items
 
 
 def _build_project_order_presence(mapping_file):
-    """读取 0618 项目&订单清洗表,汇总所有出现过的泛微项目编号。
-
-    返回的数据只用于「订单映射_未匹配」sheet 的原因判断,不参与一对一映射。
-    一对一/多候选的正式映射仍由 _build_project_order_candidates 生成。
-    """
-    rows = []
-
-    # 本部订单:赛事订单主表、MCN订单主表都使用同一组列名。
-    for source_name, sheet_name in (
-            ('赛事本部订单', ORDER_MAPPING_SHEETS['赛事本部订单']),
-            ('MCN本部订单', ORDER_MAPPING_SHEETS['MCN本部订单'])):
-        order_df = _read_cleaned_order_sheet(
-            mapping_file,
-            sheet_name,
-            ['泛微项目编号', '订单编号', '订单标题'],
-        )
-        _append_order_presence_rows(
-            rows,
-            order_df,
-            source_name,
-            fanwei_column='泛微项目编号',
-            order_column='订单编号',
-            title_column='订单标题',
-        )
-
-    # 协同订单:同一行里既有下单方泛微项目编号,也有协同方泛微项目编号。
-    # 两个编号都可能被供应商/灵工单据引用,所以分别纳入 presence 检查。
-    coop_df = _read_cleaned_order_sheet(
+    """读取新版全量项目+全量订单表,汇总所有出现过的泛微项目编号。"""
+    project_lookup, project_presence_df = _build_full_project_lookup(mapping_file)
+    order_df = _read_cleaned_order_sheet(
         mapping_file,
-        ORDER_MAPPING_SHEETS['全量协同订单'],
-        ['泛微下单方项目编号', '泛微协同方项目编号', '协同订单编号', '协同订单标题'],
-    )
-    _append_order_presence_rows(
-        rows,
-        coop_df,
-        '协同订单-下单方项目',
-        fanwei_column='泛微下单方项目编号',
-        order_column='协同订单编号',
-        title_column='协同订单标题',
-    )
-    _append_order_presence_rows(
-        rows,
-        coop_df,
-        '协同订单-协同方项目',
-        fanwei_column='泛微协同方项目编号',
-        order_column='协同订单编号',
-        title_column='协同订单标题',
+        ORDER_MAPPING_SHEETS['全量订单'],
+        ['原泛微项目编码', '订单编号', '订单标题', '项目编号'],
     )
 
-    # 去重后按统一列返回,便于后续按「泛微项目编号」分组判断是否出现过。
-    return pd.DataFrame(
-        rows,
-        columns=['泛微项目编号', '订单编号', '订单标题', '映射来源'],
-    ).drop_duplicates()
+    rows = project_presence_df.to_dict('records')
+    for _, order_row in order_df.iterrows():
+        for project_item in _order_project_items(order_row, project_lookup):
+            rows.append({
+                '泛微项目编号': project_item['泛微项目编号'],
+                '订单编号': _text(order_row.get('订单编号', '')),
+                '订单标题': _text(order_row.get('订单标题', '')),
+                '映射来源': project_item['映射来源'],
+            })
+
+    if not rows:
+        return _empty_order_presence_df()
+    return pd.DataFrame(rows, columns=['泛微项目编号', '订单编号', '订单标题', '映射来源']).drop_duplicates()
 
 
 def _build_project_order_candidates(mapping_file):
-    rows = []
-
-    for source_name, sheet_name in (
-            ('赛事本部订单', ORDER_MAPPING_SHEETS['赛事本部订单']),
-            ('MCN本部订单', ORDER_MAPPING_SHEETS['MCN本部订单'])):
-        order_df = _read_cleaned_order_sheet(
-            mapping_file,
-            sheet_name,
-            ['泛微项目编号', '订单编号', '订单标题', '项目编号'],
-        )
-        _append_order_mapping_rows(
-            rows,
-            order_df,
-            source_name,
-            fanwei_column='泛微项目编号',
-            order_column='订单编号',
-            title_column='订单标题',
-            project_column='项目编号',
-            project_name_column='项目名称',
-        )
-
-    coop_df = _read_cleaned_order_sheet(
+    project_lookup, _ = _build_full_project_lookup(mapping_file)
+    order_df = _read_cleaned_order_sheet(
         mapping_file,
-        ORDER_MAPPING_SHEETS['全量协同订单'],
-        ['泛微下单方项目编号', '泛微协同方项目编号', '协同订单编号', '协同订单标题', '协同方项目编号'],
-    )
-    _append_order_mapping_rows(
-        rows,
-        coop_df,
-        '协同订单-下单方项目',
-        fanwei_column='泛微下单方项目编号',
-        order_column='协同订单编号',
-        title_column='协同订单标题',
-        project_column='协同方项目编号',
-        project_name_column='协同方项目名称',
-    )
-    _append_order_mapping_rows(
-        rows,
-        coop_df,
-        '协同订单-协同方项目',
-        fanwei_column='泛微协同方项目编号',
-        order_column='协同订单编号',
-        title_column='协同订单标题',
-        project_column='协同方项目编号',
-        project_name_column='协同方项目名称',
+        ORDER_MAPPING_SHEETS['全量订单'],
+        ['原泛微项目编码', '订单编号', '订单标题', '项目编号', '项目名称'],
     )
 
+    rows = []
+    for _, order_row in order_df.iterrows():
+        order_code = _text(order_row.get('订单编号', ''))
+        if not order_code:
+            continue
+        for project_item in _order_project_items(order_row, project_lookup):
+            rows.append({
+                '泛微项目编号': project_item['泛微项目编号'],
+                '订单编号': order_code,
+                '订单标题': _text(order_row.get('订单标题', '')),
+                '项目编号': project_item['项目编号'],
+                '项目名称': project_item['项目名称'],
+                '映射来源': project_item['映射来源'],
+            })
+
+    if not rows:
+        return _empty_order_candidates_df()
     return pd.DataFrame(
         rows,
         columns=['泛微项目编号', '订单编号', '订单标题', '项目编号', '项目名称', '映射来源'],
@@ -691,16 +682,16 @@ def collect_order_mapping_issues(merged_df):
         for _, row in unmatched.iterrows():
             appearances = order_presence.get(row['泛微项目编号'], [])
             if appearances:
-                unmatched_reasons.append('0618订单表中有该泛微项目编号,但订单编号为空')
+                unmatched_reasons.append(f'{ORDER_MAPPING_XLSX_NAME} 项目/订单映射表中有该泛微项目编号,但没有可用订单编号')
                 unmatched_sources.append('; '.join(_text(item.get('映射来源')) for item in appearances))
                 unmatched_order_values.append('; '.join(_text(item.get('订单编号')) or '(空)' for item in appearances))
             else:
-                unmatched_reasons.append('0618赛事订单主表、MCN订单主表、全量协同订单均未出现该泛微项目编号')
+                unmatched_reasons.append(f'{ORDER_MAPPING_XLSX_NAME} 全量项目/全量订单均未出现该泛微项目编号')
                 unmatched_sources.append('')
                 unmatched_order_values.append('')
         unmatched.insert(2, '未匹配原因', unmatched_reasons)
-        unmatched['0618订单表出现位置'] = unmatched_sources
-        unmatched['0618订单编号字段值'] = unmatched_order_values
+        unmatched['订单映射表出现位置'] = unmatched_sources
+        unmatched['订单映射表订单编号字段值'] = unmatched_order_values
         sheets['订单映射_未匹配'] = unmatched
     return sheets
 
@@ -879,6 +870,7 @@ def map_gig_budget_expense_items(budget_df):
         lambda value: subject_map.get(c.remove_slashes(value), ('', '')))
     df['费用项目编码'] = mapped_items.map(lambda item: item[0])
     df['费用项目描述'] = mapped_items.map(lambda item: item[1])
+    df['泛微费用项目编码'] = df['预算科目'].where(df['预算科目'].notna(), '')
     return df
 
 
@@ -917,6 +909,7 @@ def allocate_gig_budget_to_recipients(recipient_df, budget_df):
                     '预算科目': '',
                     '费用项目编码': '',
                     '费用项目描述': '',
+                    '泛微费用项目编码': '',
                     '预算项金额': '',
                     '预付款金额分摊': pd.to_numeric(recipient_row['付给三方平台金额'], errors='coerce'),
                 })
@@ -944,6 +937,7 @@ def allocate_gig_budget_to_recipients(recipient_df, budget_df):
                     '预算科目': first_budget.get('预算科目', ''),
                     '费用项目编码': first_budget.get('费用项目编码', ''),
                     '费用项目描述': first_budget.get('费用项目描述', ''),
+                    '泛微费用项目编码': first_budget.get('泛微费用项目编码', ''),
                     '预算项金额': first_budget.get('预算项金额', ''),
                     '预付款金额分摊': pd.to_numeric(recipient_row['付给三方平台金额'], errors='coerce'),
                 })
@@ -961,6 +955,7 @@ def allocate_gig_budget_to_recipients(recipient_df, budget_df):
                 '预算科目': budget_row.get('预算科目', ''),
                 '费用项目编码': budget_row.get('费用项目编码', ''),
                 '费用项目描述': budget_row.get('费用项目描述', ''),
+                '泛微费用项目编码': budget_row.get('泛微费用项目编码', ''),
                 '预算项金额': budget_row.get('预算项金额', ''),
                 '预付款金额分摊': allocated_amount,
             })
@@ -1092,6 +1087,8 @@ def build_supplier_output(merged_df):
     output_df['预付款金额（支付币种）'] = detail_amount.map(c.round_amount)       # [明细] yfje(预付金额)
     output_df['已到票核销金额（支付币种）'] = settled_amount.map(c.round_amount)  # [明细] yfje(预付金额) - 按比例分摊的 [主表] sycxtkje(剩余冲销/退款金额)
     output_df['已付未核（支付币种）'] = unsettled_amount.map(c.round_amount)     # [主表] sycxtkje(剩余冲销/退款金额) 按明细占比分摊
+    output_df['泛微费用项目编码'] = merged_df['预算科目'].where(
+        merged_df['预算科目'].notna(), '')                               # [明细] yskm -> 原泛微预算科目路径
     return output_df[SUPPLIER_OUTPUT_COLUMNS]
 
 
@@ -1179,6 +1176,11 @@ def build_gig_output(merged_df):
             lambda value: subject_item(value, 0))                        # [原流程预算项明细] dt3.yskm(预算科目) -> 规则表费用项目编码
         output_df['费用项目描述'] = merged_df['预算科目'].map(
             lambda value: subject_item(value, 1))                        # [原流程预算项明细] dt3.yskm(预算科目) -> 规则表费用项目描述
+    if '泛微费用项目编码' in merged_df.columns:
+        output_df['泛微费用项目编码'] = merged_df['泛微费用项目编码'].where(
+            merged_df['泛微费用项目编码'].notna(), '')
+    else:
+        output_df['泛微费用项目编码'] = merged_df['预算科目'].where(merged_df['预算科目'].notna(), '')
 
     # 跨系统映射字段。
     output_df['核算主体编号'] = merged_df['公司主体'].map(

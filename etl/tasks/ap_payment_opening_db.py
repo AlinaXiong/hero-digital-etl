@@ -59,6 +59,7 @@ OUTPUT_COLUMNS = [
     '主播房间号',
     '报账币种',
     '报账金额（支付币种）',
+    '泛微费用项目编码',
 ]
 
 # 问题清单里,目标字段缺失时带出的泛微源字段。
@@ -337,6 +338,8 @@ def build_output(merged_df):
         lambda value: subject_item(value, 1))                          # [明细] yskm -> 规则表描述
     output_df['报账币种'] = merged_df['付款币种'].map(c.to_iso_currency)  # [主表] fkbz -> ISO币种
     output_df['报账金额（支付币种）'] = payment_amount.map(c.round_amount)  # [明细] fkje
+    output_df['泛微费用项目编码'] = merged_df['预算科目'].where(
+        merged_df['预算科目'].notna(), '')                             # [明细] yskm -> 原泛微预算科目路径
     # write_to_template 按 DataFrame 顺序写入模板,这里显式固定列序。
     return output_df[OUTPUT_COLUMNS]
 

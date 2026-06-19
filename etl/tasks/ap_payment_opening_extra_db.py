@@ -73,6 +73,8 @@ OUTPUT_COLUMNS = [
     '主播房间号',
     '报账币种',
     '报账金额（支付币种）',
+    '泛微项目编号',
+    '泛微费用项目编码',
 ]
 
 BATCH_ISSUE_SOURCE_FIELDS = {
@@ -148,16 +150,21 @@ SELECT
     d.zczcje AS `转出明细金额`,
     d.srje AS `转出收入金额`,
     v.lcbh AS `费用单据号`,
-    v.yskm AS `预算科目ID`,
+    COALESCE(v.yskm, d.yslx) AS `预算科目ID`,
     v.fkbz AS `付款币种ID`,
     v.fkje AS `费用原金额`,
     v.sywzje AS `费用剩余未占金额`,
-    v.yzje AS `费用已占金额`
+    v.yzje AS `费用已占金额`,
+    CASE m.ly
+        WHEN 5 THEN '赛事只转入外部成本'
+        WHEN 2 THEN 'MCN只转入外部成本'
+        ELSE CONCAT('内部收支来源', m.ly)
+    END AS `内部收支来源`
 FROM uf_xtyynbsz m
 JOIN uf_xtyynbsz_dt10 d ON d.mainid = m.id
 LEFT JOIN view_costlist_ys v
     ON v.id = COALESCE(NULLIF(d.stzjid, ''), NULLIF(d.mxid, ''))
-WHERE m.ly = 5
+WHERE m.ly IN (5, 2)
   AND m.lczt IN (1, 2)
   AND m.sfzf IS NULL
   AND m.sqrq >= %(date_from)s
@@ -167,10 +174,12 @@ ORDER BY m.sqrq, m.id, d.id
 EXTERNAL_COST_STATS_SQL = """
 SELECT
     COUNT(*) AS document_count,
+    SUM(CASE WHEN ly = 5 THEN 1 ELSE 0 END) AS event_document_count,
+    SUM(CASE WHEN ly = 2 THEN 1 ELSE 0 END) AS mcn_document_count,
     SUM(COALESCE(zrzcjehz, 0)) AS in_amount_total,
     SUM(COALESCE(zczcjehz, 0)) AS out_amount_total
 FROM uf_xtyynbsz
-WHERE ly = 5
+WHERE ly IN (5, 2)
   AND lczt IN (1, 2)
   AND sfzf IS NULL
   AND sqrq >= %(date_from)s
@@ -213,8 +222,8 @@ def _first_non_blank(*values):
 PROJECT_TABLES = ('uf_xtyyxmkp', 'uf_xmkp', 'view_xmjkzb')
 
 
-def build_fw_project_code_map_for_ids(project_values):
-    """泛微项目浏览框 ID -> 泛微项目编号,兼容 xmkp/xmjk/MCN赛事项目等来源。"""
+def build_fw_project_info_map_for_ids(project_values):
+    """泛微项目浏览框 ID -> 项目编号/名称,兼容 xmkp/xmjk/MCN赛事项目等来源。"""
     project_ids = c.clean_codes(
         project_id
         for value in project_values
@@ -233,23 +242,102 @@ def build_fw_project_code_map_for_ids(project_values):
             project_df = c.query_db(
                 'FW',
                 'vspn_xtyy',
-                f'SELECT id, xmbh AS project_code FROM {table} '
+                f'SELECT id, xmbh AS project_code, xmmc AS project_name FROM {table} '
                 f'WHERE id IN ({c.in_placeholders(ids)})',
                 ids,
             )
         except Exception:
-            continue
+            try:
+                project_df = c.query_db(
+                    'FW',
+                    'vspn_xtyy',
+                    f"SELECT id, xmbh AS project_code, '' AS project_name FROM {table} "
+                    f'WHERE id IN ({c.in_placeholders(ids)})',
+                    ids,
+                )
+            except Exception:
+                continue
         for _, row in project_df.iterrows():
             project_id = c.format_code(row['id'])
             project_code = _text(row['project_code'])
             if project_id and project_code and project_id not in result:
-                result[project_id] = project_code
+                result[project_id] = {
+                    'code': project_code,
+                    'name': _text(row.get('project_name', '')),
+                }
                 remaining.discard(project_id)
     return result
 
 
+def build_fw_project_code_map_for_ids(project_values):
+    return {
+        project_id: info.get('code', '')
+        for project_id, info in build_fw_project_info_map_for_ids(project_values).items()
+    }
+
+
 def _resolve_project_codes(values, project_map):
     return values.map(lambda value: _first_browser_value(project_map, value) or _text(value))
+
+
+def _resolve_project_names(values, project_name_map):
+    return values.map(lambda value: _first_browser_value(project_name_map, value))
+
+
+def _with_resolved_project_fields(source_df, project_column='项目编号'):
+    df = source_df.copy()
+    if project_column not in df.columns:
+        df['项目编号'] = ''
+        df['项目名称'] = df['项目名称'] if '项目名称' in df.columns else ''
+        return df
+
+    project_info_map = build_fw_project_info_map_for_ids(df[project_column])
+    project_code_map = {
+        project_id: info.get('code', '')
+        for project_id, info in project_info_map.items()
+    }
+    project_name_map = {
+        project_id: info.get('name', '')
+        for project_id, info in project_info_map.items()
+    }
+
+    df['项目编号'] = _resolve_project_codes(df[project_column], project_code_map)
+    mapped_project_names = _resolve_project_names(df[project_column], project_name_map)
+    existing_project_names = df['项目名称'] if '项目名称' in df.columns else pd.Series('', index=df.index)
+    df['项目名称'] = [
+        _first_non_blank(existing_name, mapped_name)
+        for existing_name, mapped_name in zip(existing_project_names, mapped_project_names)
+    ]
+    return df
+
+
+def _apply_order_project_columns(output_df, source_df):
+    """按预付期初口径补充泛微项目编号,并用项目&订单清洗表映射订单字段。"""
+    df = output_df.copy()
+    project_source_df = _with_resolved_project_fields(source_df)
+    project_codes = project_source_df['项目编号'].map(_text)
+    df['泛微项目编号'] = project_codes
+    df['订单编号'] = project_codes.map(lambda value: _order_mapping_value(value, '订单编号'))
+    df['订单名称'] = project_codes.map(lambda value: _order_mapping_value(value, '订单标题'))
+    return df[OUTPUT_COLUMNS]
+
+
+def _enrich_missing_order_issue(sheets, output_df, source_df):
+    """让「缺失_订单编号」清单同时带出项目编号/名称,便于回查原单。"""
+    sheet_name = '缺失_订单编号'
+    if sheet_name not in sheets or '订单编号' not in output_df.columns:
+        return sheets
+
+    project_source_df = _with_resolved_project_fields(source_df)
+    blank_mask = output_df['订单编号'].astype(str).str.strip() == ''
+    data = {
+        '来源单据编号': output_df.loc[blank_mask, '来源单据编号'].astype(str),
+        '订单编号': output_df.loc[blank_mask, '订单编号'].astype(str),
+        '泛微项目编号': project_source_df.loc[blank_mask, '项目编号'].astype(str),
+        '泛微项目名称': project_source_df.loc[blank_mask, '项目名称'].astype(str),
+    }
+    sheets[sheet_name] = pd.DataFrame(data).drop_duplicates().reset_index(drop=True)
+    return sheets
 
 
 def _resolve_subject_paths(subject_ids):
@@ -361,13 +449,12 @@ def resolve_batch_values(source_df):
     employee_map = c.build_fw_employee_info_map_for_ids(df['申请人ID'])
     company_map = c.build_fw_company_name_map_for_ids(df['公司主体ID'])
     supplier_status_map = c.build_fw_supplier_status_map(df['供应商ID'])
-    project_map = build_fw_project_code_map_for_ids(df['项目编号ID'])
 
     df['申请人'] = df['申请人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
     df['申请人工号'] = df['申请人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
     df['公司主体'] = df['公司主体ID'].map(lambda value: company_map.get(c.format_code(value), ''))
     df['供应商'] = df['供应商ID'].map(lambda value: _supplier_name(value, supplier_status_map))
-    df['项目编号'] = _resolve_project_codes(df['项目编号ID'], project_map)
+    df = _with_resolved_project_fields(df, '项目编号ID')
     df['预算科目'] = _resolve_subject_paths(df['预算科目ID'])
     return df
 
@@ -394,8 +481,6 @@ def build_batch_output(source_df):
     output_df['单据类型'] = DOCUMENT_TYPE
     output_df['申请人工号'] = source_df['申请人工号']
     output_df['申请人姓名'] = source_df['申请人']
-    output_df['订单编号'] = source_df['项目编号'].map(lambda value: _order_mapping_value(value, '订单编号'))
-    output_df['订单名称'] = source_df['项目编号'].map(lambda value: _order_mapping_value(value, '订单标题'))
     output_df['核算主体编号'] = source_df['公司主体'].map(lambda value: _lookup_by_name(entity_map, value))
     output_df['核算主体描述'] = source_df['公司主体']
     output_df['备注'] = source_df['备注'].map(lambda value: _text(value)[:150])
@@ -415,14 +500,17 @@ def build_batch_output(source_df):
     output_df['主播房间号'] = ''
     output_df['报账币种'] = 'CNY'
     output_df['报账金额（支付币种）'] = amount.map(c.round_amount)
-    return output_df[OUTPUT_COLUMNS]
+    output_df['泛微费用项目编码'] = source_df['预算科目'].where(source_df['预算科目'].notna(), '')
+    return _apply_order_project_columns(output_df, source_df)
 
 
 # ============================ 只转入外部成本 ============================
 def read_external_cost_source():
     stats = _query_fw(EXTERNAL_COST_STATS_SQL).iloc[0]
-    print(f"[应付期初-只转入外部成本] SQL过滤: 来源=只转入外部成本(ly=5) 且 流程状态∈审批中/审批完成 且 未作废 且 申请日期>={DATE_FROM}")
+    print(f"[应付期初-只转入外部成本] SQL过滤: 来源=赛事只转入外部成本(ly=5)+MCN只转入外部成本(ly=2) 且 流程状态∈审批中/审批完成 且 未作废 且 申请日期>={DATE_FROM}")
     print(f"  保留内部收支 {int(stats['document_count'] or 0)} 单; "
+          f"赛事 {int(stats['event_document_count'] or 0)} 单; "
+          f"MCN {int(stats['mcn_document_count'] or 0)} 单; "
           f"转入金额合计 {float(stats['in_amount_total'] or 0):.2f}; "
           f"转出金额合计 {float(stats['out_amount_total'] or 0):.2f}")
     source_df = _query_fw(EXTERNAL_COST_SOURCE_SQL)
@@ -440,7 +528,15 @@ def resolve_external_cost_values(source_df):
         df['转入项目编号ID'], df['转出项目编号ID'],
         df['转入MCN赛事项目编号ID'], df['转出MCN赛事项目编号ID'],
     ], ignore_index=True)
-    project_map = build_fw_project_code_map_for_ids(project_values)
+    project_info_map = build_fw_project_info_map_for_ids(project_values)
+    project_code_map = {
+        project_id: info.get('code', '')
+        for project_id, info in project_info_map.items()
+    }
+    project_name_map = {
+        project_id: info.get('name', '')
+        for project_id, info in project_info_map.items()
+    }
 
     df['申请人'] = df['申请人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
     df['申请人工号'] = df['申请人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
@@ -448,8 +544,8 @@ def resolve_external_cost_values(source_df):
     df['转出公司主体'] = df['转出公司主体ID'].map(lambda value: _first_browser_value(company_map, value))
     df['转入项目编号'] = [
         _first_non_blank(
-            _first_browser_value(project_map, in_project),
-            _first_browser_value(project_map, in_mcn_project),
+            _first_browser_value(project_code_map, in_project),
+            _first_browser_value(project_code_map, in_mcn_project),
             _text(in_project),
             _text(in_mcn_project),
         )
@@ -457,12 +553,30 @@ def resolve_external_cost_values(source_df):
     ]
     df['转出项目编号'] = [
         _first_non_blank(
-            _first_browser_value(project_map, out_project),
-            _first_browser_value(project_map, out_mcn_project),
+            _first_browser_value(project_code_map, out_project),
+            _first_browser_value(project_code_map, out_mcn_project),
             _text(out_project),
             _text(out_mcn_project),
         )
         for out_project, out_mcn_project in zip(df['转出项目编号ID'], df['转出MCN赛事项目编号ID'])
+    ]
+    df['转入项目名称'] = [
+        _first_non_blank(
+            in_project_name,
+            _first_browser_value(project_name_map, in_project),
+            _first_browser_value(project_name_map, in_mcn_project),
+        )
+        for in_project_name, in_project, in_mcn_project
+        in zip(df['转入项目名称'], df['转入项目编号ID'], df['转入MCN赛事项目编号ID'])
+    ]
+    df['转出项目名称'] = [
+        _first_non_blank(
+            out_project_name,
+            _first_browser_value(project_name_map, out_project),
+            _first_browser_value(project_name_map, out_mcn_project),
+        )
+        for out_project_name, out_project, out_mcn_project
+        in zip(df['转出项目名称'], df['转出项目编号ID'], df['转出MCN赛事项目编号ID'])
     ]
     df['付款币种'] = df['付款币种ID'].map(lambda value: currency_map.get(c.format_code(value), '人民币'))
     df['预算科目'] = _resolve_subject_paths(df['预算科目ID'])
@@ -512,8 +626,6 @@ def build_external_cost_output(source_df):
     output_df['单据类型'] = DOCUMENT_TYPE
     output_df['申请人工号'] = expanded_df['申请人工号']
     output_df['申请人姓名'] = expanded_df['申请人']
-    output_df['订单编号'] = expanded_df['项目编号'].map(lambda value: _order_mapping_value(value, '订单编号'))
-    output_df['订单名称'] = expanded_df['项目编号'].map(lambda value: _order_mapping_value(value, '订单标题'))
     output_df['核算主体编号'] = expanded_df['公司主体'].map(lambda value: _lookup_by_name(entity_map, value))
     output_df['核算主体描述'] = expanded_df['公司主体']
     output_df['备注'] = [
@@ -533,10 +645,11 @@ def build_external_cost_output(source_df):
     output_df['主播房间号'] = ''
     output_df['报账币种'] = expanded_df['付款币种'].map(c.to_iso_currency)
     output_df['报账金额（支付币种）'] = expanded_df['金额'].map(c.round_amount)
+    output_df['泛微费用项目编码'] = expanded_df['预算科目'].where(expanded_df['预算科目'].notna(), '')
 
     # 供问题清单复用。
     expanded_df['收款方描述'] = VIRTUAL_VENDOR_NAME
-    return output_df[OUTPUT_COLUMNS], expanded_df
+    return _apply_order_project_columns(output_df, expanded_df), expanded_df
 
 
 def collect_external_cost_pair_check(expanded_df):
@@ -633,7 +746,11 @@ def run():
     external_source_df = read_external_cost_source()
 
     # 2. 构建三个 sheet 输出
-    base_output_df = base_payment.build_output(base_source_df)
+    base_issue_source_df = _with_resolved_project_fields(base_source_df)
+    base_output_df = _apply_order_project_columns(
+        base_payment.build_output(base_source_df),
+        base_issue_source_df,
+    )
     batch_output_df = build_batch_output(batch_source_df)
     external_output_df, external_issue_source_df = build_external_cost_output(external_source_df)
     print('[应付期初-期初对公付款单导入] 输出明细行数:', len(base_output_df))
@@ -659,13 +776,16 @@ def run():
     base_sheets = {'必输字段未达100%': c.fill_summary(
         base_output_df, required_cols, RULE_SHEET, RULE_TABLE)}
     base_sheets.update(c.collect_field_issues(
-        base_output_df, base_source_df, required_cols, base_payment.ISSUE_SOURCE_FIELDS))
+        base_output_df, base_issue_source_df, required_cols, base_payment.ISSUE_SOURCE_FIELDS))
+    base_sheets = _enrich_missing_order_issue(base_sheets, base_output_df, base_issue_source_df)
+    base_sheets.update(collect_order_mapping_issues(base_issue_source_df))
     exception_sheets.update({f'期初对公付款单导入_{name}': df for name, df in base_sheets.items()})
 
     batch_sheets = {'必输字段未达100%': c.fill_summary(
         batch_output_df, required_cols, RULE_SHEET, RULE_TABLE)}
     batch_sheets.update(c.collect_field_issues(
         batch_output_df, batch_source_df, required_cols, BATCH_ISSUE_SOURCE_FIELDS))
+    batch_sheets = _enrich_missing_order_issue(batch_sheets, batch_output_df, batch_source_df)
     batch_sheets.update(collect_order_mapping_issues(batch_source_df))
     exception_sheets.update({f'批量费用流程_{name}': df for name, df in batch_sheets.items()})
 
@@ -673,6 +793,7 @@ def run():
         external_output_df, required_cols, RULE_SHEET, RULE_TABLE)}
     external_sheets.update(c.collect_field_issues(
         external_output_df, external_issue_source_df, required_cols, EXTERNAL_COST_ISSUE_SOURCE_FIELDS))
+    external_sheets = _enrich_missing_order_issue(external_sheets, external_output_df, external_issue_source_df)
     external_sheets.update(collect_order_mapping_issues(external_issue_source_df))
     external_sheets.update(collect_external_cost_pair_check(external_issue_source_df))
     exception_sheets.update({f'只转入外部成本_{name}': df for name, df in external_sheets.items()})

@@ -117,6 +117,7 @@ def build_output(merged_df, employee_code_map, vendor_map, entity_map, subject_m
     output_df['主播房间号'] = ''  # 不涉及(MCN 才有)
     output_df['报账币种'] = merged_df['付款币种'].map(c.to_iso_currency)  # [主表] 付款币种 -> ISO
     output_df['报账金额（支付币种）'] = payment_amount.map(c.round_amount)  # [明细] 付款金额
+    output_df['泛微费用项目编码'] = merged_df['预算科目'].where(merged_df['预算科目'].notna(), '')  # [明细] 原泛微预算科目路径
     return output_df
 
 

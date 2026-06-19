@@ -145,6 +145,7 @@ def build_output(merged_df, employee_code_map, vendor_map, entity_map, subject_m
     output_df['预付款金额（支付币种）'] = detail_amount.map(c.round_amount)  # [明细] 预付金额
     output_df['已到票核销金额（支付币种）'] = settled_amount.map(c.round_amount)  # 预付款金额 - 已付未核
     output_df['已付未核（支付币种）'] = unsettled_amount.map(c.round_amount)  # 剩余冲销/退款按占比分摊
+    output_df['泛微费用项目编码'] = merged_df['预算科目'].where(merged_df['预算科目'].notna(), '')  # [明细] 原泛微预算科目路径
     return output_df
 
 
@@ -232,6 +233,7 @@ def build_gig_output(header_df, detail_df, vendor_map, company_map, entity_map):
     out['支付状态'] = '支付成功'                                                # 默认支付成功(R55)
     out['退款状态'] = ''                                                        # 不涉及(R56)
     out['核销状态'] = '已核销'                                                  # 默认已核销(R57)
+    out['泛微费用项目编码'] = ''                                                  # 文件版灵工源暂无预算科目
     return out, merged
 
 
