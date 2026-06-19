@@ -11,6 +11,7 @@ import sys
 from etl.tasks import (
     ap_payment_opening,
     ap_payment_opening_db,
+    ap_payment_opening_extra_db,
     ap_prepayment_opening,
     ap_prepayment_opening_db,
     ar_invoice_opening,
@@ -22,6 +23,7 @@ from etl.tasks import (
 TASKS = {
     'ap_payment_opening': ap_payment_opening.run,         # 应付期初 对公付款单
     'ap_payment_opening_db': ap_payment_opening_db.run,   # 应付期初 对公付款单(DB直连版)
+    'ap_payment_opening_extra_db': ap_payment_opening_extra_db.run,  # 应付期初 批量费用流程/只转入外部成本(DB直连版)
     'ap_prepayment_opening': ap_prepayment_opening.run,   # 预付期初 供应商预付款单
     'ap_prepayment_opening_db': ap_prepayment_opening_db.run,  # 预付期初 供应商预付款单/零工预付款单(DB直连版)
     'ar_invoice_opening': ar_invoice_opening.run,         # 应收期初 应收报账单

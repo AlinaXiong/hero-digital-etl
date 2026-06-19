@@ -1139,7 +1139,7 @@ def report_fill(output_df, columns):
         if column not in output_df.columns:
             continue
         filled_count = (output_df[column].astype(str).str.strip() != '').sum()
-        print(f'  {column} 填充率: {filled_count}/{len(output_df)} = {filled_count/len(output_df)*100:.1f}%')
+        print(f'  {column} 填充率: {filled_count}/{len(output_df)} = {filled_count/len(output_df)*100:.2f}%')
 
 
 def collect_field_issues(output_df, source_df, required_cols, source_field_map, doc_col='来源单据编号'):
@@ -1186,7 +1186,7 @@ def fill_summary(output_df, columns, rule_sheet=None, table_name=None):
             else:
                 remark = ''
             rows.append({'必输字段': column, '填充数': filled, '缺失数': total - filled,
-                         '总数': total, '填充率': f'{filled / total * 100:.1f}%', '备注': remark})
+                         '总数': total, '填充率': f'{filled / total * 100:.2f}%', '备注': remark})
     return pd.DataFrame(rows, columns=['必输字段', '填充数', '缺失数', '总数', '填充率', '备注'])
 
 
