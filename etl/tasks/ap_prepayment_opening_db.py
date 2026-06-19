@@ -49,7 +49,6 @@ SUPPLIER_OUTPUT_COLUMNS = [
     '单据类型',
     '申请人工号',
     '申请人姓名',
-    '泛微项目编号',
     '订单编号',
     '订单名称',
     '核算主体编号',
@@ -70,6 +69,7 @@ SUPPLIER_OUTPUT_COLUMNS = [
     '预付款金额（支付币种）',
     '已到票核销金额（支付币种）',
     '已付未核（支付币种）',
+    '泛微项目编号',
 ]
 GIG_OUTPUT_COLUMNS = [
     '来源系统',
@@ -101,6 +101,7 @@ GIG_OUTPUT_COLUMNS = [
     '支付状态',
     '退款状态',
     '核销状态',
+    '泛微项目编号',
 ]
 
 SUPPLIER_ISSUE_SOURCE_FIELDS = {
@@ -117,6 +118,7 @@ GIG_ISSUE_SOURCE_FIELDS = {
     '核算主体编号': '公司主体',
     '费用项目编码': '预算科目',
     '收款方编码': '实际收款方',
+    '订单编号': '项目编号',
 }
 
 FW_SUPPLIER_TABLE = 'uf_yfkxx'
@@ -127,7 +129,7 @@ FW_GIG_BUDGET_TABLE = 'formtable_main_279_dt3'
 FW_GIG_RECIPIENT_TABLE = 'formtable_main_279_dt4'
 FW_PROJECT_TABLE = 'uf_xtyyxmkp'
 ORDER_MAPPING_ENV = 'PROJECT_ORDER_MAPPING_XLSX'
-ORDER_MAPPING_XLSX_PATTERN = '业财项目_项目&订单清洗*.xlsx'
+ORDER_MAPPING_XLSX_NAME = '业财项目_项目&订单清洗_0618.xlsx'
 ORDER_MAPPING_SHEETS = {
     '赛事本部订单': '赛事订单主表_清洗后',
     'MCN本部订单': 'MCN订单主表_清洗后',
@@ -136,7 +138,7 @@ ORDER_MAPPING_SHEETS = {
 
 
 # ============================ 枚举 / 过滤口径 ============================
-DATE_FROM = '2026-01-01'
+DATE_FROM = '2022-01-01'
 APPROVED_STATUS_CODE = 2
 VOID_CODE = 0
 DEPOSIT_PAYMENT_NATURE_CODES = {'0', '1'}  # uf_yfkxx.fkxz:0=押金,1=质保金
@@ -214,6 +216,8 @@ SELECT
     h.lcfsrq AS `流程发生日期`,
     w.requestId AS `流程请求ID`,
     h.lczsjqqid AS `流程转数据请求ID`,
+    COALESCE(NULLIF(CAST(h.xmbh AS CHAR), ''), NULLIF(CAST(w.xmbh AS CHAR), '')) AS `项目编号ID`,
+    COALESCE(NULLIF(h.xmmc, ''), NULLIF(w.xmmc, '')) AS `项目名称`,
     h.jbr AS `经办人ID`,
     h.gszt AS `公司主体ID`,
     COALESCE(NULLIF(h.skfwb, ''), w.skfmc) AS `收款方文本`,
@@ -316,6 +320,8 @@ EXPECTED_GIG_HEADER_FIELDS = {
         'sqrq': '申请日期',
         'lcfsrq': '流程发生日期',
         'lczsjqqid': '流程转数据请求ID',
+        'xmbh': '项目编号',
+        'xmmc': '项目名称',
         'jbr': '经办人',
         'gszt': '公司主体',
         'skfwb': '收款方-文本',
@@ -329,6 +335,8 @@ EXPECTED_GIG_HEADER_FIELDS = {
 EXPECTED_GIG_WORKFLOW_FIELDS = {
     '': {
         'lcbh': '流程编号',
+        'xmbh': '项目编号',
+        'xmmc': '项目名称',
         'skfmc': '收款方名称',
         'htmc': '合同名称',
     },
@@ -383,7 +391,6 @@ def _find_project_order_mapping_file():
             return path
         print(f'[预付期初-供应商预付款-订单映射] {ORDER_MAPPING_ENV} 指向的文件不存在:', configured)
 
-    candidates = []
     search_dirs = [
         c.SRC_DIR / 'other_cleaned_data',
         c.SRC_DIR / 'project_order',
@@ -391,9 +398,10 @@ def _find_project_order_mapping_file():
         Path.home() / 'Downloads',
     ]
     for search_dir in search_dirs:
-        if search_dir.exists():
-            candidates.extend(search_dir.glob(ORDER_MAPPING_XLSX_PATTERN))
-    return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
+        path = search_dir / ORDER_MAPPING_XLSX_NAME
+        if path.exists():
+            return path
+    return None
 
 
 def _dedupe_headers(headers):
@@ -446,6 +454,90 @@ def _append_order_mapping_rows(
             '项目名称': _text(row.get(project_name_column, '')) if project_name_column else '',
             '映射来源': source_name,
         })
+
+
+def _append_order_presence_rows(
+        rows, df, source_name, fanwei_column, order_column, title_column):
+    """收集订单表中出现过的泛微项目编号,用于解释未匹配原因。
+
+    这里和 _append_order_mapping_rows 的区别是:
+    - 正式映射只保留「泛微项目编号 + 订单编号」都不为空的记录。
+    - presence 检查只要求泛微项目编号存在,即使订单编号为空也保留。
+
+    这样未匹配时可以区分两类情况:
+    1. 0618 三个订单表里完全没有这个泛微项目编号。
+    2. 订单表里有这个泛微项目编号,但订单编号为空,所以不能写入导入模板。
+    """
+    for _, row in df.iterrows():
+        # 不同订单表的泛微项目列名不同,通过 fanwei_column 参数统一读取。
+        fanwei_project = _text(row.get(fanwei_column, ''))
+        if not fanwei_project:
+            continue
+
+        # 订单编号允许为空:为空时也要保留,用于后续生成「订单编号为空」的未匹配原因。
+        rows.append({
+            '泛微项目编号': fanwei_project,
+            '订单编号': _text(row.get(order_column, '')),
+            '订单标题': _text(row.get(title_column, '')),
+            '映射来源': source_name,
+        })
+
+
+def _build_project_order_presence(mapping_file):
+    """读取 0618 项目&订单清洗表,汇总所有出现过的泛微项目编号。
+
+    返回的数据只用于「订单映射_未匹配」sheet 的原因判断,不参与一对一映射。
+    一对一/多候选的正式映射仍由 _build_project_order_candidates 生成。
+    """
+    rows = []
+
+    # 本部订单:赛事订单主表、MCN订单主表都使用同一组列名。
+    for source_name, sheet_name in (
+            ('赛事本部订单', ORDER_MAPPING_SHEETS['赛事本部订单']),
+            ('MCN本部订单', ORDER_MAPPING_SHEETS['MCN本部订单'])):
+        order_df = _read_cleaned_order_sheet(
+            mapping_file,
+            sheet_name,
+            ['泛微项目编号', '订单编号', '订单标题'],
+        )
+        _append_order_presence_rows(
+            rows,
+            order_df,
+            source_name,
+            fanwei_column='泛微项目编号',
+            order_column='订单编号',
+            title_column='订单标题',
+        )
+
+    # 协同订单:同一行里既有下单方泛微项目编号,也有协同方泛微项目编号。
+    # 两个编号都可能被供应商/灵工单据引用,所以分别纳入 presence 检查。
+    coop_df = _read_cleaned_order_sheet(
+        mapping_file,
+        ORDER_MAPPING_SHEETS['全量协同订单'],
+        ['泛微下单方项目编号', '泛微协同方项目编号', '协同订单编号', '协同订单标题'],
+    )
+    _append_order_presence_rows(
+        rows,
+        coop_df,
+        '协同订单-下单方项目',
+        fanwei_column='泛微下单方项目编号',
+        order_column='协同订单编号',
+        title_column='协同订单标题',
+    )
+    _append_order_presence_rows(
+        rows,
+        coop_df,
+        '协同订单-协同方项目',
+        fanwei_column='泛微协同方项目编号',
+        order_column='协同订单编号',
+        title_column='协同订单标题',
+    )
+
+    # 去重后按统一列返回,便于后续按「泛微项目编号」分组判断是否出现过。
+    return pd.DataFrame(
+        rows,
+        columns=['泛微项目编号', '订单编号', '订单标题', '映射来源'],
+    ).drop_duplicates()
 
 
 def _build_project_order_candidates(mapping_file):
@@ -548,19 +640,24 @@ def _order_mapping_value(project_code, field):
     return safe_map.get(_text(project_code), {}).get(field, '')
 
 
-def collect_supplier_order_mapping_issues(merged_df):
-    """输出供应商预付项目->订单映射的未匹配和多候选清单。"""
+def collect_order_mapping_issues(merged_df):
+    """输出项目->订单映射的未匹配和多候选清单。"""
     safe_map, ambiguous_map, mapping_file = load_project_order_mapping()
-    rows = pd.DataFrame({
+    issue_columns = {
         '来源单据编号': merged_df['流程编号'].map(_text),
         '泛微项目编号': merged_df['项目编号'].map(_text),
-    }).drop_duplicates()
+    }
+    if '项目编号ID' in merged_df.columns:
+        issue_columns['泛微项目ID'] = merged_df['项目编号ID'].map(_text)
+    if '项目名称' in merged_df.columns:
+        issue_columns['泛微项目名称'] = merged_df['项目名称'].map(_text)
+    rows = pd.DataFrame(issue_columns).drop_duplicates()
     rows = rows[rows['泛微项目编号'] != '']
 
     sheets = {}
     if mapping_file is None:
         sheets['订单映射_文件缺失'] = pd.DataFrame([{
-            '说明': f'未找到 {ORDER_MAPPING_XLSX_PATTERN},可通过环境变量 {ORDER_MAPPING_ENV} 指定清洗后 Excel。',
+            '说明': f'未找到 {ORDER_MAPPING_XLSX_NAME},可通过环境变量 {ORDER_MAPPING_ENV} 指定清洗后 Excel。',
         }])
         return sheets
 
@@ -579,9 +676,31 @@ def collect_supplier_order_mapping_issues(merged_df):
     if ambiguous_rows:
         sheets['订单映射_多候选'] = pd.DataFrame(ambiguous_rows)
 
+    order_presence_df = _build_project_order_presence(mapping_file)
+    order_presence = {
+        project_code: group.to_dict('records')
+        for project_code, group in order_presence_df.groupby('泛微项目编号', sort=False)
+    }
+
     mapped_projects = set(safe_map) | set(ambiguous_map)
     unmatched = rows[~rows['泛微项目编号'].isin(mapped_projects)].copy()
     if len(unmatched) > 0:
+        unmatched_reasons = []
+        unmatched_sources = []
+        unmatched_order_values = []
+        for _, row in unmatched.iterrows():
+            appearances = order_presence.get(row['泛微项目编号'], [])
+            if appearances:
+                unmatched_reasons.append('0618订单表中有该泛微项目编号,但订单编号为空')
+                unmatched_sources.append('; '.join(_text(item.get('映射来源')) for item in appearances))
+                unmatched_order_values.append('; '.join(_text(item.get('订单编号')) or '(空)' for item in appearances))
+            else:
+                unmatched_reasons.append('0618赛事订单主表、MCN订单主表、全量协同订单均未出现该泛微项目编号')
+                unmatched_sources.append('')
+                unmatched_order_values.append('')
+        unmatched.insert(2, '未匹配原因', unmatched_reasons)
+        unmatched['0618订单表出现位置'] = unmatched_sources
+        unmatched['0618订单编号字段值'] = unmatched_order_values
         sheets['订单映射_未匹配'] = unmatched
     return sheets
 
@@ -693,6 +812,7 @@ def resolve_gig_source_values(source_df):
     employee_map = c.build_fw_employee_info_map_for_ids(df['经办人ID'])
     company_map = c.build_fw_company_name_map_for_ids(df['公司主体ID'])
     contract_map = c.build_fw_contract_code_map_for_ids(df['相关合同ID'])
+    project_code_map = build_fw_project_code_map_for_ids(df['项目编号ID'])
 
     # [建模头表] jbr(经办人) -> hrmresource / hrmjobtitles
     df['经办人'] = df['经办人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
@@ -705,6 +825,8 @@ def resolve_gig_source_values(source_df):
         name if _text(name) else fallback
         for name, fallback in zip(df['合同名称'], fallback_contract)
     ]
+    df['项目编号'] = df['项目编号ID'].map(
+        lambda value: _lookup_first_browser_value(project_code_map, value) or _text(value))
     return df
 
 
@@ -1041,9 +1163,10 @@ def build_gig_output(merged_df):
     output_df['预付款金额（支付币种）'] = pd.to_numeric(
         merged_df['预付款金额分摊'], errors='coerce').map(c.round_amount)  # [原流程明细] dt4.sl(付给三方平台金额) 按合并预算科目顺序占用预算项金额
 
-    # 当前源数据没有直接可用的订单/计划行/银行备注,按模板留空。
-    output_df['订单编号'] = ''
-    output_df['订单名称'] = ''
+    # 项目&订单清洗结果:泛微项目编号 -> 订单编号/订单标题。
+    output_df['泛微项目编号'] = merged_df['项目编号'].map(_text)
+    output_df['订单编号'] = merged_df['项目编号'].map(lambda value: _order_mapping_value(value, '订单编号'))
+    output_df['订单名称'] = merged_df['项目编号'].map(lambda value: _order_mapping_value(value, '订单标题'))
     output_df['合同收支计划行'] = ''
     output_df['银行转账备注'] = ''
     if has_mapped_expense_items:
@@ -1134,13 +1257,14 @@ def run():
         supplier_output_df, supplier_required, RULE_SHEET, RULE_TABLE_SUPPLIER)}
     supplier_sheets.update(c.collect_field_issues(
         supplier_output_df, supplier_merged_df, supplier_required, SUPPLIER_ISSUE_SOURCE_FIELDS))
-    supplier_sheets.update(collect_supplier_order_mapping_issues(supplier_merged_df))
+    supplier_sheets.update(collect_order_mapping_issues(supplier_merged_df))
     exception_sheets.update({f'供应商_{name}': df for name, df in supplier_sheets.items()})
 
     gig_sheets = {'必输字段未达100%': c.fill_summary(
         gig_output_df, gig_required, RULE_SHEET, RULE_TABLE_GIG)}
     gig_sheets.update(c.collect_field_issues(
         gig_output_df, gig_merged_df, gig_required, GIG_ISSUE_SOURCE_FIELDS))
+    gig_sheets.update(collect_order_mapping_issues(gig_merged_df))
     exception_sheets.update({f'灵工_{name}': df for name, df in gig_sheets.items()})
 
     c.write_exceptions(EXCEPTION_FILE, exception_sheets)

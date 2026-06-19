@@ -15,6 +15,7 @@ from etl.tasks import (
     ap_prepayment_opening_db,
     ar_invoice_opening,
     ar_invoice_opening_db,
+    invoice_info_db,
 )
 
 # 登记任务:任务名 -> run 函数。新增任务在这里加一行。
@@ -25,6 +26,7 @@ TASKS = {
     'ap_prepayment_opening_db': ap_prepayment_opening_db.run,  # 预付期初 供应商预付款单/零工预付款单(DB直连版)
     'ar_invoice_opening': ar_invoice_opening.run,         # 应收期初 应收报账单
     'ar_invoice_opening_db': ar_invoice_opening_db.run,   # 应收期初 应收报账单(DB直连版)
+    'invoice_info_db': invoice_info_db.run,               # 发票信息(DB直连版)
 }
 
 
