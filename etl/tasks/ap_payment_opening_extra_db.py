@@ -644,7 +644,7 @@ def run():
     required_cols = c.required_columns(RULE_SHEET, RULE_TABLE)
     print('— 期初对公付款单导入 填充率 —')
     c.report_fill(base_output_df, required_cols)
-    print('— 只转入外部成本 填充率 —')
+    print('— 批量费用流程 填充率 —')
     c.report_fill(batch_output_df, required_cols)
     print('— 只转入外部成本 填充率 —')
     c.report_fill(external_output_df, required_cols)

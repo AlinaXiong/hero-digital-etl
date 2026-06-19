@@ -123,7 +123,7 @@ SELECT
     m.xmbh AS `项目编号`,
     m.gszt AS `公司主体ID`,
     m.bz AS `备注`,
-    m.xght AS `相关合同`,
+    m.xght AS `相关合同ID`,
     m.gys AS `供应商ID`,
     m.gyswb AS `供应商-文本`,
     m.yhzh AS `银行账号`,
@@ -205,6 +205,14 @@ def _query_fw(sql):
 
 
 # ============================ 源值解析 ============================
+def _lookup_first_browser_value(mapping, value):
+    for item_id in c.parse_browser_ids(value):
+        mapped = mapping.get(item_id, '')
+        if mapped:
+            return mapped
+    return ''
+
+
 def resolve_payment_status_name(value):
     """uf_dgfktz.zfzt 支付状态: 0=已支付。"""
     code = c.format_code(value)
@@ -217,12 +225,14 @@ def resolve_source_values(source_df):
     保留原始 ID 列,新增展示列:
     - 经办人ID -> 经办人 / 经办人工号
     - 公司主体ID -> 公司主体
+    - 相关合同ID -> 合同编号
     - 付款币种ID -> 付款币种
     - 预算科目ID -> 预算科目完整路径
     """
     df = source_df.copy()
     employee_map = c.build_fw_employee_info_map_for_ids(df['经办人ID'])
     company_map = c.build_fw_company_name_map_for_ids(df['公司主体ID'])
+    contract_map = c.build_fw_contract_code_map_for_ids(df['相关合同ID'])
     currency_map = c.build_fw_currency_name_map_for_ids(df['付款币种ID'])
     subject_map = c.build_fw_budget_subject_path_map_for_ids(df['预算科目ID'])
 
@@ -231,6 +241,8 @@ def resolve_source_values(source_df):
     df['经办人工号'] = df['经办人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
     # [主表] gszt -> uf_gstt.gsmc
     df['公司主体'] = df['公司主体ID'].map(lambda value: company_map.get(c.format_code(value), ''))
+    # [主表] xght -> uf_htsp.htbh
+    df['相关合同'] = df['相关合同ID'].map(lambda value: _lookup_first_browser_value(contract_map, value))
     # [主表] fkbz -> fnacurrency.CURRENCYNAME
     df['付款币种'] = df['付款币种ID'].map(lambda value: currency_map.get(c.format_code(value), ''))
     # [主表] zfzt: 0=已支付
@@ -293,7 +305,7 @@ def build_output(merged_df):
     output_df['备注'] = merged_df['备注'].astype(str).where(
         merged_df['备注'].notna(), '').str.slice(0, 150)              # [主表] bz,导入限制截前150字符
     output_df['合同号'] = merged_df['相关合同'].where(
-        merged_df['相关合同'].notna(), '')                            # [主表] xght
+        merged_df['相关合同'].notna(), '')                            # [主表] xght -> uf_htsp.htbh
     output_df['银行账号'] = merged_df['银行账号'].where(
         merged_df['银行账号'].notna(), '')                            # [主表] yhzh 原值
     output_df['计划付款日期'] = merged_df['预计付款日期'].map(c.format_date)  # [主表] yjfkrq
