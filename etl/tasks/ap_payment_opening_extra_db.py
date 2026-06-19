@@ -501,6 +501,7 @@ def build_batch_output(source_df):
     output_df['报账币种'] = 'CNY'
     output_df['报账金额（支付币种）'] = amount.map(c.round_amount)
     output_df['泛微费用项目编码'] = source_df['预算科目'].where(source_df['预算科目'].notna(), '')
+    output_df['银行账号'] = c.resolve_hand_vendor_bank_accounts(output_df['收款方编码'])
     return _apply_order_project_columns(output_df, source_df)
 
 
@@ -636,7 +637,7 @@ def build_external_cost_output(source_df):
     output_df['合同收支计划行'] = ''
     output_df['收款方编码'] = virtual_vendor_code
     output_df['收款方描述'] = VIRTUAL_VENDOR_NAME
-    output_df['银行账号'] = ''
+    output_df['银行账号'] = c.resolve_hand_vendor_bank_accounts(output_df['收款方编码'])
     output_df['计划付款日期'] = ''
     output_df['银行转账备注'] = ''
     output_df['实际已支付金额'] = expanded_df['金额'].map(c.round_amount)
@@ -777,6 +778,10 @@ def run():
         base_output_df, required_cols, RULE_SHEET, RULE_TABLE)}
     base_sheets.update(c.collect_field_issues(
         base_output_df, base_issue_source_df, required_cols, base_payment.ISSUE_SOURCE_FIELDS))
+    base_bank_issues = c.collect_hand_vendor_bank_account_issues(
+        base_output_df, base_issue_source_df['银行账号'])
+    if not base_bank_issues.empty:
+        base_sheets['银行账号_校验异常'] = base_bank_issues
     base_sheets = _enrich_missing_order_issue(base_sheets, base_output_df, base_issue_source_df)
     base_sheets.update(collect_order_mapping_issues(base_issue_source_df))
     exception_sheets.update({f'期初对公付款单导入_{name}': df for name, df in base_sheets.items()})
@@ -785,6 +790,9 @@ def run():
         batch_output_df, required_cols, RULE_SHEET, RULE_TABLE)}
     batch_sheets.update(c.collect_field_issues(
         batch_output_df, batch_source_df, required_cols, BATCH_ISSUE_SOURCE_FIELDS))
+    batch_bank_issues = c.collect_hand_vendor_bank_account_issues(batch_output_df)
+    if not batch_bank_issues.empty:
+        batch_sheets['银行账号_校验异常'] = batch_bank_issues
     batch_sheets = _enrich_missing_order_issue(batch_sheets, batch_output_df, batch_source_df)
     batch_sheets.update(collect_order_mapping_issues(batch_source_df))
     exception_sheets.update({f'批量费用流程_{name}': df for name, df in batch_sheets.items()})
@@ -793,6 +801,9 @@ def run():
         external_output_df, required_cols, RULE_SHEET, RULE_TABLE)}
     external_sheets.update(c.collect_field_issues(
         external_output_df, external_issue_source_df, required_cols, EXTERNAL_COST_ISSUE_SOURCE_FIELDS))
+    external_bank_issues = c.collect_hand_vendor_bank_account_issues(external_output_df)
+    if not external_bank_issues.empty:
+        external_sheets['银行账号_校验异常'] = external_bank_issues
     external_sheets = _enrich_missing_order_issue(external_sheets, external_output_df, external_issue_source_df)
     external_sheets.update(collect_order_mapping_issues(external_issue_source_df))
     external_sheets.update(collect_external_cost_pair_check(external_issue_source_df))

@@ -134,7 +134,8 @@ def build_output(merged_df, employee_code_map, vendor_map, entity_map, subject_m
     output_df['收款方编码'] = merged_df['付款对象'].map(  # [主表] 付款对象 -> 中台供应商编码
         lambda value: lookup_by_name(vendor_map, value))
     output_df['收款方描述'] = merged_df['付款对象'].where(merged_df['付款对象'].notna(), '')  # [主表] 付款对象
-    output_df['银行账号'] = merged_df['银行卡号'].where(merged_df['银行卡号'].notna(), '')  # [主表] 银行卡号
+    output_df['银行账号'] = c.resolve_hand_vendor_bank_accounts(
+        output_df['收款方编码'], merged_df['银行卡号'])  # 校验源银行账号;为空/不匹配时取 Hand 默认银行账号
     output_df['计划付款日期'] = ''  # 不涉及
     output_df['银行转账备注'] = ''  # 不涉及
     output_df['费用项目编码'] = merged_df['预算科目'].map(  # [明细] 预算科目 -> 科目编码
@@ -226,7 +227,8 @@ def build_gig_output(header_df, detail_df, vendor_map, company_map, entity_map):
     out['收款方编码'] = merged['实际收款方'].map(gig_payee_code)                 # [明细] 实际收款方 -> 中台供应商编码;未命中则保留实际收款方
     out['备注'] = [gig_recipient_remark(n, i, p)                                # 模版第22列:姓名-身份证-手机号(R50)
                   for n, i, p in zip(merged['实际收款方'], merged['身份证号'], merged['手机号'])]
-    out['银行账号'] = merged['银行账号'].where(merged['银行账号'].notna(), '')   # [明细] 银行账号
+    out['银行账号'] = c.resolve_hand_vendor_bank_accounts(
+        out['收款方编码'], merged['银行账号'])                                  # 校验源银行账号;为空/不匹配时取 Hand 默认银行账号
     out['预付款支付币种'] = 'CNY'                                               # 默认CNY(R52)
     out['预付款金额（支付币种）'] = pd.to_numeric(merged['付给三方平台金额'], errors='coerce').map(c.round_amount)  # [明细] 付给三方平台金额
     out['传送状态'] = '传送成功'                                                # 默认(R54)
@@ -281,10 +283,16 @@ def run():
     supplier_sheets = {'必输字段未达100%': c.fill_summary(
         output_df, supplier_required, RULE_SHEET, RULE_TABLE_SUPPLIER)}
     supplier_sheets.update(c.collect_field_issues(output_df, merged_df, supplier_required, ISSUE_SOURCE_FIELDS))
+    supplier_bank_issues = c.collect_hand_vendor_bank_account_issues(output_df, merged_df['银行卡号'])
+    if not supplier_bank_issues.empty:
+        supplier_sheets['银行账号_校验异常'] = supplier_bank_issues
     exception_sheets.update({f'供应商_{name}': df for name, df in supplier_sheets.items()})
     gig_sheets = {'必输字段未达100%': c.fill_summary(
         gig_output_df, gig_required, RULE_SHEET, RULE_TABLE_GIG)}
     gig_sheets.update(c.collect_field_issues(gig_output_df, gig_merged_df, gig_required, GIG_ISSUE_SOURCE_FIELDS))
+    gig_bank_issues = c.collect_hand_vendor_bank_account_issues(gig_output_df, gig_merged_df['银行账号'])
+    if not gig_bank_issues.empty:
+        gig_sheets['银行账号_校验异常'] = gig_bank_issues
     exception_sheets.update({f'灵工_{name}': df for name, df in gig_sheets.items()})
     c.write_exceptions(EXCEPTION_FILE, exception_sheets)
     print('已写出:', EXCEPTION_FILE, '| 各清单条数:', {k: len(v) for k, v in exception_sheets.items()})

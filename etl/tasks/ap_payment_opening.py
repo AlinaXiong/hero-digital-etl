@@ -105,7 +105,8 @@ def build_output(merged_df, employee_code_map, vendor_map, entity_map, subject_m
     output_df['收款方编码'] = merged_df['供应商-文本'].map(  # [主表] 供应商-文本 -> 中台供应商编码
         lambda value: lookup_by_name(vendor_map, value))
     output_df['收款方描述'] = merged_df['供应商-文本'].where(merged_df['供应商-文本'].notna(), '')  # [主表] 供应商-文本
-    output_df['银行账号'] = merged_df['银行账号'].where(merged_df['银行账号'].notna(), '')  # [主表] 银行账号
+    output_df['银行账号'] = c.resolve_hand_vendor_bank_accounts(
+        output_df['收款方编码'], merged_df['银行账号'])  # 校验源银行账号;为空/不匹配时取 Hand 默认银行账号
     output_df['计划付款日期'] = merged_df['预计付款日期'].map(c.format_date)  # [主表] 预计付款日期
     output_df['银行转账备注'] = ''  # 不涉及
     output_df['实际已支付金额'] = [  # [明细] 支付状态=已支付取付款金额,否则为 0
@@ -150,6 +151,9 @@ def run():
     # 6. 问题清单:必输字段未达100%汇总 + 每个有缺失的必输字段的缺失明细(自动覆盖全部必输字段)
     sheets = {'必输字段未达100%': c.fill_summary(output_df, required_cols, RULE_SHEET, RULE_TABLE)}
     sheets.update(c.collect_field_issues(output_df, merged_df, required_cols, ISSUE_SOURCE_FIELDS))
+    bank_issues = c.collect_hand_vendor_bank_account_issues(output_df, merged_df['银行账号'])
+    if not bank_issues.empty:
+        sheets['银行账号_校验异常'] = bank_issues
     c.write_exceptions(EXCEPTION_FILE, sheets)
     print('已写出:', EXCEPTION_FILE, '| 各清单条数:', {
         sheet_name: len(sheet_df) for sheet_name, sheet_df in sheets.items()

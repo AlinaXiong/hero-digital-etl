@@ -826,6 +826,166 @@ def build_supplier_vendor_info_map_for_rows(
     return vendor_by_row
 
 
+def normalize_bank_account(value):
+    """银行账号归一化:去空白,保留字母数字及原始账号字符用于比较。"""
+    text = _cell_text(value)
+    if text.endswith('.0') and text[:-2].isdigit():
+        text = text[:-2]
+    return re.sub(r'\s+', '', text)
+
+
+def build_fw_supplier_bank_account_map_for_ids(bank_account_values):
+    """泛微供应商银行账号浏览框 ID -> 银行账号文本。
+
+    对公付款/供应商预付里的银行账号字段经常存 uf_khgys_dt1.id,不能直接写入导入模板。
+    """
+    bank_account_ids = clean_codes(
+        bank_account_id
+        for value in bank_account_values
+        for bank_account_id in parse_browser_ids(value)
+    )
+    if not bank_account_ids:
+        return {}
+    bank_df = query_db(
+        'FW',
+        'vspn_xtyy',
+        'SELECT id, yhzh bank_account '
+        'FROM uf_khgys_dt1 '
+        f'WHERE id IN ({in_placeholders(bank_account_ids)})',
+        bank_account_ids,
+    )
+    return {
+        format_code(row['id']): _cell_text(row['bank_account'])
+        for _, row in bank_df.iterrows()
+        if _cell_text(row['bank_account'])
+    }
+
+
+def build_hand_vendor_bank_account_info_for_codes(vendor_codes):
+    """Hand 供应商编码 -> 银行账号信息。
+
+    来源: hfins_base.hfbs_vender_account。优先默认账户(primary_flag=1),再优先 CNY。
+    返回结构:
+      {vender_code: {'default': '...', 'accounts': [...], 'normalized': {'...': account_dict}}}
+    """
+    codes = _ordered_unique(_cell_text(value) for value in vendor_codes)
+    codes = [code for code in codes if code]
+    if not codes:
+        return {}
+
+    account_df = query_db(
+        'ZT',
+        'hfins_base',
+        'SELECT vender_code, bank_account_number, bank_account_name, primary_flag, enabled_flag, '
+        '       pk_currtype, bank_code, bank_location_name, account_id, last_update_date '
+        'FROM hfbs_vender_account '
+        f'WHERE vender_code IN ({in_placeholders(codes)}) '
+        "  AND bank_account_number IS NOT NULL AND bank_account_number <> '' "
+        "  AND (enabled_flag IS NULL OR enabled_flag = 1 OR enabled_flag = '1') "
+        'ORDER BY vender_code, primary_flag DESC, '
+        "         CASE WHEN pk_currtype = 'CNY' THEN 0 ELSE 1 END, "
+        '         last_update_date DESC, account_id DESC',
+        codes,
+    )
+
+    result = {}
+    for _, row in account_df.iterrows():
+        vendor_code = _cell_text(row['vender_code'])
+        account_number = _cell_text(row['bank_account_number'])
+        normalized = normalize_bank_account(account_number)
+        if not vendor_code or not account_number or not normalized:
+            continue
+        bucket = result.setdefault(vendor_code, {
+            'default': '',
+            'accounts': [],
+            'normalized': {},
+        })
+        account = {
+            'bank_account_number': account_number,
+            'bank_account_name': _cell_text(row.get('bank_account_name', '')),
+            'primary_flag': format_code(row.get('primary_flag', '')),
+            'enabled_flag': format_code(row.get('enabled_flag', '')),
+            'currency': _cell_text(row.get('pk_currtype', '')),
+            'bank_code': _cell_text(row.get('bank_code', '')),
+            'bank_location_name': _cell_text(row.get('bank_location_name', '')),
+        }
+        bucket['accounts'].append(account)
+        bucket['normalized'].setdefault(normalized, account)
+        if not bucket['default']:
+            bucket['default'] = account_number
+    return result
+
+
+def resolve_hand_vendor_bank_accounts(vendor_codes, source_accounts=None):
+    """按收款方供应商编码解析导入银行账号。
+
+    - 源银行账号存在且在该供应商 Hand 银行账户中:使用 Hand 中的规范账号。
+    - 源银行账号为空或不属于该供应商:使用该供应商默认银行账号。
+    """
+    vendor_series = vendor_codes if isinstance(vendor_codes, pd.Series) else pd.Series(vendor_codes)
+    source_series = _series_like(source_accounts, vendor_series.index)
+    bank_info_by_code = build_hand_vendor_bank_account_info_for_codes(vendor_series)
+
+    resolved = {}
+    for index, vendor_code in vendor_series.items():
+        vendor_code = _cell_text(vendor_code)
+        source_norm = normalize_bank_account(source_series.get(index, ''))
+        bank_info = bank_info_by_code.get(vendor_code, {})
+        normalized_accounts = bank_info.get('normalized', {})
+        if source_norm and source_norm in normalized_accounts:
+            resolved[index] = normalized_accounts[source_norm]['bank_account_number']
+        else:
+            resolved[index] = bank_info.get('default', '')
+    return pd.Series(resolved, index=vendor_series.index)
+
+
+def collect_hand_vendor_bank_account_issues(
+        output_df, source_accounts=None, vendor_code_col='收款方编码',
+        bank_col='银行账号', doc_col='来源单据编号'):
+    """校验输出银行账号是否存在于收款方 Hand 供应商银行卡中。"""
+    if vendor_code_col not in output_df.columns or bank_col not in output_df.columns:
+        return pd.DataFrame()
+
+    vendor_series = output_df[vendor_code_col]
+    source_series = _series_like(source_accounts, output_df.index)
+    bank_info_by_code = build_hand_vendor_bank_account_info_for_codes(vendor_series)
+
+    rows = []
+    for index, vendor_code in vendor_series.items():
+        vendor_code = _cell_text(vendor_code)
+        if not vendor_code:
+            continue
+        source_account = _cell_text(source_series.get(index, ''))
+        source_norm = normalize_bank_account(source_account)
+        output_account = _cell_text(output_df.at[index, bank_col])
+        output_norm = normalize_bank_account(output_account)
+        bank_info = bank_info_by_code.get(vendor_code, {})
+        normalized_accounts = bank_info.get('normalized', {})
+        default_account = bank_info.get('default', '')
+        reason = ''
+        if not output_norm:
+            reason = '收款方在Hand供应商银行卡中未找到可用银行账号'
+        elif output_norm not in normalized_accounts:
+            reason = '输出银行账号未在该收款方Hand供应商银行卡中找到'
+        elif source_norm and source_norm not in normalized_accounts:
+            reason = '源银行账号未在该收款方Hand供应商银行卡中找到,已使用默认银行账号'
+        if not reason:
+            continue
+        rows.append({
+            doc_col: _cell_text(output_df.at[index, doc_col]) if doc_col in output_df.columns else '',
+            vendor_code_col: vendor_code,
+            '源银行账号': source_account,
+            '输出银行账号': output_account,
+            'Hand默认银行账号': default_account,
+            'Hand可用银行账号数': len(bank_info.get('accounts', [])),
+            '校验结果': reason,
+        })
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).drop_duplicates().reset_index(drop=True)
+
+
 def build_customer_map():
     """客户名称 -> 中台客户编码 customer_code。来源:中台 hfins_base.hfbs_system_customer。
     按 description / taxpayer_name 建键(均 normalize_name 归一化)。"""

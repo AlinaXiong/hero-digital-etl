@@ -1077,6 +1077,8 @@ def build_supplier_output(merged_df):
         vendor_description(index, supplier_text)
         for index, supplier_text in zip(merged_df.index, merged_df['付款对象'])
     ]                                                                    # 优先 Hand description(供应商描述),兜底 [主表] fkdx(付款对象) -> uf_khgys.khmc(供应商名称)
+    output_df['银行账号'] = c.resolve_hand_vendor_bank_accounts(
+        output_df['收款方编码'], merged_df['银行卡号'])                  # 按收款方 Hand 供应商银行卡校验;为空/不匹配时取默认账号
     output_df['费用项目编码'] = merged_df['预算科目'].map(
         lambda value: subject_item(value, 0))                            # [明细] yskm(预算科目) -> 规则表费用项目编码
     output_df['费用项目描述'] = merged_df['预算科目'].map(
@@ -1151,12 +1153,12 @@ def build_gig_output(merged_df):
         merged_df['合同名称'].notna(), '')                              # [原流程] htmc(合同名称);为空时合同编号兜底
     output_df['计划付款日期'] = merged_df['预计付款日期'].map(c.format_date)  # [建模头] yjfkrq(预计付款日期)
     output_df['收款方编码'] = merged_df['实际收款方'].map(gig_payee_code)  # [原流程明细] dt4.skf(收款方)
+    output_df['银行账号'] = c.resolve_hand_vendor_bank_accounts(
+        output_df['收款方编码'], merged_df['银行账号'])                  # 按收款方 Hand 供应商银行卡校验;为空/不匹配时取默认账号
     output_df['备注'] = [
         gig_recipient_remark(name, id_number, phone)
         for name, id_number, phone in zip(merged_df['实际收款方'], merged_df['身份证号'], merged_df['手机号'])
     ]                                                                    # 姓名-身份证-手机号
-    output_df['银行账号'] = merged_df['银行账号'].where(
-        merged_df['银行账号'].notna(), '')                              # [原流程明细] dt4.yhzh(银行账号)
     output_df['预付款金额（支付币种）'] = pd.to_numeric(
         merged_df['预付款金额分摊'], errors='coerce').map(c.round_amount)  # [原流程明细] dt4.sl(付给三方平台金额) 按合并预算科目顺序占用预算项金额
 
@@ -1259,6 +1261,10 @@ def run():
         supplier_output_df, supplier_required, RULE_SHEET, RULE_TABLE_SUPPLIER)}
     supplier_sheets.update(c.collect_field_issues(
         supplier_output_df, supplier_merged_df, supplier_required, SUPPLIER_ISSUE_SOURCE_FIELDS))
+    supplier_bank_issues = c.collect_hand_vendor_bank_account_issues(
+        supplier_output_df, supplier_merged_df['银行卡号'])
+    if not supplier_bank_issues.empty:
+        supplier_sheets['银行账号_校验异常'] = supplier_bank_issues
     supplier_sheets.update(collect_order_mapping_issues(supplier_merged_df))
     exception_sheets.update({f'供应商_{name}': df for name, df in supplier_sheets.items()})
 
@@ -1266,6 +1272,10 @@ def run():
         gig_output_df, gig_required, RULE_SHEET, RULE_TABLE_GIG)}
     gig_sheets.update(c.collect_field_issues(
         gig_output_df, gig_merged_df, gig_required, GIG_ISSUE_SOURCE_FIELDS))
+    gig_bank_issues = c.collect_hand_vendor_bank_account_issues(
+        gig_output_df, gig_merged_df['银行账号'])
+    if not gig_bank_issues.empty:
+        gig_sheets['银行账号_校验异常'] = gig_bank_issues
     gig_sheets.update(collect_order_mapping_issues(gig_merged_df))
     exception_sheets.update({f'灵工_{name}': df for name, df in gig_sheets.items()})
 

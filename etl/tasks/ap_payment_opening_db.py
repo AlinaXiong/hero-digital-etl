@@ -236,6 +236,7 @@ def resolve_source_values(source_df):
     contract_map = c.build_fw_contract_code_map_for_ids(df['相关合同ID'])
     currency_map = c.build_fw_currency_name_map_for_ids(df['付款币种ID'])
     subject_map = c.build_fw_budget_subject_path_map_for_ids(df['预算科目ID'])
+    bank_account_map = c.build_fw_supplier_bank_account_map_for_ids(df['银行账号'])
 
     # [主表] jbr -> hrmresource / hrmjobtitles
     df['经办人'] = df['经办人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
@@ -244,6 +245,10 @@ def resolve_source_values(source_df):
     df['公司主体'] = df['公司主体ID'].map(lambda value: company_map.get(c.format_code(value), ''))
     # [主表] xght -> uf_htsp.htbh
     df['相关合同'] = df['相关合同ID'].map(lambda value: _lookup_first_browser_value(contract_map, value))
+    # [主表] yhzh 是供应商银行账号浏览框 ID,先转成账号文本,后续再按 Hand 供应商银行卡校验。
+    df['银行账号'] = df['银行账号'].map(
+        lambda value: _lookup_first_browser_value(bank_account_map, value)
+        or ('' if pd.isna(value) else str(value).strip()))
     # [主表] fkbz -> fnacurrency.CURRENCYNAME
     df['付款币种'] = df['付款币种ID'].map(lambda value: currency_map.get(c.format_code(value), ''))
     # [主表] zfzt: 0=已支付
@@ -327,6 +332,8 @@ def build_output(merged_df):
         vendor_description(index, supplier_text)
         for index, supplier_text in zip(merged_df.index, merged_df['供应商-文本'])
     ]                                                                  # 优先 Hand description,兜底 [主表] gyswb
+    output_df['银行账号'] = c.resolve_hand_vendor_bank_accounts(
+        output_df['收款方编码'], merged_df['银行账号'])                  # 按收款方 Hand 供应商银行卡校验;为空/不匹配时取默认账号
 
     # 金额和费用项目。
     output_df['实际已支付金额'] = [
@@ -381,6 +388,9 @@ def run():
     # 5. 问题清单
     sheets = {'必输字段未达100%': c.fill_summary(output_df, required_cols, RULE_SHEET, RULE_TABLE)}
     sheets.update(c.collect_field_issues(output_df, merged_df, required_cols, ISSUE_SOURCE_FIELDS))
+    bank_issues = c.collect_hand_vendor_bank_account_issues(output_df, merged_df['银行账号'])
+    if not bank_issues.empty:
+        sheets['银行账号_校验异常'] = bank_issues
     c.write_exceptions(EXCEPTION_FILE, sheets)
     print('已写出:', EXCEPTION_FILE, '| 各清单条数:', {
         sheet_name: len(sheet_df) for sheet_name, sheet_df in sheets.items()
