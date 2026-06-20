@@ -3,7 +3,8 @@
 
 处理流程:
 1. 校验泛微字段字典,避免 SQL 字段名/含义写错。
-2. 从泛微库读取供应商预付 uf_yfkxx/uf_yfkxx_dt1,以及零工付款 uf_lgptfk + 原流程收款人明细/预算项明细。
+2. 从泛微库读取供应商预付 uf_yfkxx/uf_yfkxx_dt1,并从 uf_dgfktz_dt2 汇总对公付款冲销;
+   零工付款读取 uf_lgptfk + 原流程收款人明细/预算项明细。
 3. 只对必须跨表/跨系统的 ID 做批量解析,例如人员、公司主体、币种、预算科目、供应商、银行账号。
 4. 按导入模版两个 tab 逐列生成输出,字段旁标注取值来源。
 
@@ -123,6 +124,8 @@ GIG_ISSUE_SOURCE_FIELDS = {
 
 FW_SUPPLIER_TABLE = 'uf_yfkxx'
 FW_SUPPLIER_DETAIL_TABLE = 'uf_yfkxx_dt1'
+FW_PAYMENT_OFFSET_TABLE = 'uf_dgfktz'
+FW_PAYMENT_OFFSET_DETAIL_TABLE = 'uf_dgfktz_dt2'
 FW_GIG_HEADER_TABLE = 'uf_lgptfk'
 FW_GIG_WORKFLOW_TABLE = 'formtable_main_279'
 FW_GIG_BUDGET_TABLE = 'formtable_main_279_dt3'
@@ -171,9 +174,25 @@ SELECT
     m.fkxz AS `付款性质ID`,
     m.sycxtkje AS `剩余冲销/退款金额`,
     d.yfje AS `预付金额`,
-    d.yskm AS `预算科目ID`
+    d.yskm AS `预算科目ID`,
+    COALESCE(w.written_off_amount, 0) AS `冲销金额（支付币种-同预付单预算科目）`
 FROM uf_yfkxx m
 JOIN uf_yfkxx_dt1 d ON d.mainid = m.id
+LEFT JOIN (
+    SELECT
+        CAST(x.yfkxx AS CHAR) AS prepayment_id,
+        CAST(x.yskm AS CHAR) AS budget_subject_id,
+        SUM(ABS(COALESCE(x.cxje, 0))) AS written_off_amount
+    FROM uf_dgfktz_dt2 x
+    JOIN uf_dgfktz p ON p.id = x.mainid
+    WHERE x.yfkxx IS NOT NULL
+      AND x.yfkxx <> ''
+      AND p.sqrq >= %(date_from)s
+      AND p.lcz = %(approved_status_code)s
+      AND (p.sfzf IS NULL OR p.sfzf <> %(void_code)s)
+    GROUP BY CAST(x.yfkxx AS CHAR), CAST(x.yskm AS CHAR)
+) w ON w.prepayment_id = CAST(m.id AS CHAR)
+   AND w.budget_subject_id = CAST(d.yskm AS CHAR)
 WHERE m.sqrq >= %(date_from)s
   AND m.lczt = %(approved_status_code)s
   AND (m.sfzf IS NULL OR m.sfzf <> %(void_code)s)
@@ -305,6 +324,18 @@ EXPECTED_SUPPLIER_FIELDS = {
     FW_SUPPLIER_DETAIL_TABLE: {
         'yfje': '预付金额',
         'yskm': '预算科目',
+    },
+}
+EXPECTED_PAYMENT_OFFSET_FIELDS = {
+    '': {
+        'sqrq': '申请日期',
+        'lcz': '流程状态',
+        'sfzf': '是否作废',
+    },
+    FW_PAYMENT_OFFSET_DETAIL_TABLE: {
+        'yfkxx': '预付款信息',
+        'yskm': '预算科目',
+        'cxje': '冲销金额',
     },
 }
 EXPECTED_GIG_HEADER_FIELDS = {
@@ -678,6 +709,42 @@ def allocate_gig_budget_to_recipients(recipient_df, budget_df):
 
 
 # ============================ 模板输出:供应商预付款 ============================
+def allocate_supplier_written_off_amounts(merged_df):
+    """按预付单+预算科目把对公付款冲销金额分摊到预付预算明细行。"""
+    detail_amount = pd.to_numeric(merged_df['预付金额'], errors='coerce').fillna(0).map(c.round_amount)
+    group_written_off = pd.to_numeric(
+        merged_df['冲销金额（支付币种-同预付单预算科目）'], errors='coerce').fillna(0)
+    settled_amount = pd.Series(0.0, index=merged_df.index, dtype='float64')
+
+    for _, group in merged_df.groupby(['ID', '预算科目ID'], sort=False, dropna=False):
+        indexes = list(group.index)
+        if not indexes:
+            continue
+
+        written_off_amount = c.round_amount(group_written_off.loc[indexes].iloc[0])
+        if len(indexes) == 1:
+            settled_amount.loc[indexes[0]] = written_off_amount
+            continue
+
+        group_detail_amount = detail_amount.loc[indexes]
+        detail_total = c.round_amount(group_detail_amount.sum())
+        if detail_total != 0:
+            allocations = [
+                c.round_amount(written_off_amount * amount / detail_total)
+                for amount in group_detail_amount
+            ]
+        else:
+            per_row_amount = c.round_amount(written_off_amount / len(indexes))
+            allocations = [per_row_amount] * len(indexes)
+
+        diff = c.round_amount(written_off_amount - sum(allocations))
+        allocations[-1] = c.round_amount(allocations[-1] + diff)
+        settled_amount.loc[indexes] = allocations
+
+    unsettled_amount = (detail_amount - settled_amount).map(c.round_amount)
+    return detail_amount, settled_amount, unsettled_amount
+
+
 def build_supplier_output(merged_df):
     """供应商预付 DB 源数据 -> 供应商预付款单导入模版 26 列。"""
     def lookup_by_name(mapping, value):
@@ -707,12 +774,7 @@ def build_supplier_output(merged_df):
             return ''
         return subject_map.get(c.remove_slashes(subject_path), ('', ''))[index]
 
-    main_amount = pd.to_numeric(merged_df['付款金额'], errors='coerce').fillna(0)
-    detail_amount = pd.to_numeric(merged_df['预付金额'], errors='coerce').fillna(0)
-    remaining = pd.to_numeric(merged_df['剩余冲销/退款金额'], errors='coerce').fillna(0)
-    ratio = (detail_amount / main_amount).where(main_amount != 0, 0)
-    unsettled_amount = remaining * ratio
-    settled_amount = detail_amount - unsettled_amount
+    detail_amount, settled_amount, unsettled_amount = allocate_supplier_written_off_amounts(merged_df)
     is_deposit = merged_df['付款性质ID'].map(c.format_code).isin(DEPOSIT_PAYMENT_NATURE_CODES)
 
     output_df = pd.DataFrame(index=merged_df.index)
@@ -764,8 +826,8 @@ def build_supplier_output(merged_df):
 
     # 金额拆分。
     output_df['预付款金额（支付币种）'] = detail_amount.map(c.round_amount)       # [明细] yfje(预付金额)
-    output_df['已到票核销金额（支付币种）'] = settled_amount.map(c.round_amount)  # [明细] yfje(预付金额) - 按比例分摊的 [主表] sycxtkje(剩余冲销/退款金额)
-    output_df['已付未核（支付币种）'] = unsettled_amount.map(c.round_amount)     # [主表] sycxtkje(剩余冲销/退款金额) 按明细占比分摊
+    output_df['已到票核销金额（支付币种）'] = settled_amount.map(c.round_amount)  # [对公付款冲销] uf_dgfktz_dt2.cxje 转正后按预付单+预算科目汇总/分摊
+    output_df['已付未核（支付币种）'] = unsettled_amount.map(c.round_amount)     # [明细] yfje(预付金额) - 已到票核销金额
     output_df['泛微费用项目编码'] = merged_df['预算科目'].where(
         merged_df['预算科目'].notna(), '')                               # [明细] yskm -> 原泛微预算科目路径
     return output_df[SUPPLIER_OUTPUT_COLUMNS]
@@ -872,6 +934,7 @@ def build_gig_output(merged_df):
 def read_supplier_source():
     """从 DB 直接读取过滤后的供应商预付主子合并数据。"""
     c.validate_fw_fields(FW_SUPPLIER_TABLE, EXPECTED_SUPPLIER_FIELDS)
+    c.validate_fw_fields(FW_PAYMENT_OFFSET_TABLE, EXPECTED_PAYMENT_OFFSET_FIELDS)
     stats = _query_fw(SUPPLIER_STATS_SQL).iloc[0]
     status_name = FLOW_STATUS_MEANINGS.get(APPROVED_STATUS_CODE, '')
     void_name = VOID_FLAG_MEANINGS.get(VOID_CODE, '')
