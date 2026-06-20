@@ -6,14 +6,34 @@
 
 查看当前所有任务：`python run.py --list`
 
-| 任务名 | 业务含义 | 数据源                                                                                           | 产出模板 |
-| --- | --- |-----------------------------------------------------------------------------------------------| --- |
-| `ap_payment_opening` | 应付期初 - 对公付款单 | 对公付款主表 + 明细                                                                                   | 英雄期初对公付款单导入模版 |
-| `ap_payment_opening_db` | 应付期初 - 对公付款单(DB直连版) | 泛微 `uf_dgfktz` + `uf_dgfktz_dt1`                                                              | 英雄期初对公付款单导入模版 |
-| `ap_prepayment_opening` | 预付期初 - 供应商预付款单 + 零工预付款单 | 预付款主表 + 明细；零工平台付款头数据 + 实际收款人明细                                                                | 英雄期初预付款单导入模版 |
+| 任务名 | 业务含义 | 数据源 | 产出模板 |
+| --- | --- | --- | --- |
+| `ap_payment_opening` | 应付期初 - 对公付款单 | 对公付款主表 + 明细 | 英雄期初对公付款单导入模版 |
+| `ap_payment_opening_db` | 应付期初 - 对公付款单(DB直连版) | 泛微 `uf_dgfktz` + `uf_dgfktz_dt1` | 英雄期初对公付款单导入模版 |
+| `ap_payment_opening_extra_db` | 应付期初 - 对公付款单补充三 tab(DB直连版) | `ap_payment_opening_db` 口径 + 泛微 `uf_plfy` / `uf_plfy_dt1` + `uf_xtyynbsz` / `uf_xtyynbsz_dt10` / `view_costlist_ys` | 英雄期初对公付款单导入模版 |
+| `ap_prepayment_opening` | 预付期初 - 供应商预付款单 + 零工预付款单 | 预付款主表 + 明细；零工平台付款头数据 + 实际收款人明细 | 英雄期初预付款单导入模版 |
 | `ap_prepayment_opening_db` | 预付期初 - 供应商预付款单 + 零工预付款单(DB直连版) | 泛微 `uf_yfkxx` + `uf_yfkxx_dt1`；`uf_lgptfk` + `formtable_main_279` + `formtable_main_279_dt3` + `formtable_main_279_dt4` | 英雄期初预付款单导入模版 |
-| `ar_invoice_opening` | 应收期初 - 应收报账单 | 开票记录 + 收款登记                                                                                   | 应收报账单期初数据导入模板 |
-| `ar_invoice_opening_db` | 应收期初 - 应收报账单(DB直连版) | 泛微 `uf_xtyykp` + `uf_skdj`                                                                    | 应收报账单期初数据导入模板 |
+| `ar_invoice_opening` | 应收期初 - 应收报账单 | 开票记录 + 收款登记 | 应收报账单期初数据导入模板 |
+| `ar_invoice_opening_db` | 应收期初 - 应收报账单(DB直连版) | 泛微 `uf_xtyykp` + `uf_skdj` | 应收报账单期初数据导入模板 |
+| `invoice_info_db` | 发票信息(DB直连版) | 泛微 `fnainvoiceledger` + `fnainvoiceledgerdtl` | 发票信息清洗导入表 |
+| `all` | 一次跑核心 DB 导入任务 | 依次执行 `ap_payment_opening_extra_db`、`ap_prepayment_opening_db`、`ar_invoice_opening_db`、`invoice_info_db` | 多个模板/清洗表 |
+
+### all（一键执行核心 DB 任务）
+
+按固定顺序串行执行四个任务：
+
+1. `ap_payment_opening_extra_db`
+2. `ap_prepayment_opening_db`
+3. `ar_invoice_opening_db`
+4. `invoice_info_db`
+
+执行命令：
+
+```bash
+python run.py all
+```
+
+其中任一子任务失败时，进程会直接报错退出，后续任务不会继续跑。
 
 ### ap_payment_opening（应付期初 - 对公付款单）
 
@@ -28,6 +48,17 @@
 ### ap_payment_opening_db（应付期初 - 对公付款单 DB 直连版）
 
 与 `ap_payment_opening` 使用同一套过滤、输出和问题清单口径；源数据不读 Excel，直接从泛微库读取 `uf_dgfktz` / `uf_dgfktz_dt1`，并把人员、部门、枚举、币种、预算科目、公司主体等 ID 转成原 Excel 导出同款展示值。
+
+### ap_payment_opening_extra_db（应付期初 - 对公付款单补充三 tab DB 直连版）
+
+一次生成「应付期初」同一个 Excel 的三个 tab：`期初对公付款单导入`、`批量费用流程`、`只转入外部成本`。
+
+- **期初对公付款单导入**：复用 `ap_payment_opening_db` 的读取、过滤、供应商、合同、银行账号和预算科目逻辑。
+- **批量费用流程源表**：泛微 `uf_plfy` + `uf_plfy_dt1`；过滤 `d.sfqr=0`、明细未作废、记录日期 ≥ 2026-01-01。
+- **只转入外部成本源表**：泛微 `uf_xtyynbsz` + `uf_xtyynbsz_dt10`，并关联 `view_costlist_ys` 取费用单明细；同时处理赛事来源 `ly=5` 和 MCN 来源 `ly=2`。
+- **项目/订单字段**：先把泛微项目浏览框 ID 解析成泛微项目编号，再按 0619 项目&订单清洗表映射订单编号/订单名称，并保留 `泛微项目编号`。
+- **校验清单**：除必输字段、供应商、银行账号、项目订单映射异常外，`只转入外部成本` 还会输出每个单据转入/转出正负金额是否配平的检查结果。
+- **产出**：`英雄期初对公付款单导入_应付期初_补充_<YYYYMMDD>.xlsx`。
 
 ### ap_prepayment_opening（预付期初 - 供应商预付款单 / 零工预付款单）
 
@@ -45,7 +76,7 @@
 
 ### ap_prepayment_opening_db（预付期初 - 供应商预付款单 / 零工预付款单 DB 直连版）
 
-与 `ap_prepayment_opening` 使用同一套过滤、输出和问题清单口径；源数据不读 Excel，供应商预付直接从泛微 `uf_yfkxx` / `uf_yfkxx_dt1` 读取。零工预付从建模头表 `uf_lgptfk` 关联原流程主表 `formtable_main_279`，再取预算项明细表 `formtable_main_279_dt3` 和收款人明细表 `formtable_main_279_dt4`；其中 `dt3` 对应「对公&报销&零工&批量四合一」里零工平台付款的预算科目/费用金额来源。人员、公司主体、合同、银行账号、币种、预算科目、供应商等 ID 在任务内批量解析。
+与 `ap_prepayment_opening` 使用同一套过滤、输出和问题清单口径；源数据不读 Excel，供应商预付直接从泛微 `uf_yfkxx` / `uf_yfkxx_dt1` 读取。零工预付从建模头表 `uf_lgptfk` 关联原流程主表 `formtable_main_279`，再取预算项明细表 `formtable_main_279_dt3` 和收款人明细表 `formtable_main_279_dt4`；其中 `dt3` 对应「对公&报销&零工&批量四合一」里零工平台付款的预算科目/费用金额来源。人员、公司主体、合同、银行账号、币种、预算科目、供应商等 ID 在任务内批量解析；订单编号/订单名称统一按 0619 项目&订单清洗表映射，并保留 `泛微项目编号`。
 
 ### ar_invoice_opening（应收期初 - 应收报账单）
 
@@ -54,55 +85,83 @@
 - **源表**：`uf_xtyykp开票.xlsx`（一行=一条开票记录）+ `uf_skdj收款登记.xlsx`（按「开票/预收单号」汇总）
 - **行过滤**：申请日期 ≥ 2026-01-01 且 开票状态=已开票 且 非作废
 - **行粒度**：一行=一条开票记录；收款登记按「开票/预收单号=流程编号」聚合已收款金额后回填核销金额
-- **关键映射**：申请人→工号、公司主体→核算主体编码、客户→付款对象编码、业务类型→`HERO.BUSINESS_TYPE` 编码、开票类型默认合同开票、税率→`hfbs_tax_type.description`
+- **关键映射**：申请人→工号、公司主体→核算主体编码、客户→付款对象编码、业务类型→`HERO.BUSINESS_TYPE` 编码、开票类型默认合同开票、税率→`hfbs_tax_type.description`；项目/订单按 0619 项目&订单清洗表映射，并保留 `泛微项目编号`
 - **产出**：`英雄应收报账单期初数据导入_应收期初_<YYYYMMDD>.xlsx`（71 列单 tab）
 
 ### ar_invoice_opening_db（应收期初 - 应收报账单 DB 直连版）
 
-与 `ar_invoice_opening` 使用同一套过滤、输出和问题清单口径；源数据不读 Excel，直接从泛微库读取 `uf_xtyykp`，并按「开票/预收单号」关联 `uf_skdj` 汇总已收款金额。申请人、部门、公司主体、客户、合同、币种等 ID 在公共方法里批量解析。
+与 `ar_invoice_opening` 使用同一套过滤、输出和问题清单口径；源数据不读 Excel，直接从泛微库读取 `uf_xtyykp`，并按「开票/预收单号」关联 `uf_skdj` 汇总已收款金额。申请人、部门、公司主体、客户、合同、币种、项目等 ID 在公共方法里批量解析；项目/订单按 0619 项目&订单清洗表映射，并保留 `泛微项目编号`。
 
-## 当前清洗进度（2026-06-14）
+### invoice_info_db（发票信息 DB 直连版）
 
-### 应付期初 - 供应商付款
+按规则表「发票信息」生成发票信息清洗结果。
 
-- **执行命令**：`python run.py ap_payment_opening`
-- **过滤结果**：满足流程来源/申请日期/审批状态条件 3885 单，剔除作废 8 单，最终保留主表 3877 单
-- **输出结果**：生成导入明细 4383 行
-- **待业务确认/补充**：
-  - 订单编号：暂未映射，0/4383
-  - 收款方编码：已匹配 4116/4383，未匹配清单 156 条
-  - 费用项目编码：已匹配 4293/4383，未匹配清单 90 条
-- **产出文件**：`output/ap_payment_opening/英雄期初对公付款单导入_应付期初_20260614.xlsx`
-- **未匹配清单**：`output/ap_payment_opening/未匹配清单_应付期初_20260614.xlsx`
+- **源表**：泛微 `fnainvoiceledger`，并关联 `fnainvoiceledgerdtl` 汇总发票备注。
+- **行过滤**：当前只取 2026 年报销/关联数据；保留 `status IN (1, 2)` 的冻结/核销状态发票，不取初始未使用发票。
+- **关键映射**：发票归属人→工号、购买方→核算主体编码、泛微发票类型→汉得 `VAT_INVOICE_TYPE`，含税金额转中文大写。
+- **产出**：`发票信息清洗_发票信息_2026_<YYYYMMDD>.xlsx`。
 
-### 预付期初 - 供应商预付款 / 零工预付款
+## 公共清洗口径
 
-- **执行命令**：`python run.py ap_prepayment_opening`
-- **供应商预付款过滤结果**：满足申请日期/审批状态条件 1023 单，剔除作废 12 单，最终保留主表 1011 单
-- **供应商预付款输出结果**：生成导入明细 1087 行
-- **零工预付款过滤结果**：满足申请日期/审批状态条件 962 单，剔除作废 0 单，最终保留主表 962 单
-- **零工预付款输出结果**：生成导入明细 2731 行
-- **待业务确认/补充**：
-  - 供应商预付款订单编号：暂未映射，0/1087
-  - 供应商预付款收款方编码：已匹配 1057/1087，未匹配清单 30 条
-  - 供应商预付款费用项目编码：已匹配 1030/1087，未匹配清单 57 条
-  - 零工预付款订单编号：暂未映射，0/2731
-  - 零工预付款费用项目编码：规则目前无来源，0/2731
-- **产出文件**：`output/ap_prepayment_opening/英雄期初预付款单导入_预付期初_20260614.xlsx`
-- **未匹配清单**：`output/ap_prepayment_opening/未匹配清单_预付期初_20260614.xlsx`
+### 0619 项目/订单清洗映射
 
-### 应收期初 - 应收报账单（2026-06-15）
+项目和订单字段统一从 `data/source/other_cleaned_data/业财项目_项目&订单清洗_0619.xlsx` 读取；如文件放在其他位置，可通过环境变量 `PROJECT_ORDER_MAPPING_XLSX` 指定完整路径。
 
-- **执行命令**：`python run.py ar_invoice_opening`
-- **过滤结果**：满足申请日期/开票状态条件 823 行，剔除作废 0 行，最终保留开票记录 823 行
-- **输出结果**：生成导入明细 823 行
-- **待业务确认/补充**：
-  - 付款对象：已匹配 818/823，未匹配清单 5 条（源表客户为空）
-  - 合同编号：已填 641/823，缺失 182 行（未匹配清单按来源单据去重后 157 条）
-  - 税率类型：已匹配 812/823，缺失 11 行（源表税率为空或未命中字典）
-  - 里程碑阶段、平台、自审批、自审核、凭证推送、行号、收入分类：规则标注由汉得后续统一赋值，当前保持为空
-- **产出文件**：`output/ar_invoice_opening/英雄应收报账单期初数据导入_应收期初_20260615.xlsx`
-- **未匹配清单**：`output/ar_invoice_opening/未匹配清单_应收期初_20260615.xlsx`
+- **使用 sheet**：`全量项目_清洗后` + `全量订单主表_清洗后`。
+- **公共方法**：所有提取对应关系的逻辑都放在 `etl/common.py`，任务文件只调用 `c.project_order_mapping_value(...)` 和 `c.collect_order_mapping_issues(...)`。
+- **原泛微项目编码拆分**：`原泛微项目编码` 可能一格维护多个编码，按分号、中文分号、逗号、中文逗号、换行拆分。
+- **无优先级规则**：不区分“单独一行”和“集合里的一项”的优先级；同一个泛微项目编号映射到多个订单时，不强行填订单字段，统一列到 `订单映射_多候选`。
+- **一对一规则**：只有当一个泛微项目编号最终只对应一个订单时，才回填订单编号、订单名称，以及需要时的清洗后项目编号/项目名称。
+- **异常清单**：无法映射的项目进入 `订单映射_未匹配`；映射表中出现过但没有可用订单编号的项目会标明出现位置和订单字段值。
+- **当前使用任务**：`ap_prepayment_opening_db`、`ap_payment_opening_extra_db`、`ar_invoice_opening`、`ar_invoice_opening_db`。
+
+### 银行账号
+
+供应商银行账号统一按 Hand 供应商主数据校验：
+
+- 源单有银行账号，且该账号在 Hand 中属于当前收款方：使用源账号对应的银行账号。
+- 源单未填，或源账号不属于当前收款方：使用 Hand 中该供应商 `是否默认账户=是` 的银行账号。
+- 异常会进入 `银行账号_校验异常`，便于检查供应商缺账号、默认账号缺失或源账号归属不一致。
+
+### 泛微费用项目编码
+
+应付/预付相关导入表会在最后保留 `泛微费用项目编码`，用于回看泛微原预算科目层级，格式保持为原路径，例如：
+
+```text
+AR日常运营费用/AR4日常运营费用/AR47办公杂费
+```
+
+应收期初导入模板不需要该字段，因此应收任务不输出 `泛微费用项目编码`。
+
+## 当前清洗进度（2026-06-20）
+
+### 应付期初 - 对公付款单补充三 tab
+
+- **执行命令**：`python run.py ap_payment_opening_extra_db`
+- **输出结果**：同一个 Excel 写入 `期初对公付款单导入`、`批量费用流程`、`只转入外部成本` 三个 tab
+- **订单映射结果**：
+  - 期初对公付款单导入：订单编号已填 3163/5192
+  - 批量费用流程：订单编号已填 23613/37116
+  - 只转入外部成本：订单编号已填 326/610
+- **补充校验**：`只转入外部成本` 同时处理赛事 `ly=5` 和 MCN `ly=2`，并输出每个单据转入/转出正负金额配平检查
+- **产出文件**：`output/ap_payment_opening_extra_db/英雄期初对公付款单导入_应付期初_补充_20260620.xlsx`
+- **未匹配清单**：`output/ap_payment_opening_extra_db/未匹配清单_应付期初_补充_20260620.xlsx`
+
+### 预付期初 - 供应商预付款 / 零工预付款 DB
+
+- **执行命令**：`python run.py ap_prepayment_opening_db`
+- **供应商预付款订单映射**：订单编号已填 1181/7718
+- **零工预付款订单映射**：订单编号已填 1653/13690
+- **产出文件**：`output/ap_prepayment_opening_db/英雄期初预付款单导入_预付期初_20260620.xlsx`
+- **未匹配清单**：`output/ap_prepayment_opening_db/未匹配清单_预付期初_20260620.xlsx`
+
+### 应收期初 - 应收报账单
+
+- **执行命令**：`python run.py ar_invoice_opening` / `python run.py ar_invoice_opening_db`
+- **文件版项目订单清单**：多候选 74 条，未匹配 290 条
+- **DB 版项目订单清单**：多候选 84 条，未匹配 307 条
+- **文件版产出**：`output/ar_invoice_opening/英雄应收报账单期初数据导入_应收期初_20260620.xlsx`
+- **DB 版产出**：`output/ar_invoice_opening_db/英雄应收报账单期初数据导入_应收期初_20260620.xlsx`
 
 ## 目录结构
 
@@ -116,10 +175,12 @@ hero-digital-etl/
 │   └── tasks/
 │       ├── ap_payment_opening.py       # 应付期初 - 对公付款单
 │       ├── ap_payment_opening_db.py    # 应付期初 - 对公付款单(DB直连版)
+│       ├── ap_payment_opening_extra_db.py # 应付期初 - 对公付款单补充三 tab(DB直连版)
 │       ├── ap_prepayment_opening.py    # 预付期初 - 供应商预付款单
 │       ├── ap_prepayment_opening_db.py # 预付期初 - 供应商预付款单/零工预付款单(DB直连版)
 │       ├── ar_invoice_opening.py       # 应收期初 - 应收报账单
-│       └── ar_invoice_opening_db.py    # 应收期初 - 应收报账单(DB直连版)
+│       ├── ar_invoice_opening_db.py    # 应收期初 - 应收报账单(DB直连版)
+│       └── invoice_info_db.py          # 发票信息(DB直连版)
 ├── data/
 │   ├── source/<任务名>/                # 各任务源表(文件名保持来源系统原名)
 │   ├── rules/业财项目_数据映射规则.xlsx
@@ -134,7 +195,9 @@ hero-digital-etl/
 ```bash
 pip install -r requirements.txt
 copy .env.example .env                  # 填入真实数据库账密
-python run.py ap_payment_opening        # 或 ap_prepayment_opening / ar_invoice_opening
+python run.py all                       # 一次跑核心 DB 导入任务
+# 或单独执行一个任务:
+python run.py ap_payment_opening_extra_db
 ```
 
 `.env` 读取真实数据库连接信息，本地使用即可，不要提交到 GitHub。脚本只执行 `SELECT` 查询，不写入数据库。

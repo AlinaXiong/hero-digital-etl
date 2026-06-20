@@ -19,10 +19,6 @@ if __package__ is None or __package__ == '':
 
 from etl import common as c
 from etl.tasks import ap_payment_opening_db as base_payment
-from etl.tasks.ap_prepayment_opening_db import (
-    _order_mapping_value,
-    collect_order_mapping_issues,
-)
 
 
 # ============================ 文件 / 模板 ============================
@@ -317,8 +313,8 @@ def _apply_order_project_columns(output_df, source_df):
     project_source_df = _with_resolved_project_fields(source_df)
     project_codes = project_source_df['项目编号'].map(_text)
     df['泛微项目编号'] = project_codes
-    df['订单编号'] = project_codes.map(lambda value: _order_mapping_value(value, '订单编号'))
-    df['订单名称'] = project_codes.map(lambda value: _order_mapping_value(value, '订单标题'))
+    df['订单编号'] = project_codes.map(lambda value: c.project_order_mapping_value(value, '订单编号'))
+    df['订单名称'] = project_codes.map(lambda value: c.project_order_mapping_value(value, '订单标题'))
     return df[OUTPUT_COLUMNS]
 
 
@@ -783,7 +779,7 @@ def run():
     if not base_bank_issues.empty:
         base_sheets['银行账号_校验异常'] = base_bank_issues
     base_sheets = _enrich_missing_order_issue(base_sheets, base_output_df, base_issue_source_df)
-    base_sheets.update(collect_order_mapping_issues(base_issue_source_df))
+    base_sheets.update(c.collect_order_mapping_issues(base_issue_source_df))
     exception_sheets.update({f'期初对公付款单导入_{name}': df for name, df in base_sheets.items()})
 
     batch_sheets = {'必输字段未达100%': c.fill_summary(
@@ -794,7 +790,7 @@ def run():
     if not batch_bank_issues.empty:
         batch_sheets['银行账号_校验异常'] = batch_bank_issues
     batch_sheets = _enrich_missing_order_issue(batch_sheets, batch_output_df, batch_source_df)
-    batch_sheets.update(collect_order_mapping_issues(batch_source_df))
+    batch_sheets.update(c.collect_order_mapping_issues(batch_source_df))
     exception_sheets.update({f'批量费用流程_{name}': df for name, df in batch_sheets.items()})
 
     external_sheets = {'必输字段未达100%': c.fill_summary(
@@ -805,7 +801,7 @@ def run():
     if not external_bank_issues.empty:
         external_sheets['银行账号_校验异常'] = external_bank_issues
     external_sheets = _enrich_missing_order_issue(external_sheets, external_output_df, external_issue_source_df)
-    external_sheets.update(collect_order_mapping_issues(external_issue_source_df))
+    external_sheets.update(c.collect_order_mapping_issues(external_issue_source_df))
     external_sheets.update(collect_external_cost_pair_check(external_issue_source_df))
     exception_sheets.update({f'只转入外部成本_{name}': df for name, df in external_sheets.items()})
 

@@ -31,6 +31,22 @@ TASKS = {
     'invoice_info_db': invoice_info_db.run,               # 发票信息(DB直连版)
 }
 
+ALL_TASK_NAMES = (
+    'ap_payment_opening_extra_db',
+    'ap_prepayment_opening_db',
+    'ar_invoice_opening_db',
+    'invoice_info_db',
+)
+
+
+def run_all():
+    for index, task_name in enumerate(ALL_TASK_NAMES, start=1):
+        print(f'\n=== 运行 all 子任务 {index}/{len(ALL_TASK_NAMES)}: {task_name} ===')
+        TASKS[task_name]()
+
+
+TASKS['all'] = run_all
+
 
 def main():
     arg = sys.argv[1] if len(sys.argv) > 1 else 'ap_payment_opening'

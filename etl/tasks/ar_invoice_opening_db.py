@@ -18,6 +18,7 @@ if __package__ is None or __package__ == '':
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from etl import common as c
+from etl.tasks.ap_prepayment_opening_db import build_fw_project_code_map_for_ids
 
 # ============================ 文件 / 模板 ============================
 TASK_NAME = 'ar_invoice_opening_db'
@@ -75,6 +76,7 @@ OUTPUT_COLUMNS = [
     '项目',
     '订单',
     *[f'行维度{i}' for i in range(3, 21)],
+    '泛微项目编号',
 ]
 
 # 问题清单里,目标字段缺失时带出的泛微源字段。
@@ -89,6 +91,8 @@ ISSUE_SOURCE_FIELD_MAP = {
     '核销金额': '收款登记已收款金额',
     '金额': '开票金额（含税价）',
     '税率类型': '税率',
+    '项目': '项目编号',
+    '订单': '项目编号',
 }
 
 FW_INVOICE_TABLE = 'uf_xtyykp'
@@ -144,6 +148,8 @@ SELECT
     m.sqrbm AS `申请人部门ID`,
     m.sqrq AS `申请日期`,
     m.kpht AS `开票合同ID`,
+    m.xmbh AS `项目编号ID`,
+    m.xmmc AS `项目名称`,
     m.gszt AS `公司主体ID`,
     m.kh AS `客户ID`,
     m.kpjehsj AS `开票金额（含税价）`,
@@ -202,6 +208,8 @@ EXPECTED_INVOICE_FIELDS = {
         'sqrbm': '申请人部门',
         'sqrq': '申请日期',
         'kpht': '开票合同',
+        'xmbh': '项目编号',
+        'xmmc': '项目名称',
         'gszt': '公司主体',
         'kh': '客户',
         'kpjehsj': '开票金额（含税价）',
@@ -249,6 +257,14 @@ def _first_browser_id(value):
     return ids[0] if ids else ''
 
 
+def _lookup_first_browser_value(mapping, value):
+    for item_id in c.parse_browser_ids(value):
+        mapped = mapping.get(item_id, '')
+        if mapped:
+            return mapped
+    return ''
+
+
 def resolve_business_type_name(value):
     """uf_xtyykp.ywlx 业务类型:0=外部公司,1=外部个人,2=空业务类型。"""
     code = c.format_code(value)
@@ -274,6 +290,7 @@ def resolve_source_values(source_df):
     customer_map = c.build_fw_customer_name_map_for_ids(df['客户ID'])
     contract_map = c.build_fw_contract_code_map_for_ids(df['开票合同ID'])
     currency_map = c.build_fw_currency_name_map_for_ids(df['开票币种ID'])
+    project_map = build_fw_project_code_map_for_ids(df['项目编号ID'])
 
     # [开票表] sqr -> hrmresource / hrmjobtitles
     df['申请人'] = df['申请人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
@@ -286,6 +303,9 @@ def resolve_source_values(source_df):
     df['客户'] = df['客户ID'].map(lambda value: customer_map.get(_first_browser_id(value), ''))
     # [开票表] kpht -> uf_htsp.htbh
     df['开票合同'] = df['开票合同ID'].map(lambda value: contract_map.get(_first_browser_id(value), ''))
+    # [开票表] xmbh -> uf_xtyyxmkp.xmbh
+    df['项目编号'] = df['项目编号ID'].map(
+        lambda value: _lookup_first_browser_value(project_map, value) or _text(value))
     # [开票表] kpbz -> fnacurrency.CURRENCYNAME
     df['开票币种'] = df['开票币种ID'].map(lambda value: currency_map.get(c.format_code(value), ''))
     # [开票表] ywlx:0=外部公司,1=外部个人,2=空业务类型
@@ -398,10 +418,12 @@ def build_output(invoice_df):
 
     for column in [f'头维度{i}' for i in range(1, 21)]:
         output_df[column] = ''
-    output_df['项目'] = ''
-    output_df['订单'] = ''
+    project_codes = invoice_df['项目编号'].map(_text)
+    output_df['项目'] = project_codes.map(lambda value: c.project_order_mapping_value(value, '项目编号'))
+    output_df['订单'] = project_codes.map(lambda value: c.project_order_mapping_value(value, '订单编号'))
     for column in [f'行维度{i}' for i in range(3, 21)]:
         output_df[column] = ''
+    output_df['泛微项目编号'] = project_codes
 
     # write_to_template 按 DataFrame 顺序写入模板,这里显式固定列序。
     return output_df[OUTPUT_COLUMNS]
@@ -445,6 +467,7 @@ def run():
     sheets = {'必输字段未达100%': c.fill_summary(output_df, required_cols, RULE_SHEET, RULE_TABLE)}
     sheets.update(c.collect_field_issues(
         output_df, invoice_df, required_cols, ISSUE_SOURCE_FIELD_MAP, doc_col='来源单据号'))
+    sheets.update(c.collect_order_mapping_issues(invoice_df))
     c.write_exceptions(EXCEPTION_FILE, sheets)
     print('已写出:', EXCEPTION_FILE, '| 各清单条数:', {
         sheet_name: len(sheet_df) for sheet_name, sheet_df in sheets.items()

@@ -79,6 +79,8 @@ ISSUE_SOURCE_FIELD_MAP = {
     '核销金额': '收款登记已收款金额',
     '金额': '开票金额（含税价）',
     '税率类型': '税率',
+    '项目': '项目编号',
+    '订单': '项目编号',
 }
 
 
@@ -194,10 +196,12 @@ def build_output(invoice_df, employee_code_map, customer_map, entity_map,
 
     for column in [f'头维度{i}' for i in range(1, 21)]:
         output_df[column] = ''  # 头维度1-20不涉及,留空
-    output_df['项目'] = ''  # 待项目/订单清洗结果匹配
-    output_df['订单'] = ''  # 待项目/订单清洗结果匹配
+    project_codes = invoice_df['项目编号'].map(_text) if '项目编号' in invoice_df.columns else pd.Series('', index=invoice_df.index)
+    output_df['项目'] = project_codes.map(lambda value: c.project_order_mapping_value(value, '项目编号'))  # [开票记录] 项目编号 -> 0619清洗后项目编号
+    output_df['订单'] = project_codes.map(lambda value: c.project_order_mapping_value(value, '订单编号'))  # [开票记录] 项目编号 -> 0619清洗后订单编号
     for column in [f'行维度{i}' for i in range(3, 21)]:
         output_df[column] = ''  # 行维度3-20不涉及,留空
+    output_df['泛微项目编号'] = project_codes  # 保留原泛微项目编号便于回查
     return output_df
 
 
@@ -234,6 +238,7 @@ def run():
     sheets = {'必输字段未达100%': c.fill_summary(output_df, required_cols, RULE_SHEET, RULE_TABLE)}
     sheets.update(c.collect_field_issues(output_df, enriched_invoice_df, required_cols,
                                          ISSUE_SOURCE_FIELD_MAP, doc_col='来源单据号'))
+    sheets.update(c.collect_order_mapping_issues(enriched_invoice_df))
     c.write_exceptions(EXCEPTION_FILE, sheets)
     print('已写出:', EXCEPTION_FILE, '| 各清单条数:', {
         sheet_name: len(sheet_df) for sheet_name, sheet_df in sheets.items()
