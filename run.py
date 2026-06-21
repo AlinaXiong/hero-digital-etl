@@ -6,7 +6,11 @@
 
 新增任务:在 etl/tasks 下加一个 <任务名>.py,再在下面 TASKS 登记。
 """
+import shutil
 import sys
+from datetime import datetime
+
+from etl import common as c
 
 from etl.tasks import (
     ap_payment_opening,
@@ -40,11 +44,60 @@ ALL_TASK_NAMES = (
     'invoice_info_db',
 )
 
+ALL_SUMMARY_GROUPS = (
+    ('应付', 'ap_payment_opening_extra_db'),
+    ('预付', 'ap_prepayment_opening_db'),
+    ('应收', 'ar_invoice_opening_db'),
+    ('发票信息', 'invoice_info_db'),
+)
+
+
+def _summary_dir_name():
+    return f'应收-应付-预付-发票-{c.today_suffix()[4:]}汇总'
+
+
+def _copy_recent_task_outputs(task_name, target_dir, started_at):
+    source_dir = c.OUT_DIR / task_name
+    if not source_dir.exists():
+        return 0
+
+    copied_count = 0
+    threshold = started_at.timestamp() - 2
+    for source_file in sorted(source_dir.glob('*.xlsx'), key=lambda path: path.name):
+        if source_file.name.startswith('~$'):
+            continue
+        if source_file.stat().st_mtime < threshold:
+            continue
+        target_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_file, target_dir / source_file.name)
+        copied_count += 1
+    return copied_count
+
+
+def create_all_summary(started_at):
+    summary_dir = c.OUT_DIR / _summary_dir_name()
+    if summary_dir.exists():
+        try:
+            shutil.rmtree(summary_dir)
+        except PermissionError:
+            summary_dir = summary_dir.with_name(f'{summary_dir.name}_{datetime.now().strftime("%H%M%S")}')
+    summary_dir.mkdir(parents=True, exist_ok=True)
+
+    total_count = 0
+    for folder_name, task_name in ALL_SUMMARY_GROUPS:
+        copied_count = _copy_recent_task_outputs(task_name, summary_dir / folder_name, started_at)
+        total_count += copied_count
+        print(f'[all汇总] {folder_name}: {copied_count} 个文件')
+    print(f'[all汇总] 已生成: {summary_dir} (共 {total_count} 个文件)')
+    return summary_dir
+
 
 def run_all():
+    started_at = datetime.now()
     for index, task_name in enumerate(ALL_TASK_NAMES, start=1):
         print(f'\n=== 运行 all 子任务 {index}/{len(ALL_TASK_NAMES)}: {task_name} ===')
         TASKS[task_name]()
+    create_all_summary(started_at)
 
 
 TASKS['all'] = run_all

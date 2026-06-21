@@ -30,11 +30,12 @@ SUPPLIER_VENDOR_MAPPING_JSON = SRC_DIR / 'supplier_vendor_aliases.json'
 CUSTOMER_ALIAS_MAPPING_JSON = SRC_DIR / 'customer_aliases.json'
 SUPPLIER_VENDOR_NAME_MATCH_JSON = SRC_DIR / 'supplier_vendor_name_matches.json'
 PROJECT_ORDER_MAPPING_ENV = 'PROJECT_ORDER_MAPPING_XLSX'
-PROJECT_ORDER_MAPPING_XLSX_NAME = '业财项目_项目&订单清洗_0619.xlsx'
+PROJECT_ORDER_MAPPING_XLSX_NAME = '业财项目_项目&订单清洗_0621.xlsx'
 PROJECT_ORDER_MAPPING_SHEETS = {
     '全量项目': '全量项目_清洗后',
     '全量订单': '全量订单主表_清洗后',
 }
+PROJECT_ORDER_CLEANABLE_COLUMN = '是否可洗流程'
 _PROJECT_ORDER_MAPPING_CACHE = None
 
 
@@ -1067,9 +1068,19 @@ def build_supplier_vendor_info_map_for_rows(
             supplier_series, supplier_texts, document_numbers,
             selected_by_index, source_to_target, vendor_by_source_id,
         )
-        report_file.parent.mkdir(parents=True, exist_ok=True)
-        report_df.to_excel(report_file, index=False)
-        print(f'{prefix}Hand按ID查不到的供应商清单已写出: {report_file} ({len(report_df)} 条)')
+        if report_df.empty:
+            if report_file.exists():
+                try:
+                    report_file.unlink()
+                    print(f'{prefix}Hand按ID查不到的供应商清单为空，已删除旧文件: {report_file}')
+                except PermissionError:
+                    print(f'{prefix}Hand按ID查不到的供应商清单为空，但旧文件被占用未删除: {report_file}')
+            else:
+                print(f'{prefix}Hand按ID查不到的供应商清单为空，不生成文件')
+        else:
+            report_file.parent.mkdir(parents=True, exist_ok=True)
+            report_df.to_excel(report_file, index=False)
+            print(f'{prefix}Hand按ID查不到的供应商清单已写出: {report_file} ({len(report_df)} 条)')
     return vendor_by_row
 
 
@@ -1507,6 +1518,15 @@ def _read_cleaned_order_sheet(path, sheet_name, required_columns):
     return df
 
 
+def _filter_cleanable_order_rows(order_df):
+    """0621 订单主表口径:仅处理“是否可洗流程”包含 Y 的订单行。"""
+    if PROJECT_ORDER_CLEANABLE_COLUMN not in order_df.columns:
+        print(f'[项目订单映射] {PROJECT_ORDER_MAPPING_SHEETS["全量订单"]} 未找到 {PROJECT_ORDER_CLEANABLE_COLUMN} 列,暂不按可洗流程过滤。')
+        return order_df
+    flag = order_df[PROJECT_ORDER_CLEANABLE_COLUMN].map(_cell_text).str.upper()
+    return order_df[flag.str.contains('Y', na=False)].copy()
+
+
 def _empty_order_presence_df():
     return pd.DataFrame(columns=['泛微项目编号', '订单编号', '订单标题', '映射来源'])
 
@@ -1609,6 +1629,7 @@ def _build_project_order_presence(mapping_file):
         PROJECT_ORDER_MAPPING_SHEETS['全量订单'],
         ['原泛微项目编码', '订单编号', '订单标题', '项目编号'],
     )
+    order_df = _filter_cleanable_order_rows(order_df)
 
     rows = project_presence_df.to_dict('records')
     for _, order_row in order_df.iterrows():
@@ -1632,6 +1653,8 @@ def _build_project_order_candidates(mapping_file):
         PROJECT_ORDER_MAPPING_SHEETS['全量订单'],
         ['原泛微项目编码', '订单编号', '订单标题', '项目编号', '项目名称'],
     )
+    before_count = len(order_df)
+    order_df = _filter_cleanable_order_rows(order_df)
 
     rows = []
     for _, order_row in order_df.iterrows():
@@ -1650,10 +1673,12 @@ def _build_project_order_candidates(mapping_file):
 
     if not rows:
         return _empty_order_candidates_df()
-    return pd.DataFrame(
+    result_df = pd.DataFrame(
         rows,
         columns=['泛微项目编号', '订单编号', '订单标题', '项目编号', '项目名称', '映射来源'],
     ).drop_duplicates()
+    print(f'[项目订单映射] 可洗订单过滤: {len(order_df)}/{before_count} 行')
+    return result_df
 
 
 def load_project_order_mapping():
