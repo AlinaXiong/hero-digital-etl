@@ -15,6 +15,7 @@
 | `ap_prepayment_opening_db` | 预付期初 - 供应商预付款单 + 零工预付款单(DB直连版) | 泛微 `uf_yfkxx` + `uf_yfkxx_dt1` + `uf_dgfktz_dt2`；`uf_lgptfk` + `formtable_main_279` + `formtable_main_279_dt3` + `formtable_main_279_dt4` | 英雄期初预付款单导入模版 |
 | `ar_invoice_opening` | 应收期初 - 应收报账单 | 开票记录 + 收款登记 | 应收报账单期初数据导入模板 |
 | `ar_invoice_opening_db` | 应收期初 - 应收报账单(DB直连版) | 泛微 `uf_xtyykp` + `uf_skdj` | 应收报账单期初数据导入模板 |
+| `contract_anchor_db` | 合同迁移 - 智书主播流程(DB直连版) | 泛微 `uf_htk` + `uf_zbkp` / `uf_zbkp_dt1` | 智书合同字段-主播流程 |
 | `invoice_info_db` | 发票信息(DB直连版) | 泛微 `fnainvoiceledger` + `fnainvoiceledgerdtl` | 发票信息清洗导入表 |
 | `all` | 一次跑核心 DB 导入任务 | 依次执行 `ap_payment_opening_extra_db`、`ap_prepayment_opening_db`、`ar_invoice_opening_db`、`invoice_info_db` | 多个模板/清洗表 |
 
@@ -100,6 +101,17 @@ DB 直连版源数据不读 Excel；供应商预付从泛微 `uf_yfkxx` / `uf_yf
 - **行过滤**：当前只取 2026 年报销/关联数据；保留 `status IN (1, 2)` 的冻结/核销状态发票，不取初始未使用发票。
 - **关键映射**：发票归属人→工号、购买方→核算主体编码、泛微发票类型→汉得 `VAT_INVOICE_TYPE`，含税金额转中文大写。
 - **产出**：`发票信息清洗_发票信息_2026_<YYYYMMDD>.xlsx`。
+
+### contract_anchor_db（合同迁移 - 智书主播流程 DB 直连版）
+
+按法务映射规则和「智书合同字段-主播流程」模板，把泛微主播合同库清洗成智书主播流程导入数据。
+
+- **源表**：泛微 `uf_htk` 主表，关联主播卡片 `uf_zbkp` 和平台/房间明细 `uf_zbkp_dt1`。
+- **行过滤**：合同类型=主播协议，合同签署状态 ∈ {审批完成, 已归档}。
+- **输出 sheet**：`字段模板`、`对方信息`、`我方信息`、`费用明细`；`选项` sheet 保留模板原样。
+- **关键映射**：合同执行人、合同状态/二级类型/所属平台枚举、主播身份证/战队/签约金等从主播卡片补充；对方主体按客户/供应商分别映射到中台编码；我方主体按合同用印范围映射到核算主体编码。
+- **默认值**：计价方式=固定总价，合同期限类型=固定期限，是否需要验收=否，打印模式=黑白双面打印，签约形式=纸质签约-不限制我方/对方先签约，盖章份数=3。
+- **产出**：`output/contract_anchor_db/智书合同字段_主播流程_合同迁移_<YYYYMMDD>.xlsx`。
 
 ## 公共清洗口径
 

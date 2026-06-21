@@ -27,6 +27,8 @@ TPL_DIR   = ROOT / 'data' / 'templates'    # 导入模版
 OUT_DIR   = ROOT / 'output'                # 产出
 RULE_XLSX = RULES_DIR / '业财项目_数据映射规则.xlsx'
 SUPPLIER_VENDOR_MAPPING_JSON = SRC_DIR / 'supplier_vendor_aliases.json'
+CUSTOMER_ALIAS_MAPPING_JSON = SRC_DIR / 'customer_aliases.json'
+SUPPLIER_VENDOR_NAME_MATCH_JSON = SRC_DIR / 'supplier_vendor_name_matches.json'
 PROJECT_ORDER_MAPPING_ENV = 'PROJECT_ORDER_MAPPING_XLSX'
 PROJECT_ORDER_MAPPING_XLSX_NAME = '业财项目_项目&订单清洗_0619.xlsx'
 PROJECT_ORDER_MAPPING_SHEETS = {
@@ -335,6 +337,91 @@ def parse_browser_ids(value):
     )
 
 
+def clean_fw_select_name(value, language_id=7):
+    """清洗泛微 workflow_selectitem.SELECTNAME。
+
+    多语言选项常见格式类似 ``~`~`7 纸质`~`8 Paper`~`~``;优先取中文(7),
+    普通纯文本选项则原样返回。
+    """
+    text = _cell_text(value)
+    if not text:
+        return ''
+    marker = '~`~`'
+    if marker not in text:
+        return text
+
+    for part in text.split(marker):
+        part = part.strip('`~ ')
+        if part.startswith(str(language_id)):
+            return part[len(str(language_id)):].strip()
+    cleaned = re.sub(r'~`~`\d+\s*', '', text)
+    cleaned = cleaned.replace('`~`~', '').replace(marker, '').strip('`~ ')
+    return cleaned
+
+
+def build_fw_select_option_map(table_name, field_name, language_id=7):
+    """泛微建模下拉字段编码 -> 选项中文名。
+
+    table_name 为 workflow_bill.tablename;field_name 为实际数据库字段名。
+    """
+    field_df = read_fw_field_dictionary(table_name, language_id=language_id)
+    matched = field_df[field_df['field_name'] == field_name]
+    if matched.empty:
+        return {}
+    field_ids = clean_codes(matched['field_id'])
+    if not field_ids:
+        return {}
+
+    option_df = query_db(
+        'FW',
+        'vspn_xtyy',
+        'SELECT fieldid, selectvalue, selectname '
+        'FROM workflow_selectitem '
+        f'WHERE fieldid IN ({in_placeholders(field_ids)}) '
+        'ORDER BY fieldid, listorder, selectvalue',
+        field_ids,
+    )
+    return {
+        format_code(row['selectvalue']): clean_fw_select_name(row['selectname'], language_id=language_id)
+        for _, row in option_df.iterrows()
+        if clean_fw_select_name(row['selectname'], language_id=language_id)
+    }
+
+
+def build_fw_select_option_maps(table_name, field_names, language_id=7):
+    """批量读取同一个泛微建模表的多个下拉字段选项。"""
+    field_names = list(field_names)
+    if not field_names:
+        return {}
+    field_df = read_fw_field_dictionary(table_name, language_id=language_id)
+    field_df = field_df[field_df['field_name'].isin(field_names)]
+    if field_df.empty:
+        return {field_name: {} for field_name in field_names}
+
+    field_id_to_name = {
+        format_code(row['field_id']): row['field_name']
+        for _, row in field_df.iterrows()
+        if format_code(row['field_id'])
+    }
+    field_ids = list(field_id_to_name)
+    option_df = query_db(
+        'FW',
+        'vspn_xtyy',
+        'SELECT fieldid, selectvalue, selectname '
+        'FROM workflow_selectitem '
+        f'WHERE fieldid IN ({in_placeholders(field_ids)}) '
+        'ORDER BY fieldid, listorder, selectvalue',
+        field_ids,
+    )
+    result = {field_name: {} for field_name in field_names}
+    for _, row in option_df.iterrows():
+        field_name = field_id_to_name.get(format_code(row['fieldid']))
+        option_name = clean_fw_select_name(row['selectname'], language_id=language_id)
+        if field_name and option_name:
+            result[field_name][format_code(row['selectvalue'])] = option_name
+    return result
+
+
 # ============================ 映射字典 ============================
 # 币种 -> ISO 码
 CURRENCY_TO_ISO = {
@@ -595,41 +682,75 @@ def build_vendor_map():
     return vendor_map
 
 
-def load_same_supplier_mapping(mapping_file=SUPPLIER_VENDOR_MAPPING_JSON, log_prefix=''):
-    """读取“视为同一个供应商”规则:供应商泛微Id -> targetId。"""
+def _load_json_rows(mapping_file):
     if not mapping_file.exists():
-        return {}
+        return []
 
     with mapping_file.open('r', encoding='utf-8-sig') as f:
         data = json.load(f)
-    rows = data.values() if isinstance(data, dict) else data
+    return list(data.values()) if isinstance(data, dict) else data
+
+
+def _load_id_alias_mapping(mapping_file, source_keys, log_label, log_prefix=''):
+    """读取“源泛微ID -> targetId”归并规则。"""
+    rows = _load_json_rows(mapping_file)
 
     mapping = {}
     for row in rows:
         if not isinstance(row, dict):
             continue
-        source_id = format_code(
-            row.get('供应商泛微Id')
-            or row.get('Id')
-            or row.get('id')
-            or row.get('supplierId')
-        )
+        source_id = ''
+        for key in source_keys:
+            source_id = format_code(row.get(key))
+            if source_id:
+                break
         target_id = format_code(row.get('targetId') or row.get('target_id'))
         if source_id and target_id:
             mapping[source_id] = target_id
     prefix = f'{log_prefix} ' if log_prefix else ''
-    print(f'{prefix}供应商ID归并规则: {mapping_file} ({len(mapping)} 条)')
+    if mapping_file.exists():
+        print(f'{prefix}{log_label}: {mapping_file} ({len(mapping)} 条)')
     return mapping
+
+
+def load_same_supplier_mapping(mapping_file=SUPPLIER_VENDOR_MAPPING_JSON, log_prefix=''):
+    """读取“视为同一个供应商”规则:供应商泛微Id -> targetId。"""
+    return _load_id_alias_mapping(
+        mapping_file,
+        ['供应商泛微Id', 'Id', 'id', 'supplierId'],
+        '供应商ID归并规则',
+        log_prefix,
+    )
+
+
+def load_same_customer_mapping(mapping_file=CUSTOMER_ALIAS_MAPPING_JSON, log_prefix=''):
+    """读取“视为同一个客户”规则:客户泛微Id -> targetId。"""
+    return _load_id_alias_mapping(
+        mapping_file,
+        ['客户泛微Id', 'Id', 'id', 'customerId'],
+        '客户ID归并规则',
+        log_prefix,
+    )
+
+
+def resolve_alias_id(source_id, alias_map):
+    """把 JSON 中声明为同一主体的源ID逐级归并到 targetId。"""
+    current_id = format_code(source_id)
+    seen = set()
+    while current_id and current_id in alias_map and current_id not in seen:
+        seen.add(current_id)
+        current_id = alias_map[current_id]
+    return current_id
 
 
 def resolve_same_supplier_id(supplier_id, same_supplier_map):
     """把 JSON 中声明为同一供应商的源ID归并到 targetId。"""
-    current_id = format_code(supplier_id)
-    seen = set()
-    while current_id and current_id in same_supplier_map and current_id not in seen:
-        seen.add(current_id)
-        current_id = same_supplier_map[current_id]
-    return current_id
+    return resolve_alias_id(supplier_id, same_supplier_map)
+
+
+def resolve_same_customer_id(customer_id, same_customer_map):
+    """把 JSON 中声明为同一客户的源ID归并到 targetId。"""
+    return resolve_alias_id(customer_id, same_customer_map)
 
 
 def build_fw_supplier_status_map(supplier_values):
@@ -715,6 +836,125 @@ def build_hand_vendor_info_by_ids(target_ids):
                 'match_method': 'supplier_id',
             }
     return result
+
+
+def build_hand_vendor_info_by_names(names):
+    """供应商名称 -> 唯一命中的 Hand 供应商信息。
+
+    按 description / taxpayer_name 归一化精确匹配;如果同名命中多个不同编码则不自动采用。
+    """
+    keys = normalized_name_values(names)
+    if not keys:
+        return {}
+    description_key = sql_normalized_name('description')
+    taxpayer_key = sql_normalized_name('taxpayer_name')
+    placeholders = in_placeholders(keys)
+    vendor_df = query_db(
+        'ZT',
+        'hfins_base',
+        'SELECT vender_id, vender_code, description vendor_name, taxpayer_name '
+        'FROM hfbs_system_vender '
+        f'WHERE {description_key} IN ({placeholders}) '
+        f'   OR {taxpayer_key} IN ({placeholders})',
+        keys + keys,
+    )
+
+    grouped = {}
+    for _, row in vendor_df.iterrows():
+        vendor_id = format_code(row['vender_id'])
+        vendor_code = _cell_text(row['vender_code'])
+        vendor_name = _cell_text(row['vendor_name'])
+        taxpayer_name = _cell_text(row['taxpayer_name'])
+        if not vendor_code:
+            continue
+        info = {
+            'id': vendor_id,
+            'code': vendor_code,
+            'name': vendor_name,
+            'taxpayer_name': taxpayer_name,
+            'match_method': 'disabled_supplier_name',
+        }
+        for name in (vendor_name, taxpayer_name):
+            key = normalize_name(name)
+            if key in keys:
+                grouped.setdefault(key, []).append(info)
+
+    result = {}
+    for key, candidates in grouped.items():
+        by_code = {}
+        for candidate in candidates:
+            by_code.setdefault(candidate['code'], candidate)
+        if len(by_code) == 1:
+            item = next(iter(by_code.values())).copy()
+            item['candidate_count'] = len(candidates)
+            result[key] = item
+    return result
+
+
+def load_supplier_vendor_name_match_map(mapping_file=SUPPLIER_VENDOR_NAME_MATCH_JSON, log_prefix=''):
+    """读取自动发现的禁用供应商名称匹配缓存:泛微供应商ID -> Hand 供应商编码。"""
+    rows = _load_json_rows(mapping_file)
+    result = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        supplier_id = format_code(
+            row.get('供应商泛微Id')
+            or row.get('supplierId')
+            or row.get('id')
+        )
+        vendor_code = _cell_text(
+            row.get('handVendorCode')
+            or row.get('vender_code')
+            or row.get('vendor_code')
+        )
+        if supplier_id and vendor_code:
+            result[supplier_id] = {
+                'code': vendor_code,
+                'id': format_code(row.get('handVendorId') or row.get('vender_id') or row.get('targetId')),
+                'name': _cell_text(row.get('handVendorName') or row.get('供应商名称')),
+                'source_name': _cell_text(row.get('供应商名称')),
+                'match_method': _cell_text(row.get('匹配方式')) or 'disabled_supplier_name_cache',
+            }
+    prefix = f'{log_prefix} ' if log_prefix else ''
+    if mapping_file.exists():
+        print(f'{prefix}禁用供应商名称匹配缓存: {mapping_file} ({len(result)} 条)')
+    return result
+
+
+def append_supplier_vendor_name_matches(rows, mapping_file=SUPPLIER_VENDOR_NAME_MATCH_JSON):
+    """把本次按名称匹配到的禁用供应商写入新的缓存 JSON,供后续复用。"""
+    new_rows = []
+    for row in rows:
+        supplier_id = format_code(row.get('供应商泛微Id') or row.get('supplierId') or row.get('id'))
+        vendor_code = _cell_text(row.get('handVendorCode') or row.get('vender_code') or row.get('vendor_code'))
+        if supplier_id and vendor_code:
+            new_rows.append(row)
+    if not new_rows:
+        return 0
+
+    existing_rows = _load_json_rows(mapping_file)
+    by_supplier = {}
+    for row in existing_rows:
+        if not isinstance(row, dict):
+            continue
+        supplier_id = format_code(row.get('供应商泛微Id') or row.get('supplierId') or row.get('id'))
+        if supplier_id:
+            by_supplier[supplier_id] = row
+    changed = 0
+    for row in new_rows:
+        supplier_id = format_code(row.get('供应商泛微Id') or row.get('supplierId') or row.get('id'))
+        old = by_supplier.get(supplier_id)
+        if old != row:
+            by_supplier[supplier_id] = row
+            changed += 1
+    if not changed:
+        return 0
+
+    mapping_file.parent.mkdir(parents=True, exist_ok=True)
+    output_rows = sorted(by_supplier.values(), key=lambda item: format_code(item.get('供应商泛微Id') or item.get('supplierId') or item.get('id')))
+    mapping_file.write_text(json.dumps(output_rows, ensure_ascii=False, indent=2), encoding='utf-8')
+    return changed
 
 
 def _series_like(values, index):
@@ -1009,6 +1249,36 @@ def build_customer_map():
             if key and key not in ('nan', 'none') and key not in customer_map:
                 customer_map[key] = str(row['customer_code']).strip()
     return customer_map
+
+
+def build_hand_customer_info_by_ids(target_ids):
+    """Hand 客户ID(customer_id) -> 客户信息。"""
+    target_ids = clean_codes(target_ids)
+    if not target_ids:
+        return {}
+
+    customer_df = query_db(
+        'ZT',
+        'hfins_base',
+        'SELECT customer_id, customer_code, description customer_name, taxpayer_name '
+        'FROM hfbs_system_customer '
+        f'WHERE customer_id IN ({in_placeholders(target_ids)})',
+        target_ids,
+    )
+    result = {}
+    for _, row in customer_df.iterrows():
+        customer_id = format_code(row['customer_id'])
+        customer_code = _cell_text(row['customer_code'])
+        customer_name = _cell_text(row['customer_name'])
+        taxpayer_name = _cell_text(row['taxpayer_name'])
+        if customer_id:
+            result[customer_id] = {
+                'code': customer_code,
+                'name': customer_name,
+                'taxpayer_name': taxpayer_name,
+                'match_method': 'customer_id',
+            }
+    return result
 
 
 def build_customer_map_for_names(names):
