@@ -45,9 +45,9 @@ ALL_TASK_NAMES = (
 )
 
 ALL_SUMMARY_GROUPS = (
-    ('应付', 'ap_payment_opening_extra_db'),
-    ('预付', 'ap_prepayment_opening_db'),
-    ('应收', 'ar_invoice_opening_db'),
+    ('应付期初', 'ap_payment_opening_extra_db'),
+    ('预付期初', 'ap_prepayment_opening_db'),
+    ('应收期初', 'ar_invoice_opening_db'),
     ('发票信息', 'invoice_info_db'),
 )
 

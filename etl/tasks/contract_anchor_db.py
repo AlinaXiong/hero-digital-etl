@@ -32,8 +32,8 @@ DATE_SUFFIX = c.today_suffix()
 
 TEMPLATE_FILE = TEMPLATE_DIR / '智书合同字段-主播流程.xlsx'
 RULE_CSV = c.RULES_DIR / '业财项目_数据映射规则 - 合同数据映射规则-for法务.csv'
-OUTPUT_FILE = OUTPUT_DIR / f'智书合同字段_主播流程_合同迁移_{DATE_SUFFIX}.xlsx'
-EXCEPTION_FILE = OUTPUT_DIR / f'未匹配清单_主播流程_合同迁移_{DATE_SUFFIX}.xlsx'
+OUTPUT_FILE = OUTPUT_DIR / f'智书合同字段_主播流程_{DATE_SUFFIX}.xlsx'
+EXCEPTION_FILE = OUTPUT_DIR / f'未匹配清单_主播流程_{DATE_SUFFIX}.xlsx'
 
 SHEET_MAIN = '字段模板'
 SHEET_OPTIONS = '选项'
