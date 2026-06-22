@@ -123,6 +123,7 @@ SELECT
     m.jbr AS `经办人ID`,
     m.xmbh AS `项目编号`,
     m.gszt AS `公司主体ID`,
+    m.rzdw AS `成本中心ID`,
     m.bz AS `备注`,
     m.xght AS `相关合同ID`,
     m.gys AS `供应商ID`,
@@ -175,6 +176,7 @@ EXPECTED_FW_FIELDS = {
         'jbr': '经办人',
         'xmbh': '项目编号',
         'gszt': '公司主体',
+        'rzdw': '成本中心（入账单位）',
         'bz': '备注',
         'xght': '相关合同',
         'gys': '供应商',
@@ -235,6 +237,7 @@ def resolve_source_values(source_df):
     company_map = c.build_fw_company_name_map_for_ids(df['公司主体ID'])
     contract_map = c.build_fw_contract_code_map_for_ids(df['相关合同ID'])
     currency_map = c.build_fw_currency_name_map_for_ids(df['付款币种ID'])
+    cost_center_map = c.build_fw_cost_center_map_for_ids(df['成本中心ID'])
     subject_map = c.build_fw_budget_subject_path_map_for_ids(df['预算科目ID'])
     bank_account_map = c.build_fw_supplier_bank_account_map_for_ids(df['银行账号'])
 
@@ -251,6 +254,8 @@ def resolve_source_values(source_df):
         or ('' if pd.isna(value) else str(value).strip()))
     # [主表] fkbz -> fnacurrency.CURRENCYNAME
     df['付款币种'] = df['付款币种ID'].map(lambda value: currency_map.get(c.format_code(value), ''))
+    # [主表] rzdw(成本中心) -> uf_cbzx.mc(成本中心名称)
+    df['成本中心'] = df['成本中心ID'].map(lambda value: _lookup_first_browser_value(cost_center_map, value))
     # [主表] zfzt: 0=已支付
     df['支付状态'] = df['支付状态ID'].map(resolve_payment_status_name)
     # [明细表] yskm -> fnabudgetfeetype 层级路径
@@ -391,6 +396,8 @@ def run():
     bank_issues = c.collect_hand_vendor_bank_account_issues(output_df, merged_df['银行账号'])
     if not bank_issues.empty:
         sheets['银行账号_校验异常'] = bank_issues
+    # 给各未匹配清单补「成本中心」「预算项」两列(按单据号关联预算科目路径)。
+    c.attach_budget_issue_columns(sheets, c.build_budget_issue_map(merged_df))
     c.write_exceptions(EXCEPTION_FILE, sheets)
     print('已写出:', EXCEPTION_FILE, '| 各清单条数:', {
         sheet_name: len(sheet_df) for sheet_name, sheet_df in sheets.items()

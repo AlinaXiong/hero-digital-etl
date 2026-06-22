@@ -151,6 +151,7 @@ SELECT
     m.xmbh AS `项目编号ID`,
     m.xmmc AS `项目名称`,
     m.gszt AS `公司主体ID`,
+    m.cbzx AS `成本中心ID`,
     m.kh AS `客户ID`,
     m.kpjehsj AS `开票金额（含税价）`,
     m.sl AS `税率`,
@@ -211,6 +212,7 @@ EXPECTED_INVOICE_FIELDS = {
         'xmbh': '项目编号',
         'xmmc': '项目名称',
         'gszt': '公司主体',
+        'cbzx': '成本中心',
         'kh': '客户',
         'kpjehsj': '开票金额（含税价）',
         'sl': '税率',
@@ -290,6 +292,7 @@ def resolve_source_values(source_df):
     customer_map = c.build_fw_customer_name_map_for_ids(df['客户ID'])
     contract_map = c.build_fw_contract_code_map_for_ids(df['开票合同ID'])
     currency_map = c.build_fw_currency_name_map_for_ids(df['开票币种ID'])
+    cost_center_map = c.build_fw_cost_center_map_for_ids(df['成本中心ID'])
     project_map = build_fw_project_code_map_for_ids(df['项目编号ID'])
 
     # [开票表] sqr -> hrmresource / hrmjobtitles
@@ -308,6 +311,8 @@ def resolve_source_values(source_df):
         lambda value: _lookup_first_browser_value(project_map, value) or _text(value))
     # [开票表] kpbz -> fnacurrency.CURRENCYNAME
     df['开票币种'] = df['开票币种ID'].map(lambda value: currency_map.get(c.format_code(value), ''))
+    # [开票表] cbzx -> uf_cbzx.mc(成本中心名称)
+    df['成本中心'] = df['成本中心ID'].map(lambda value: _lookup_first_browser_value(cost_center_map, value))
     # [开票表] ywlx:0=外部公司,1=外部个人,2=空业务类型
     df['业务类型'] = df['业务类型ID'].map(resolve_business_type_name)
     return df
@@ -468,6 +473,8 @@ def run():
     sheets.update(c.collect_field_issues(
         output_df, invoice_df, required_cols, ISSUE_SOURCE_FIELD_MAP, doc_col='来源单据号'))
     sheets.update(c.collect_order_mapping_issues(invoice_df))
+    # 给各未匹配清单补「成本中心」「预算项」两列(应收有成本中心,无预算科目则预算项留空)。
+    c.attach_budget_issue_columns(sheets, c.build_budget_issue_map(invoice_df))
     c.write_exceptions(EXCEPTION_FILE, sheets)
     print('已写出:', EXCEPTION_FILE, '| 各清单条数:', {
         sheet_name: len(sheet_df) for sheet_name, sheet_df in sheets.items()

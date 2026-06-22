@@ -99,6 +99,7 @@ SELECT
     d.jsr AS `申请人ID`,
     d.xmbh AS `项目编号ID`,
     m.gszt AS `公司主体ID`,
+    COALESCE(NULLIF(CAST(d.cbzx AS CHAR), ''), CAST(m.cbzx AS CHAR)) AS `成本中心ID`,
     COALESCE(NULLIF(d.bz, ''), NULLIF(m.pcbz, ''), NULLIF(m.fypcbz, ''), NULLIF(m.fypcmc, '')) AS `备注`,
     m.dwfkdw AS `供应商ID`,
     d.je AS `金额`,
@@ -138,6 +139,8 @@ SELECT
     m.zcxmmc AS `转出项目名称`,
     m.zrgszt AS `转入公司主体ID`,
     m.zcgszt AS `转出公司主体ID`,
+    m.zrcbzx AS `转入成本中心ID`,
+    m.zccbzx AS `转出成本中心ID`,
     m.zrzcjehz AS `转入总金额`,
     m.zczcjehz AS `转出总金额`,
     m.fyd AS `费用单ID`,
@@ -444,11 +447,13 @@ def resolve_batch_values(source_df):
     df = source_df.copy()
     employee_map = c.build_fw_employee_info_map_for_ids(df['申请人ID'])
     company_map = c.build_fw_company_name_map_for_ids(df['公司主体ID'])
+    cost_center_map = c.build_fw_cost_center_map_for_ids(df['成本中心ID'])
     supplier_status_map = c.build_fw_supplier_status_map(df['供应商ID'])
 
     df['申请人'] = df['申请人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
     df['申请人工号'] = df['申请人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
     df['公司主体'] = df['公司主体ID'].map(lambda value: company_map.get(c.format_code(value), ''))
+    df['成本中心'] = df['成本中心ID'].map(lambda value: _first_browser_value(cost_center_map, value))
     df['供应商'] = df['供应商ID'].map(lambda value: _supplier_name(value, supplier_status_map))
     df = _with_resolved_project_fields(df, '项目编号ID')
     df['预算科目'] = _resolve_subject_paths(df['预算科目ID'])
@@ -520,6 +525,8 @@ def resolve_external_cost_values(source_df):
     employee_map = c.build_fw_employee_info_map_for_ids(df['申请人ID'])
     company_ids = pd.concat([df['转入公司主体ID'], df['转出公司主体ID']], ignore_index=True)
     company_map = c.build_fw_company_name_map_for_ids(company_ids)
+    cost_center_ids = pd.concat([df['转入成本中心ID'], df['转出成本中心ID']], ignore_index=True)
+    cost_center_map = c.build_fw_cost_center_map_for_ids(cost_center_ids)
     currency_map = c.build_fw_currency_name_map_for_ids(df['付款币种ID'])
     project_values = pd.concat([
         df['转入项目编号ID'], df['转出项目编号ID'],
@@ -539,6 +546,8 @@ def resolve_external_cost_values(source_df):
     df['申请人工号'] = df['申请人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
     df['转入公司主体'] = df['转入公司主体ID'].map(lambda value: _first_browser_value(company_map, value))
     df['转出公司主体'] = df['转出公司主体ID'].map(lambda value: _first_browser_value(company_map, value))
+    df['转入成本中心'] = df['转入成本中心ID'].map(lambda value: _first_browser_value(cost_center_map, value))
+    df['转出成本中心'] = df['转出成本中心ID'].map(lambda value: _first_browser_value(cost_center_map, value))
     df['转入项目编号'] = [
         _first_non_blank(
             _first_browser_value(project_code_map, in_project),
@@ -587,6 +596,7 @@ def resolve_external_cost_values(source_df):
 def _build_external_side_rows(source_df, side):
     is_in = side == 'in'
     entity_col = '转入公司主体' if is_in else '转出公司主体'
+    cost_center_col = '转入成本中心' if is_in else '转出成本中心'
     project_col = '转入项目编号' if is_in else '转出项目编号'
     project_name_col = '转入项目名称' if is_in else '转出项目名称'
     amount_col = '转入金额' if is_in else '转出金额'
@@ -596,6 +606,7 @@ def _build_external_side_rows(source_df, side):
     df = source_df.copy()
     df['方向'] = side_label
     df['公司主体'] = df[entity_col]
+    df['成本中心'] = df[cost_center_col]
     df['项目编号'] = df[project_col]
     df['项目名称'] = df[project_name_col]
     df['金额'] = pd.to_numeric(df[amount_col], errors='coerce') * sign
@@ -780,6 +791,7 @@ def run():
         base_sheets['银行账号_校验异常'] = base_bank_issues
     base_sheets = _enrich_missing_order_issue(base_sheets, base_output_df, base_issue_source_df)
     base_sheets.update(c.collect_order_mapping_issues(base_issue_source_df))
+    c.attach_budget_issue_columns(base_sheets, c.build_budget_issue_map(base_issue_source_df))
     exception_sheets.update({f'期初对公付款单导入_{name}': df for name, df in base_sheets.items()})
 
     batch_sheets = {'必输字段未达100%': c.fill_summary(
@@ -791,6 +803,7 @@ def run():
         batch_sheets['银行账号_校验异常'] = batch_bank_issues
     batch_sheets = _enrich_missing_order_issue(batch_sheets, batch_output_df, batch_source_df)
     batch_sheets.update(c.collect_order_mapping_issues(batch_source_df))
+    c.attach_budget_issue_columns(batch_sheets, c.build_budget_issue_map(batch_source_df))
     exception_sheets.update({f'批量费用流程_{name}': df for name, df in batch_sheets.items()})
 
     external_sheets = {'必输字段未达100%': c.fill_summary(
@@ -803,6 +816,7 @@ def run():
     external_sheets = _enrich_missing_order_issue(external_sheets, external_output_df, external_issue_source_df)
     external_sheets.update(c.collect_order_mapping_issues(external_issue_source_df))
     external_sheets.update(collect_external_cost_pair_check(external_issue_source_df))
+    c.attach_budget_issue_columns(external_sheets, c.build_budget_issue_map(external_issue_source_df))
     exception_sheets.update({f'只转入外部成本_{name}': df for name, df in external_sheets.items()})
 
     c.write_exceptions(EXCEPTION_FILE, exception_sheets)

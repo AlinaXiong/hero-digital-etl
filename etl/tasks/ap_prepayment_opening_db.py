@@ -165,6 +165,7 @@ SELECT
     m.tdr AS `填单人ID`,
     m.xmbh AS `项目编号ID`,
     m.kpdw AS `开票单位ID`,
+    m.cbzx AS `成本中心ID`,
     m.bz AS `备注`,
     m.xght AS `相关合同ID`,
     m.fkdx AS `付款对象ID`,
@@ -232,6 +233,7 @@ SELECT
     COALESCE(NULLIF(h.xmmc, ''), NULLIF(w.xmmc, '')) AS `项目名称`,
     h.jbr AS `经办人ID`,
     h.gszt AS `公司主体ID`,
+    h.cbzx AS `成本中心ID`,
     COALESCE(NULLIF(h.skfwb, ''), w.skfmc) AS `收款方文本`,
     h.bz AS `备注`,
     w.htmc AS `合同名称`,
@@ -310,6 +312,7 @@ EXPECTED_SUPPLIER_FIELDS = {
         'tdr': '填单人',
         'xmbh': '项目编号',
         'kpdw': '开票单位',
+        'cbzx': '成本中心',
         'bz': '备注',
         'xght': '相关合同',
         'fkdx': '付款对象',
@@ -348,6 +351,7 @@ EXPECTED_GIG_HEADER_FIELDS = {
         'xmmc': '项目名称',
         'jbr': '经办人',
         'gszt': '公司主体',
+        'cbzx': '成本中心',
         'skfwb': '收款方-文本',
         'bz': '备注',
         'xght': '相关合同',
@@ -477,6 +481,7 @@ def resolve_supplier_source_values(source_df):
     employee_map = c.build_fw_employee_info_map_for_ids(df['填单人ID'])
     company_map = c.build_fw_company_name_map_for_ids(df['开票单位ID'])
     currency_map = c.build_fw_currency_name_map_for_ids(df['付款币种ID'])
+    cost_center_map = c.build_fw_cost_center_map_for_ids(df['成本中心ID'])
     subject_map = c.build_fw_budget_subject_path_map_for_ids(df['预算科目ID'])
     contract_map = c.build_fw_contract_code_map_for_ids(df['相关合同ID'])
     bank_account_map = build_fw_bank_account_map_for_ids(df['银行卡号ID'])
@@ -490,6 +495,8 @@ def resolve_supplier_source_values(source_df):
     df['开票单位'] = df['开票单位ID'].map(lambda value: company_map.get(c.format_code(value), ''))
     # [主表] fkbz(付款币种) -> fnacurrency.CURRENCYNAME(币种名称)
     df['付款币种'] = df['付款币种ID'].map(lambda value: currency_map.get(c.format_code(value), ''))
+    # [主表] cbzx(成本中心) -> uf_cbzx.mc(成本中心名称)
+    df['成本中心'] = df['成本中心ID'].map(lambda value: _lookup_first_browser_value(cost_center_map, value))
     # [明细表] yskm(预算科目) -> fnabudgetfeetype 层级路径
     df['预算科目'] = df['预算科目ID'].map(lambda value: subject_map.get(c.format_code(value), ''))
     # [主表] xght(相关合同) -> uf_htsp.htbh(合同编号)
@@ -510,9 +517,12 @@ def resolve_gig_source_values(source_df):
     df = source_df.copy()
     employee_map = c.build_fw_employee_info_map_for_ids(df['经办人ID'])
     company_map = c.build_fw_company_name_map_for_ids(df['公司主体ID'])
+    cost_center_map = c.build_fw_cost_center_map_for_ids(df['成本中心ID'])
     contract_map = c.build_fw_contract_code_map_for_ids(df['相关合同ID'])
     project_code_map = build_fw_project_code_map_for_ids(df['项目编号ID'])
 
+    # [建模头表] cbzx(成本中心) -> uf_cbzx.mc(成本中心名称)
+    df['成本中心'] = df['成本中心ID'].map(lambda value: _lookup_first_browser_value(cost_center_map, value))
     # [建模头表] jbr(经办人) -> hrmresource / hrmjobtitles
     df['经办人'] = df['经办人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
     df['经办人工号'] = df['经办人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
@@ -1006,6 +1016,7 @@ def run():
     if not supplier_bank_issues.empty:
         supplier_sheets['银行账号_校验异常'] = supplier_bank_issues
     supplier_sheets.update(c.collect_order_mapping_issues(supplier_merged_df))
+    c.attach_budget_issue_columns(supplier_sheets, c.build_budget_issue_map(supplier_merged_df))
     exception_sheets.update({f'供应商_{name}': df for name, df in supplier_sheets.items()})
 
     gig_sheets = {'必输字段未达100%': c.fill_summary(
@@ -1017,6 +1028,7 @@ def run():
     if not gig_bank_issues.empty:
         gig_sheets['银行账号_校验异常'] = gig_bank_issues
     gig_sheets.update(c.collect_order_mapping_issues(gig_merged_df))
+    c.attach_budget_issue_columns(gig_sheets, c.build_budget_issue_map(gig_merged_df))
     exception_sheets.update({f'灵工_{name}': df for name, df in gig_sheets.items()})
 
     c.write_exceptions(EXCEPTION_FILE, exception_sheets)

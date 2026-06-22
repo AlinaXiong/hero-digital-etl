@@ -665,6 +665,33 @@ def build_fw_budget_subject_path_map_for_ids(subject_ids):
     return subject_map
 
 
+def build_fw_cost_center_map_for_ids(cost_center_values):
+    """泛微成本中心(browser.cbzx01)ID -> 成本中心名称。
+
+    各表单成本中心字段(uf_dgfktz.rzdw / uf_yfkxx.cbzx / uf_xtyykp.cbzx /
+    uf_plfy.cbzx / uf_xtyynbsz.zrcbzx,zccbzx / uf_lgptfk.cbzx)都指向成本中心
+    建模表 uf_cbzx,取 uf_cbzx.mc(成本中心名称)。
+    """
+    cost_center_ids = clean_codes(
+        cost_center_id
+        for value in cost_center_values
+        for cost_center_id in parse_browser_ids(value)
+    )
+    if not cost_center_ids:
+        return {}
+    cost_center_df = query_db(
+        'FW',
+        'vspn_xtyy',
+        f'SELECT id, mc FROM uf_cbzx WHERE id IN ({in_placeholders(cost_center_ids)})',
+        cost_center_ids,
+    )
+    return {
+        format_code(row['id']): _cell_text(row['mc'])
+        for _, row in cost_center_df.iterrows()
+        if _cell_text(row['mc'])
+    }
+
+
 def build_vendor_map():
     """供应商名称 -> 中台供应商编码 vender_code。来源:中台 hfins_base.hfbs_system_vender。
     按 description / taxpayer_name 建键(均 normalize_name 归一化)。"""
@@ -1984,6 +2011,62 @@ def fill_summary(output_df, columns, rule_sheet=None, table_name=None):
             rows.append({'必输字段': column, '填充数': filled, '缺失数': total - filled,
                          '总数': total, '填充率': f'{filled / total * 100:.2f}%', '备注': remark})
     return pd.DataFrame(rows, columns=['必输字段', '填充数', '缺失数', '总数', '填充率', '备注'])
+
+
+# ============================ 未匹配清单辅助列 ============================
+# 未匹配清单里可能出现的单据号列名(应收用「来源单据号」,应付/预付用「来源单据编号」)。
+BUDGET_ISSUE_DOC_COLUMNS = ('来源单据编号', '来源单据号')
+
+
+def build_budget_issue_map(source_df, doc_col='流程编号',
+                           cost_center_col='成本中心', subject_col='预算科目'):
+    """{来源单据号 -> (成本中心, 预算项)},供未匹配清单按单据号补充辅助列。
+    成本中心 = 泛微「成本中心」字段(已解析为名称,来源 uf_cbzx.mc);预算项 = 预算科目完整路径。
+    同一单据有多个值时,按出现顺序去重后用「; 」拼接。
+    source_df 缺成本中心/预算科目列时,对应项留空(如应收无预算科目则预算项为空)。"""
+    has_cost = cost_center_col in source_df.columns
+    has_subject = subject_col in source_df.columns
+    if doc_col not in source_df.columns or not (has_cost or has_subject):
+        return {}
+    blanks = [None] * len(source_df)
+    cost_by_doc = {}
+    budget_by_doc = {}
+    for doc, cost, subject in zip(
+            source_df[doc_col],
+            source_df[cost_center_col] if has_cost else blanks,
+            source_df[subject_col] if has_subject else blanks):
+        doc_text = _cell_text(doc)
+        if not doc_text:
+            continue
+        cost_text = _cell_text(cost)
+        if cost_text:
+            cost_list = cost_by_doc.setdefault(doc_text, [])
+            if cost_text not in cost_list:
+                cost_list.append(cost_text)
+        path = _cell_text(subject)
+        if path:
+            budget_list = budget_by_doc.setdefault(doc_text, [])
+            if path not in budget_list:
+                budget_list.append(path)
+    return {
+        doc: ('; '.join(cost_by_doc.get(doc, [])), '; '.join(budget_by_doc.get(doc, [])))
+        for doc in set(cost_by_doc) | set(budget_by_doc)
+    }
+
+
+def attach_budget_issue_columns(sheets, budget_map, doc_columns=BUDGET_ISSUE_DOC_COLUMNS):
+    """给未匹配清单各 sheet 末尾补「成本中心」「预算项」两列(按单据号关联 budget_map)。
+    识别不到单据号列的 sheet(如必输字段汇总页)原样跳过。原地修改并返回 sheets。"""
+    for sheet_df in sheets.values():
+        if sheet_df is None or len(sheet_df) == 0:
+            continue
+        doc_col = next((col for col in doc_columns if col in sheet_df.columns), None)
+        if doc_col is None:
+            continue
+        docs = sheet_df[doc_col].map(_cell_text)
+        sheet_df['成本中心'] = docs.map(lambda doc: budget_map.get(doc, ('', ''))[0])
+        sheet_df['预算项'] = docs.map(lambda doc: budget_map.get(doc, ('', ''))[1])
+    return sheets
 
 
 # ============================ Excel 输出 ============================

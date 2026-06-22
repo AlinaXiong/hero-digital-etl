@@ -48,7 +48,12 @@ FW_ANCHOR_CARD_DETAIL_TABLE = 'uf_zbkp_dt1'
 FW_ANCHOR_CARD_DETAIL_FALLBACK_TABLE = 'uf_zbkp_dt1_bak1'
 PROJECT_TABLES = ('uf_xtyyxmkp', 'uf_xmkp', 'view_xmjkzb')
 
-MIGRATION_STATUS_CODES = (1, 2)
+MIGRATION_STATUS_CODES = (0, 1, 2)  # 审批中, 审批完成, 已归档
+CONTRACT_STATUS_LABELS = {
+    '0': '审批中',
+    '1': '审批完成',
+    '2': '已归档',
+}
 ANCHOR_CONTRACT_TYPE_CODE = 3
 ANCHOR_SECONDARY_CODES = (10, 11, 12, 13, 14, 15)
 SUPPLEMENT_WORKFLOW_IDS = {'48', '442'}
@@ -186,6 +191,11 @@ def _text(value):
         return ''
     text = str(value).strip()
     return '' if text in ('', 'nan', 'None', 'NaT') else text
+
+
+def resolve_contract_status_label(status_id):
+    """uf_htk.htzt -> 合同签署状态中文。仅迁移 0/1/2,对应审批中/审批完成/已归档。"""
+    return CONTRACT_STATUS_LABELS.get(c.format_code(status_id), '')
 
 
 def _first_non_blank(*values):
@@ -804,6 +814,58 @@ def build_supplier_info_map_for_values(supplier_values):
     return result
 
 
+def build_anchor_vendor_info_maps(source_df):
+    """主播 -> Hand 个人供应商编码,使对方信息里的主播编码与供应商口径一致。
+
+    优先用主播身份证号匹配 hfbs_system_vender.tax_id_number/taxpayer_number;
+    再按主播姓名唯一匹配兜底(如 曾卓君 -> V-I-CN-OT-OTH-3674)。
+    返回 (按身份证号, 按姓名归一化) 两个 {key: {code,name,id,match_method}} 映射。
+    """
+    id_numbers = c.clean_text_values(source_df.get('主播身份证号码', pd.Series(dtype=str)))
+    by_id_number = {}
+    if id_numbers:
+        placeholders = c.in_placeholders(id_numbers)
+        vendor_df = c.query_db(
+            'ZT',
+            'hfins_base',
+            'SELECT vender_id, vender_code, description, taxpayer_name, tax_id_number, taxpayer_number '
+            'FROM hfbs_system_vender '
+            f'WHERE tax_id_number IN ({placeholders}) OR taxpayer_number IN ({placeholders})',
+            id_numbers + id_numbers,
+        )
+        for _, row in vendor_df.iterrows():
+            code = _text(row['vender_code'])
+            if not code:
+                continue
+            info = {
+                'code': code,
+                'name': _first_non_blank(row.get('description'), row.get('taxpayer_name')),
+                'id': c.format_code(row.get('vender_id')),
+                'match_method': '主播身份证号匹配Hand供应商',
+            }
+            for key in (_text(row.get('tax_id_number')), _text(row.get('taxpayer_number'))):
+                if key and key not in by_id_number:
+                    by_id_number[key] = info
+
+    names = list(source_df.get('主播姓名', pd.Series(dtype=str))) + \
+        list(source_df.get('主播姓名_卡片', pd.Series(dtype=str)))
+    by_name = c.build_hand_vendor_info_by_names(c.clean_text_values(names))
+    return by_id_number, by_name
+
+
+def resolve_anchor_vendor_info(source, by_id_number, by_name):
+    """按身份证号优先、主播姓名兜底,取主播对应的 Hand 供应商编码信息。"""
+    id_number = _text(source.get('主播身份证号码'))
+    info = by_id_number.get(id_number) if id_number else None
+    if info and info.get('code'):
+        return info
+    name_key = c.normalize_name(_first_non_blank(source.get('主播姓名'), source.get('主播姓名_卡片')))
+    name_info = by_name.get(name_key) if name_key else None
+    if name_info and name_info.get('code'):
+        return {**name_info, 'match_method': '主播姓名匹配Hand供应商'}
+    return {}
+
+
 def build_anchor_card_info_map(card_values):
     card_ids = c.clean_codes(
         card_id
@@ -1149,7 +1211,7 @@ def _contract_type_label(contract_type, secondary_type):
 def _category_from_contract_number(contract_number):
     code = re.sub(r'\s+', '', _text(contract_number)).upper()
     compact_code = re.sub(r'[^A-Z0-9]', '', code)
-    if compact_code.startswith('VSMB') or 'VSMB' in compact_code:
+    if compact_code.startswith('VMSB') or 'VMSB' in compact_code:
         return CATEGORY_INDONESIA_LIVE
     if compact_code.startswith('VT') or re.search(r'(^|[-_/])VT', code):
         return CATEGORY_MALAYSIA_LIVE
@@ -1162,12 +1224,12 @@ def _category_number_basis(contract_number):
     code = _text(contract_number) or '空'
     category = _category_from_contract_number(contract_number)
     if category == CATEGORY_INDONESIA_LIVE:
-        return f'合同编号={code}; 前缀命中 VSMB'
+        return f'合同编号={code}; 前缀命中 VMSB'
     if category == CATEGORY_MALAYSIA_LIVE:
         return f'合同编号={code}; 前缀命中 VT'
     if category == CATEGORY_PLATFORM_ECONOMY:
         return f'合同编号={code}; 编号包含 P'
-    return f'合同编号={code}; 未命中 VSMB/VT/P'
+    return f'合同编号={code}; 未命中 VMSB/VT/P'
 
 
 def _main_contract_code_candidates(contract_number):
@@ -1389,7 +1451,7 @@ def resolve_source_values(source_df):
 
     df['合同类型'] = df['合同类型ID'].map(lambda value: option_maps['htlx'].get(c.format_code(value), ''))
     df['合同二级类型'] = df['合同二级类型ID'].map(lambda value: option_maps['htejlx'].get(c.format_code(value), ''))
-    df['合同签署状态'] = df['合同签署状态ID'].map(lambda value: option_maps['htzt'].get(c.format_code(value), ''))
+    df['合同签署状态'] = df['合同签署状态ID'].map(resolve_contract_status_label)
     df['合同主表所属平台'] = df['所属平台ID'].map(lambda value: option_maps['szpt'].get(c.format_code(value), ''))
     df['所属平台'] = df['合同主表所属平台']
     df['变更类型'] = df['变更类型ID'].map(lambda value: option_maps['bglx'].get(c.format_code(value), ''))
@@ -1492,6 +1554,9 @@ def resolve_source_values(source_df):
         for in_amount, out_amount in zip(df['合同预计收入'], df['合同预计支出'])
     ]
     df['推导合同总额'] = df.apply(resolve_contract_amount, axis=1)
+    anchor_vendor_by_id, anchor_vendor_by_name = build_anchor_vendor_info_maps(df)
+    df.attrs['anchor_vendor_by_id_number'] = anchor_vendor_by_id
+    df.attrs['anchor_vendor_by_name'] = anchor_vendor_by_name
     df.attrs['company_info_map'] = company_info_map
     df.attrs['customer_info_map'] = customer_info_map
     df.attrs['supplier_info_map'] = supplier_info_map
@@ -1503,10 +1568,10 @@ def resolve_source_values(source_df):
 def read_source():
     c.validate_fw_fields(FW_TABLE, EXPECTED_FW_FIELDS)
     stats = _query_fw(STATS_SQL).iloc[0]
-    print('[合同迁移-主播流程] SQL过滤: 合同类型=主播协议 且 合同签署状态∈(审批完成, 已归档)')
+    print('[合同迁移-主播流程] SQL过滤: 合同类型=主播协议 且 合同签署状态∈(审批中, 审批完成, 已归档)')
     print(f"  合同库总数 {int(stats['all_count'] or 0)} 条; "
           f"主播协议 {int(stats['anchor_type_count'] or 0)} 条; "
-          f"保留审批完成/已归档 {int(stats['kept_count'] or 0)} 条; "
+          f"保留审批中/审批完成/已归档 {int(stats['kept_count'] or 0)} 条; "
           f"排除其他状态 {int(stats['excluded_status_count'] or 0)} 条; "
           f"合同金额为空但可由收入/支出回填 {int(stats['amount_fallback_count'] or 0)} 条")
     source_df = _query_fw(SOURCE_SQL)
@@ -1525,7 +1590,8 @@ def build_main_output(source_df, headers):
 
         _set(row, 'contract_number（合同编码）', _text(source['合同编号']))
         _set(row, 'contract_name（合同名称）', _text(source['合同标题']))
-        _set(row, '订单编号', _text(source['订单编号']))
+        _set(row, '合同状态', resolve_contract_status_label(source['合同签署状态ID']))
+        _set(row, '订单编号', '')  # 暂留空,待项目/订单映射口径确认后再回填
         _set(row, 'contractCategory(智书框架合同类型)', source['合同分类'])
         _set(row, 'pay_type_code（收支类型）', source['收支类型'])
         _set(row, 'property_type_code（计价方式）', DEFAULT_PROPERTY_TYPE)
@@ -1587,11 +1653,15 @@ def build_main_output(source_df, headers):
 def build_counterparty_output(source_df, headers):
     customer_info_map = source_df.attrs.get('customer_info_map', {})
     supplier_info_map = source_df.attrs.get('supplier_info_map', {})
+    anchor_vendor_by_id = source_df.attrs.get('anchor_vendor_by_id_number', {})
+    anchor_vendor_by_name = source_df.attrs.get('anchor_vendor_by_name', {})
     rows = []
     source_rows = []
     for source in source_df.to_dict('records'):
         contract_number = _text(source['合同编号'])
-        anchor_counter_party_code = _text(source['主播卡片导入ID'])
+        # 主播对方编码取 Hand 个人供应商编码(与供应商口径一致),身份证号优先、姓名兜底。
+        anchor_vendor_info = resolve_anchor_vendor_info(source, anchor_vendor_by_id, anchor_vendor_by_name)
+        anchor_counter_party_code = anchor_vendor_info.get('code', '')
         row = _new_row(headers)
         _set(row, 'contract_number（合同编码）', contract_number)
         _set(row, 'counter_party_code（对方主体编码）', anchor_counter_party_code)
@@ -1600,9 +1670,12 @@ def build_counterparty_output(source_df, headers):
             'contract_number（合同编码）': contract_number,
             '对方主体类型': '主播',
             '泛微对方ID': _text(source['主播卡片ID']),
+            '主播身份证号码': _text(source['主播身份证号码']),
+            '主播卡片导入ID': _text(source['主播卡片导入ID']),
             '泛微对方名称': _first_non_blank(source['主播姓名'], source['主播昵称']),
-            '归并/匹配方式': _text(source['主播信息来源']),
-            '对方主体名称': _first_non_blank(source['主播姓名'], source['主播昵称']),
+            '归并/匹配方式': anchor_vendor_info.get('match_method', '') if anchor_counter_party_code else '未匹配Hand供应商',
+            '对方主体名称': _first_non_blank(
+                anchor_vendor_info.get('name'), source['主播姓名'], source['主播昵称']),
             '对方主体编码': anchor_counter_party_code,
         })
         for customer_id in c.parse_browser_ids(source['合同客户ID']):
@@ -1681,7 +1754,10 @@ def build_fee_detail_output(source_df, headers):
 def build_status_breakdown():
     option_maps = c.build_fw_select_option_maps(FW_TABLE, ['htzt'])
     df = _query_fw(STATUS_BREAKDOWN_SQL)
-    df['合同签署状态'] = df['合同签署状态ID'].map(lambda value: option_maps['htzt'].get(c.format_code(value), '空'))
+    df['合同签署状态'] = df['合同签署状态ID'].map(
+        lambda value: resolve_contract_status_label(value)
+        or option_maps['htzt'].get(c.format_code(value), '空')
+    )
     return df[['合同签署状态ID', '合同签署状态', '合同数']]
 
 
@@ -1689,6 +1765,7 @@ def build_status_breakdown():
 MAIN_ISSUE_SOURCE_FIELDS = {
     'contract_number（合同编码）': '合同编号',
     'contract_name（合同名称）': '合同标题',
+    '合同状态': '合同签署状态ID',
     '订单编号': '合同所属项目编号',
     'contractCategory(智书框架合同类型)': '合同二级类型',
     'custom_1001_948719050bfe402ab083c98e52fa71b2（合同执行人）': '合同执行人员ID',
