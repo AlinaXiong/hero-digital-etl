@@ -46,14 +46,17 @@ FW_ANCHOR_CARD_TABLE = 'uf_zbkp'
 FW_ANCHOR_CARD_FALLBACK_TABLE = 'uf_zbkp_bak1'
 FW_ANCHOR_CARD_DETAIL_TABLE = 'uf_zbkp_dt1'
 FW_ANCHOR_CARD_DETAIL_FALLBACK_TABLE = 'uf_zbkp_dt1_bak1'
+PROJECT_TABLES = ('uf_xtyyxmkp', 'uf_xmkp', 'view_xmjkzb')
 
 MIGRATION_STATUS_CODES = (1, 2)
 ANCHOR_CONTRACT_TYPE_CODE = 3
 ANCHOR_SECONDARY_CODES = (10, 11, 12, 13, 14, 15)
 SUPPLEMENT_WORKFLOW_IDS = {'48', '442'}
 ANCHOR_APPROVAL_WORKFLOW_NAME = '主播协议审批流程'
-CATEGORY_BROKERAGE = '主播专项-主播经纪'
-CATEGORY_OTHER = '主播专项-其他'
+CATEGORY_INDONESIA_LIVE = '主播专项-印尼直播'
+CATEGORY_MALAYSIA_LIVE = '主播专项-马来直播'
+CATEGORY_PLATFORM_ECONOMY = '主播专项-平台经纪'
+CATEGORY_ANCHOR_ECONOMY = '主播专项-主播经纪'
 
 DEFAULT_PROPERTY_TYPE = '固定总价'
 DEFAULT_VALIDITY_TYPE = '固定期限'
@@ -203,6 +206,14 @@ def _first_browser_code(*values):
     return ''
 
 
+def _first_browser_value(mapping, value):
+    for item_id in c.parse_browser_ids(value):
+        mapped = mapping.get(item_id, '')
+        if mapped:
+            return mapped
+    return ''
+
+
 def _excel_id_value(*values):
     code = _first_browser_code(*values)
     return int(code) if code.isdigit() else code
@@ -278,7 +289,7 @@ def _add_flow_audit_sheet(output_file, source_df):
         '主合同智书合同类型', '智书合同类型', '分类依据',
     ]
     ws.append(headers)
-    for _, row in source_df.iterrows():
+    for row in source_df.to_dict('records'):
         ws.append([
             _text(row.get('合同编号')),
             _text(row.get('合同标题')),
@@ -336,7 +347,7 @@ def _add_platform_audit_sheet(output_file, source_df):
         '合同标题平台命中', '最终所属平台ID', '最终所属平台', '取值依据',
     ]
     ws.append(headers)
-    for _, row in source_df.iterrows():
+    for row in source_df.to_dict('records'):
         ws.append([
             _text(row.get('合同编号')),
             _text(row.get('合同标题')),
@@ -373,13 +384,208 @@ def _new_row(headers):
     return {header: '' for header in headers}
 
 
+_HEADER_LOOKUP_CACHE = {}
+_CLEANED_PROJECT_CANDIDATES_CACHE = None
+_CONTRACT_ORDER_MAPPING_CACHE = None
+
+
 def _set(row, field_name, value):
     normalized = _normalize_field_name(field_name)
-    for header in row:
-        if _normalize_field_name(header) == normalized:
-            row[header] = value
-            return
+    cache_key = tuple(row.keys())
+    lookup = _HEADER_LOOKUP_CACHE.get(cache_key)
+    if lookup is None:
+        lookup = {
+            _normalize_field_name(header): header
+            for header in row
+        }
+        _HEADER_LOOKUP_CACHE[cache_key] = lookup
+    header = lookup.get(normalized)
+    if header:
+        row[header] = value
+        return
     raise KeyError(f'模板缺少字段: {field_name}')
+
+
+def build_fw_project_info_map_for_ids(project_values):
+    """泛微项目浏览框 ID -> 泛微项目编号/名称,兼容历史项目表。"""
+    project_ids = c.clean_codes(
+        project_id
+        for value in project_values
+        for project_id in c.parse_browser_ids(value)
+    )
+    if not project_ids:
+        return {}
+
+    result = {}
+    remaining = set(project_ids)
+    for table in PROJECT_TABLES:
+        if not remaining:
+            break
+        ids = [project_id for project_id in project_ids if project_id in remaining]
+        try:
+            project_df = c.query_db(
+                'FW',
+                'vspn_xtyy',
+                f'SELECT id, xmbh AS project_code, xmmc AS project_name FROM {table} '
+                f'WHERE id IN ({c.in_placeholders(ids)})',
+                ids,
+            )
+        except Exception:
+            try:
+                project_df = c.query_db(
+                    'FW',
+                    'vspn_xtyy',
+                    f"SELECT id, xmbh AS project_code, '' AS project_name FROM {table} "
+                    f'WHERE id IN ({c.in_placeholders(ids)})',
+                    ids,
+                )
+            except Exception:
+                continue
+        for _, row in project_df.iterrows():
+            project_id = c.format_code(row['id'])
+            project_code = _text(row['project_code'])
+            if project_id and project_code and project_id not in result:
+                result[project_id] = {
+                    'code': project_code,
+                    'name': _text(row.get('project_name', '')),
+                }
+                remaining.discard(project_id)
+    return result
+
+
+def _read_cleaned_sheet_with_header(path, sheet_name, required_columns):
+    raw_df = pd.read_excel(path, sheet_name=sheet_name, dtype=str, keep_default_na=False, header=None)
+    required = set(required_columns)
+    for index, row in raw_df.iterrows():
+        headers = [_text(value).replace('\n', '') for value in row.tolist()]
+        if required.issubset(set(headers)):
+            df = raw_df.iloc[index + 1:].copy()
+            df.columns = headers
+            return df
+    return pd.DataFrame(columns=list(required_columns))
+
+
+def _cleaned_mapping_file():
+    _, _, mapping_file = c.load_project_order_mapping()
+    return mapping_file
+
+
+def load_cleaned_project_candidates():
+    """0621 清洗表里的项目ID -> 原泛微项目编码候选。主播合同 xmk ID 与赛事项目 ID 会重号,需按项目名优先。"""
+    global _CLEANED_PROJECT_CANDIDATES_CACHE
+    if _CLEANED_PROJECT_CANDIDATES_CACHE is not None:
+        return _CLEANED_PROJECT_CANDIDATES_CACHE
+
+    mapping_file = _cleaned_mapping_file()
+    if mapping_file is None:
+        _CLEANED_PROJECT_CANDIDATES_CACHE = {}
+        return _CLEANED_PROJECT_CANDIDATES_CACHE
+
+    candidates = {}
+    sheet_configs = [
+        ('MCN专项项目_清洗前', 'MCN'),
+        ('赛事专项项目_清洗前', '赛事'),
+    ]
+    for sheet_name, source in sheet_configs:
+        try:
+            project_df = _read_cleaned_sheet_with_header(
+                mapping_file,
+                sheet_name,
+                ['id', 'prj_dim_value（项目编号）', 'project_name（项目名称）'],
+            )
+        except ValueError:
+            continue
+        for _, row in project_df.iterrows():
+            project_id = c.format_code(row.get('id'))
+            project_code = _text(row.get('prj_dim_value（项目编号）'))
+            project_name = _text(row.get('project_name（项目名称）'))
+            if not project_id or not project_code:
+                continue
+            candidates.setdefault(project_id, []).append({
+                'code': project_code,
+                'name': project_name,
+                'source': source,
+            })
+    _CLEANED_PROJECT_CANDIDATES_CACHE = candidates
+    return candidates
+
+
+def choose_cleaned_project_info(project_id, project_name, candidates_map):
+    candidates = candidates_map.get(c.format_code(project_id), [])
+    if not candidates:
+        return {}
+    name_key = c.normalize_name(project_name)
+    if name_key:
+        for candidate in candidates:
+            if c.normalize_name(candidate.get('name', '')) == name_key:
+                return candidate
+    for candidate in candidates:
+        if candidate.get('source') == 'MCN':
+            return candidate
+    return candidates[0]
+
+
+def load_contract_order_mapping():
+    """从 0621 订单/结算表读取 原泛微项目编码 -> 唯一订单编号。"""
+    global _CONTRACT_ORDER_MAPPING_CACHE
+    if _CONTRACT_ORDER_MAPPING_CACHE is not None:
+        return _CONTRACT_ORDER_MAPPING_CACHE
+
+    mapping_file = _cleaned_mapping_file()
+    if mapping_file is None:
+        _CONTRACT_ORDER_MAPPING_CACHE = ({}, {})
+        return _CONTRACT_ORDER_MAPPING_CACHE
+
+    sheet_names = [
+        '全量订单主表_清洗后',
+        '全量订单明细行表_清洗后',
+        '全量结算明细表_清洗后',
+        '填协同关系表',
+        '全量订单明细表（下单或报价行）_清洗后',
+    ]
+    rows = []
+    for sheet_name in sheet_names:
+        try:
+            order_df = _read_cleaned_sheet_with_header(mapping_file, sheet_name, ['原泛微项目编码', '订单编号'])
+        except ValueError:
+            continue
+        if '是否可洗流程' in order_df.columns:
+            order_df = order_df[order_df['是否可洗流程'].map(_text).str.upper().str.contains('Y', na=False)]
+        for _, row in order_df.iterrows():
+            project_code = _text(row.get('原泛微项目编码'))
+            order_code = _text(row.get('订单编号'))
+            if project_code and order_code:
+                rows.append({
+                    '项目编号': project_code,
+                    '订单编号': order_code,
+                    '映射来源': sheet_name,
+                })
+
+    by_project = {}
+    for row in rows:
+        by_project.setdefault(row['项目编号'], []).append(row)
+
+    safe_map = {}
+    ambiguous_map = {}
+    for project_code, items in by_project.items():
+        order_codes = []
+        seen = set()
+        for item in items:
+            order_code = item['订单编号']
+            if order_code not in seen:
+                seen.add(order_code)
+                order_codes.append(order_code)
+        if len(order_codes) == 1:
+            safe_map[project_code] = order_codes[0]
+        else:
+            ambiguous_map[project_code] = order_codes
+    _CONTRACT_ORDER_MAPPING_CACHE = (safe_map, ambiguous_map)
+    return _CONTRACT_ORDER_MAPPING_CACHE
+
+
+def contract_order_mapping_value(project_code):
+    safe_map, _, = load_contract_order_mapping()
+    return safe_map.get(_text(project_code), '') or c.project_order_mapping_value(project_code, '订单编号')
 
 
 def _read_anchor_required_rules(headers_by_sheet):
@@ -940,17 +1146,28 @@ def _contract_type_label(contract_type, secondary_type):
     return _first_non_blank(secondary_type, contract_type, '空')
 
 
-def _category_from_contract_type(contract_type, secondary_type):
-    return CATEGORY_BROKERAGE if _contract_type_label(contract_type, secondary_type) == '经纪合同' else CATEGORY_OTHER
+def _category_from_contract_number(contract_number):
+    code = re.sub(r'\s+', '', _text(contract_number)).upper()
+    compact_code = re.sub(r'[^A-Z0-9]', '', code)
+    if compact_code.startswith('VSMB') or 'VSMB' in compact_code:
+        return CATEGORY_INDONESIA_LIVE
+    if compact_code.startswith('VT') or re.search(r'(^|[-_/])VT', code):
+        return CATEGORY_MALAYSIA_LIVE
+    if 'P' in compact_code:
+        return CATEGORY_PLATFORM_ECONOMY
+    return CATEGORY_ANCHOR_ECONOMY
 
 
-def _category_from_main_contract(contract_type_id, contract_type, workflow_name):
-    type_id = c.format_code(contract_type_id)
-    type_name = _text(contract_type)
-    flow_name = c.clean_fw_select_name(workflow_name)
-    if (type_id == str(ANCHOR_CONTRACT_TYPE_CODE) or type_name == '主播协议') and ANCHOR_APPROVAL_WORKFLOW_NAME in flow_name:
-        return CATEGORY_BROKERAGE
-    return CATEGORY_OTHER
+def _category_number_basis(contract_number):
+    code = _text(contract_number) or '空'
+    category = _category_from_contract_number(contract_number)
+    if category == CATEGORY_INDONESIA_LIVE:
+        return f'合同编号={code}; 前缀命中 VSMB'
+    if category == CATEGORY_MALAYSIA_LIVE:
+        return f'合同编号={code}; 前缀命中 VT'
+    if category == CATEGORY_PLATFORM_ECONOMY:
+        return f'合同编号={code}; 编号包含 P'
+    return f'合同编号={code}; 未命中 VSMB/VT/P'
 
 
 def _main_contract_code_candidates(contract_number):
@@ -986,7 +1203,7 @@ def _main_contract_info_from_row(row, option_maps, source):
         'workflow_id': workflow_id,
         'workflow_name': workflow_name,
         'type_label': type_label,
-        'category': _category_from_main_contract(type_id, contract_type, workflow_name),
+        'category': _category_from_contract_number(row.get('htbh')),
         'anchor_card_id': _first_browser_code(row.get('zbid')),
         'anchor_name': _text(row.get('zbxm')),
         'anchor_nickname': _text(row.get('zbnc')),
@@ -1103,11 +1320,9 @@ def resolve_contract_category(row):
     if _is_supplement_or_termination_flow(row):
         return _first_non_blank(
             row.get('主合同分类'),
-            _category_from_contract_type(row.get('合同类型'), row.get('合同二级类型')),
+            _category_from_contract_number(row.get('合同编号')),
         )
-    if _is_empty_flow(row):
-        return _category_from_contract_type(row.get('合同类型'), row.get('合同二级类型'))
-    return CATEGORY_BROKERAGE
+    return _category_from_contract_number(row.get('合同编号'))
 
 
 def resolve_contract_category_basis(row):
@@ -1121,20 +1336,13 @@ def resolve_contract_category_basis(row):
             return (
                 f'流程类型={flow_id or "空"}; 流程名称={flow_name or "空"}; '
                 f'按去后缀主合同{_text(row.get("主合同编号")) or "空"}; '
-                f'主合同类型={_text(row.get("主合同类型")) or "空"}; '
-                f'主合同流程={_text(row.get("主合同流程名称")) or "空"}'
+                f'主合同分类={main_category}; 子合同与主合同保持一致'
             )
         return (
             f'流程类型={flow_id or "空"}; 流程名称={flow_name or "空"}; '
-            f'未找到主合同,按当前合同一级类型={type_label or "空"}兜底'
+            f'未找到主合同,按当前{_category_number_basis(row.get("合同编号"))}兜底'
         )
-    if '主播协议审批流程' in flow_name:
-        return '流程名称=主播协议审批流程'
-    if _is_empty_flow(row):
-        return f'流程类型/流程名称为空; 按合同一级类型={type_label or "空"}判断'
-    if flow_name:
-        return f'流程名称={flow_name}; 未命中特殊流程,按合同类型=主播协议兜底'
-    return f'流程名称为空; 按合同二级类型={secondary_name or "空"}兜底'
+    return _category_number_basis(row.get('合同编号'))
 
 
 def resolve_pay_type(in_amount, out_amount):
@@ -1168,6 +1376,16 @@ def resolve_source_values(source_df):
     company_info_map = build_fw_company_info_map_for_values(df['合同用印范围ID'])
     customer_info_map = build_customer_info_map_for_values(df['合同客户ID'])
     supplier_info_map = build_supplier_info_map_for_values(df['合同供应商ID'])
+    project_info_map = build_fw_project_info_map_for_ids(df['合同所属项目编号ID'])
+    cleaned_project_candidates = load_cleaned_project_candidates()
+    project_code_map = {
+        project_id: info.get('code', '')
+        for project_id, info in project_info_map.items()
+    }
+    project_name_map = {
+        project_id: info.get('name', '')
+        for project_id, info in project_info_map.items()
+    }
 
     df['合同类型'] = df['合同类型ID'].map(lambda value: option_maps['htlx'].get(c.format_code(value), ''))
     df['合同二级类型'] = df['合同二级类型ID'].map(lambda value: option_maps['htejlx'].get(c.format_code(value), ''))
@@ -1176,6 +1394,23 @@ def resolve_source_values(source_df):
     df['所属平台'] = df['合同主表所属平台']
     df['变更类型'] = df['变更类型ID'].map(lambda value: option_maps['bglx'].get(c.format_code(value), ''))
     df['流程名称'] = df['流程名称'].map(c.clean_fw_select_name)
+    cleaned_project_info = [
+        choose_cleaned_project_info(project_id, project_name, cleaned_project_candidates)
+        for project_id, project_name in zip(df['合同所属项目编号ID'], df['合同所属项目'])
+    ]
+    df['合同所属项目编号'] = [
+        _first_non_blank(
+            info.get('code', ''),
+            _first_browser_value(project_code_map, project_id),
+            project_id,
+        )
+        for info, project_id in zip(cleaned_project_info, df['合同所属项目编号ID'])
+    ]
+    df['合同所属项目名称'] = [
+        _first_non_blank(source_name, info.get('name', ''), _first_browser_value(project_name_map, value))
+        for source_name, info, value in zip(df['合同所属项目'], cleaned_project_info, df['合同所属项目编号ID'])
+    ]
+    df['订单编号'] = df['合同所属项目编号'].map(contract_order_mapping_value)
     df['合同执行人员'] = df['合同执行人员ID'].map(
         lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
     df['合同一级类型判定'] = df.apply(
@@ -1282,7 +1517,7 @@ def read_source():
 # ============================ Sheet 构建 ============================
 def build_main_output(source_df, headers):
     rows = []
-    for _, source in source_df.iterrows():
+    for source in source_df.to_dict('records'):
         row = _new_row(headers)
         contract_amount = source['推导合同总额']
         in_amount = _round_amount(source['合同预计收入'])
@@ -1290,6 +1525,7 @@ def build_main_output(source_df, headers):
 
         _set(row, 'contract_number（合同编码）', _text(source['合同编号']))
         _set(row, 'contract_name（合同名称）', _text(source['合同标题']))
+        _set(row, '订单编号', _text(source['订单编号']))
         _set(row, 'contractCategory(智书框架合同类型)', source['合同分类'])
         _set(row, 'pay_type_code（收支类型）', source['收支类型'])
         _set(row, 'property_type_code（计价方式）', DEFAULT_PROPERTY_TYPE)
@@ -1353,8 +1589,22 @@ def build_counterparty_output(source_df, headers):
     supplier_info_map = source_df.attrs.get('supplier_info_map', {})
     rows = []
     source_rows = []
-    for _, source in source_df.iterrows():
+    for source in source_df.to_dict('records'):
         contract_number = _text(source['合同编号'])
+        anchor_counter_party_code = _text(source['主播卡片导入ID'])
+        row = _new_row(headers)
+        _set(row, 'contract_number（合同编码）', contract_number)
+        _set(row, 'counter_party_code（对方主体编码）', anchor_counter_party_code)
+        rows.append(row)
+        source_rows.append({
+            'contract_number（合同编码）': contract_number,
+            '对方主体类型': '主播',
+            '泛微对方ID': _text(source['主播卡片ID']),
+            '泛微对方名称': _first_non_blank(source['主播姓名'], source['主播昵称']),
+            '归并/匹配方式': _text(source['主播信息来源']),
+            '对方主体名称': _first_non_blank(source['主播姓名'], source['主播昵称']),
+            '对方主体编码': anchor_counter_party_code,
+        })
         for customer_id in c.parse_browser_ids(source['合同客户ID']):
             info = customer_info_map.get(customer_id, {})
             row = _new_row(headers)
@@ -1396,7 +1646,7 @@ def build_our_party_output(source_df, headers):
     company_info_map = source_df.attrs.get('company_info_map', {})
     rows = []
     source_rows = []
-    for _, source in source_df.iterrows():
+    for source in source_df.to_dict('records'):
         contract_number = _text(source['合同编号'])
         company_ids = c.parse_browser_ids(source['合同用印范围ID'])
         if not company_ids:
@@ -1419,7 +1669,7 @@ def build_our_party_output(source_df, headers):
 def build_fee_detail_output(source_df, headers):
     rows = []
     source_rows = []
-    for _, source in source_df.iterrows():
+    for source in source_df.to_dict('records'):
         contract_number = _text(source['合同编号'])
         row = _new_row(headers)
         _set(row, 'contract_number（合同编码）', contract_number)
@@ -1439,6 +1689,7 @@ def build_status_breakdown():
 MAIN_ISSUE_SOURCE_FIELDS = {
     'contract_number（合同编码）': '合同编号',
     'contract_name（合同名称）': '合同标题',
+    '订单编号': '合同所属项目编号',
     'contractCategory(智书框架合同类型)': '合同二级类型',
     'custom_1001_948719050bfe402ab083c98e52fa71b2（合同执行人）': '合同执行人员ID',
     'start_date（合同期限-开始日期）': '合同有效期起始时间',
@@ -1561,6 +1812,13 @@ def run():
         '主播卡片补充信息_未匹配': collect_missing_anchor_card(source_df),
         '最终主播卡片_未匹配': collect_missing_final_anchor_card(source_df),
     }
+    exception_sheets.update(c.collect_order_mapping_issues(
+        source_df,
+        doc_col='合同编号',
+        project_col='合同所属项目编号',
+        project_id_col='合同所属项目编号ID',
+        project_name_col='合同所属项目名称',
+    ))
     exception_sheets.update({
         f'字段模板_{name}': df
         for name, df in _collect_missing_details(
