@@ -11,11 +11,13 @@ import os
 import re
 import json
 import unicodedata
+import html
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
 from openpyxl import load_workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from sqlalchemy import create_engine
 from sqlalchemy.engine import URL
 
@@ -34,9 +36,12 @@ PROJECT_ORDER_MAPPING_XLSX_NAME = '业财项目_项目&订单清洗_0621.xlsx'
 PROJECT_ORDER_MAPPING_SHEETS = {
     '全量项目': '全量项目_清洗后',
     '全量订单': '全量订单主表_清洗后',
+    '订单明细': '全量订单明细行表_清洗后',
 }
+CLEANED_PROJECT_SOURCE_SHEETS = ('赛事专项项目_清洗前', 'MCN专项项目_清洗前')
 PROJECT_ORDER_CLEANABLE_COLUMN = '是否可洗流程'
 _PROJECT_ORDER_MAPPING_CACHE = None
+_CLEANED_PROJECT_MAPPING_CACHE = None
 
 
 # ============================ 配置 / 数据库 ============================
@@ -252,9 +257,23 @@ def format_code(value):
         return text
 
 
+_ISO_DATE_RE = re.compile(r'^(\d{4}-\d{2}-\d{2})')
+
+
 def format_date(value):
-    """日期 -> 'yyyy-mm-dd';空值->''。"""
-    return '' if pd.isna(value) else pd.to_datetime(value).strftime('%Y-%m-%d')
+    """日期 -> 'yyyy-mm-dd';空值/非法值(如 0000-00-00)->''。
+
+    多数源值已是 'YYYY-MM-DD' 字符串(char(10)),直接截取避免逐格 pd.to_datetime(慢)。
+    """
+    if pd.isna(value):
+        return ''
+    if isinstance(value, str):
+        match = _ISO_DATE_RE.match(value.strip())
+        if match:
+            iso = match.group(1)
+            return '' if iso == '0000-00-00' else iso
+    parsed = pd.to_datetime(value, errors='coerce')
+    return '' if pd.isna(parsed) else parsed.strftime('%Y-%m-%d')
 
 
 def round_amount(value):
@@ -1545,6 +1564,117 @@ def _read_cleaned_order_sheet(path, sheet_name, required_columns):
     return df
 
 
+def _find_cleaned_column(columns, *patterns):
+    for column in columns:
+        text = _cell_text(column).replace('\n', '')
+        lowered = text.lower()
+        if any(pattern in text or pattern in lowered for pattern in patterns):
+            return column
+    return None
+
+
+def _project_name_key(value):
+    text = html.unescape(_cell_text(value))
+    text = re.sub(r'<[^>]+>', ' ', text)
+    return normalize_name(text)
+
+
+def _read_cleaned_project_source_rows(mapping_file):
+    rows = []
+    for sheet_name in CLEANED_PROJECT_SOURCE_SHEETS:
+        try:
+            df = pd.read_excel(mapping_file, sheet_name=sheet_name, dtype=str, keep_default_na=False)
+        except ValueError:
+            continue
+        id_col = _find_cleaned_column(df.columns, 'id')
+        code_col = _find_cleaned_column(df.columns, 'prj_dim_value', '项目编号')
+        name_col = _find_cleaned_column(df.columns, 'project_name', '项目名称')
+        if id_col is None or code_col is None or name_col is None:
+            continue
+        for _, row in df.iterrows():
+            project_id = format_code(row.get(id_col))
+            project_code = _cell_text(row.get(code_col))
+            project_name = _cell_text(row.get(name_col))
+            if not (project_id and project_code):
+                continue
+            rows.append({
+                '泛微项目ID': project_id,
+                '项目编号': project_code,
+                '项目名称': project_name,
+                '项目名称key': _project_name_key(project_name),
+                '映射来源': sheet_name,
+            })
+    return rows
+
+
+def load_cleaned_project_mapping():
+    """读取项目清洗前表,支持按 合同所属项目编号ID+项目名称 定位清洗后项目编号。"""
+    global _CLEANED_PROJECT_MAPPING_CACHE
+    if _CLEANED_PROJECT_MAPPING_CACHE is not None:
+        return _CLEANED_PROJECT_MAPPING_CACHE
+
+    mapping_file = _find_project_order_mapping_file()
+    if mapping_file is None:
+        _CLEANED_PROJECT_MAPPING_CACHE = ({}, {}, {}, {}, None)
+        return _CLEANED_PROJECT_MAPPING_CACHE
+
+    rows = _read_cleaned_project_source_rows(mapping_file)
+    by_id_name = {}
+    by_id = {}
+    by_code = {}
+    for row in rows:
+        project_id = row['泛微项目ID']
+        project_name_key = row['项目名称key']
+        project_code = row['项目编号']
+        if project_name_key:
+            by_id_name.setdefault((project_id, project_name_key), row)
+        by_id.setdefault(project_id, []).append(row)
+        by_code.setdefault(project_code, row)
+
+    by_unique_id = {}
+    for project_id, items in by_id.items():
+        project_codes = {_cell_text(item['项目编号']) for item in items if _cell_text(item['项目编号'])}
+        if len(project_codes) == 1:
+            by_unique_id[project_id] = items[0]
+
+    print(
+        '[项目清洗映射] 使用:',
+        mapping_file,
+        '| 清洗前项目记录数:', len(rows),
+        '| ID+名称映射数:', len(by_id_name),
+        '| 唯一ID映射数:', len(by_unique_id),
+    )
+    _CLEANED_PROJECT_MAPPING_CACHE = (by_id_name, by_id, by_unique_id, by_code, mapping_file)
+    return _CLEANED_PROJECT_MAPPING_CACHE
+
+
+def cleaned_project_mapping(project_id_value, project_name='', project_code=''):
+    by_id_name, by_id, by_unique_id, by_code, _ = load_cleaned_project_mapping()
+    project_name_key = _project_name_key(project_name)
+    project_ids = parse_browser_ids(project_id_value) or [format_code(project_id_value)]
+    for project_id in project_ids:
+        project_id = format_code(project_id)
+        if project_id and project_name_key:
+            mapped = by_id_name.get((project_id, project_name_key))
+            if mapped:
+                return mapped
+    if project_name_key:
+        for project_id in project_ids:
+            for mapped in by_id.get(format_code(project_id), []):
+                mapped_name_key = mapped.get('项目名称key', '')
+                if mapped_name_key and (project_name_key in mapped_name_key or mapped_name_key in project_name_key):
+                    return mapped
+    for project_code_item in split_fanwei_project_codes(project_code):
+        mapped = by_code.get(project_code_item)
+        if mapped:
+            return mapped
+    for project_id in project_ids:
+        mapped = by_unique_id.get(format_code(project_id))
+        if mapped:
+            return mapped
+    return {}
+
+
 def _filter_cleanable_order_rows(order_df):
     """0621 订单主表口径:仅处理“是否可洗流程”包含 Y 的订单行。"""
     if PROJECT_ORDER_CLEANABLE_COLUMN not in order_df.columns:
@@ -1560,6 +1690,12 @@ def _empty_order_presence_df():
 
 def _empty_order_candidates_df():
     return pd.DataFrame(columns=['泛微项目编号', '订单编号', '订单标题', '项目编号', '项目名称', '映射来源'])
+
+
+def _mcn_order_project_code(value):
+    text = _cell_text(value)
+    match = re.match(r'^(.+)-\d{3,}$', text)
+    return match.group(1) if match else ''
 
 
 def _build_full_project_lookup(mapping_file):
@@ -1668,9 +1804,58 @@ def _build_project_order_presence(mapping_file):
                 '映射来源': project_item['映射来源'],
             })
 
+    detail_df = _build_order_detail_candidates(mapping_file)
+    for _, detail_row in detail_df.iterrows():
+        rows.append({
+            '泛微项目编号': detail_row['泛微项目编号'],
+            '订单编号': detail_row['订单编号'],
+            '订单标题': detail_row['订单标题'],
+            '映射来源': detail_row['映射来源'],
+        })
+
     if not rows:
         return _empty_order_presence_df()
     return pd.DataFrame(rows, columns=['泛微项目编号', '订单编号', '订单标题', '映射来源']).drop_duplicates()
+
+
+def _build_order_detail_candidates(mapping_file):
+    try:
+        detail_df = _read_cleaned_order_sheet(
+            mapping_file,
+            PROJECT_ORDER_MAPPING_SHEETS['订单明细'],
+            ['原泛微项目编码', '原泛微MCN订单编码', '订单编号'],
+        )
+    except ValueError:
+        return _empty_order_candidates_df()
+
+    rows = []
+    for _, detail_row in detail_df.iterrows():
+        order_code = _cell_text(detail_row.get('订单编号', ''))
+        if not order_code:
+            continue
+        mcn_order_code = _cell_text(detail_row.get('原泛微MCN订单编码', ''))
+        project_keys = split_fanwei_project_codes(detail_row.get('原泛微项目编码', ''))
+        for key in (mcn_order_code, _mcn_order_project_code(mcn_order_code)):
+            if key and key not in project_keys:
+                project_keys.append(key)
+        order_title = _cell_text(detail_row.get('合作内容', '')) or _cell_text(detail_row.get('订单内容', ''))
+        project_name = _cell_text(detail_row.get('开票内容', ''))
+        for project_key in project_keys:
+            rows.append({
+                '泛微项目编号': project_key,
+                '订单编号': order_code,
+                '订单标题': order_title,
+                '项目编号': _mcn_order_project_code(mcn_order_code) or project_key,
+                '项目名称': project_name,
+                '映射来源': PROJECT_ORDER_MAPPING_SHEETS['订单明细'],
+            })
+
+    if not rows:
+        return _empty_order_candidates_df()
+    return pd.DataFrame(
+        rows,
+        columns=['泛微项目编号', '订单编号', '订单标题', '项目编号', '项目名称', '映射来源'],
+    ).drop_duplicates()
 
 
 def _build_project_order_candidates(mapping_file):
@@ -1699,13 +1884,18 @@ def _build_project_order_candidates(mapping_file):
             })
 
     if not rows:
-        return _empty_order_candidates_df()
-    result_df = pd.DataFrame(
-        rows,
-        columns=['泛微项目编号', '订单编号', '订单标题', '项目编号', '项目名称', '映射来源'],
-    ).drop_duplicates()
+        result_df = _empty_order_candidates_df()
+    else:
+        result_df = pd.DataFrame(
+            rows,
+            columns=['泛微项目编号', '订单编号', '订单标题', '项目编号', '项目名称', '映射来源'],
+        )
+    detail_df = _build_order_detail_candidates(mapping_file)
+    result_df = pd.concat([result_df, detail_df], ignore_index=True).drop_duplicates()
     print(f'[项目订单映射] 可洗订单过滤: {len(order_df)}/{before_count} 行')
-    return result_df
+    return result_df[
+        ['泛微项目编号', '订单编号', '订单标题', '项目编号', '项目名称', '映射来源']
+    ]
 
 
 def load_project_order_mapping():
@@ -2070,14 +2260,23 @@ def attach_budget_issue_columns(sheets, budget_map, doc_columns=BUDGET_ISSUE_DOC
 
 
 # ============================ Excel 输出 ============================
+def _clean_cell_value(value):
+    """Excel(openpyxl)不允许的控制字符会报 IllegalCharacterError, 写入前剔除。"""
+    if pd.isna(value):
+        return ''
+    if isinstance(value, str):
+        return ILLEGAL_CHARACTERS_RE.sub('', value)
+    return value
+
+
 def _fill_sheet(worksheet, output_df):
     """把 output_df 按列顺序写进 worksheet(保留表头样式,清空旧数据行)。"""
     for col_idx, column_name in enumerate(output_df.columns, start=1):
         worksheet.cell(row=1, column=col_idx).value = column_name
     if worksheet.max_row > 1:
         worksheet.delete_rows(2, worksheet.max_row)
-    for _, row in output_df.iterrows():
-        worksheet.append(['' if pd.isna(v) else v for v in row.tolist()])
+    for row in output_df.itertuples(index=False, name=None):
+        worksheet.append([_clean_cell_value(v) for v in row])
 
 
 def write_to_template(output_df, template_path, output_path, sheet_name):
@@ -2089,12 +2288,22 @@ def write_to_template(output_df, template_path, output_path, sheet_name):
     return output_path
 
 
-def write_template_sheets(template_path, output_path, sheet_to_df):
-    """一次把多个 sheet 写进同一个导入模版(保留各表头与 lov 页)。
-    sheet_to_df: {sheet名: DataFrame};DataFrame 列顺序需与该 sheet 表头一致(列名不影响)。"""
+def write_template_sheets(template_path, output_path, sheet_to_df, extra_sheets=None):
+    """一次把多个 sheet 写进同一个导入模版(保留各表头与 lov 页),单次加载/保存。
+
+    sheet_to_df: {sheet名: DataFrame};写入模版已有 sheet(列顺序需与表头一致)。
+    extra_sheets: {sheet名: DataFrame};新建 sheet(如核对页),避免重复 load/save 大文件。
+    """
     wb = load_workbook(template_path)
     for sheet_name, output_df in sheet_to_df.items():
         _fill_sheet(wb[sheet_name], output_df)
+    for sheet_name, output_df in (extra_sheets or {}).items():
+        if sheet_name in wb.sheetnames:
+            del wb[sheet_name]
+        worksheet = wb.create_sheet(sheet_name)
+        worksheet.append([_clean_cell_value(c) for c in output_df.columns])
+        for row in output_df.itertuples(index=False, name=None):
+            worksheet.append([_clean_cell_value(v) for v in row])
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
     return output_path

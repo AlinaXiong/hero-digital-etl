@@ -1,5 +1,55 @@
 [
   {
+    "供应商泛微Id": "1005",
+    "供应商名称": "深圳市乾派文化传播有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "826",
+    "handVendorCode": "V-C-CN-OT-OTH-0103",
+    "handVendorName": "深圳市乾派文化传播有限公司",
+    "handTaxpayerName": "深圳市乾派文化传播有限公司"
+  },
+  {
+    "供应商泛微Id": "1013",
+    "供应商名称": "仟传网络科技(上海)有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "848",
+    "handVendorCode": "V-C-CN-OT-OTH-0119",
+    "handVendorName": "仟传网络科技（上海）有限公司",
+    "handTaxpayerName": "仟传网络科技（上海）有限公司"
+  },
+  {
+    "供应商泛微Id": "1017",
+    "供应商名称": "深圳市小象互娱文化娱乐有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "715",
+    "handVendorCode": "V-C-CN-OT-OTH-0018",
+    "handVendorName": "深圳市小象互娱文化娱乐有限公司",
+    "handTaxpayerName": "深圳市小象互娱文化娱乐有限公司"
+  },
+  {
+    "供应商泛微Id": "1032",
+    "供应商名称": "苏州蔚来海岸创业服务有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "727",
+    "handVendorCode": "V-C-CN-OT-OTH-0027",
+    "handVendorName": "苏州蔚来海岸创业服务有限公司",
+    "handTaxpayerName": "苏州蔚来海岸创业服务有限公司"
+  },
+  {
+    "供应商泛微Id": "10608",
+    "供应商名称": "杨威",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "18852",
+    "handVendorCode": "V-I-CN-OT-OTH-3868",
+    "handVendorName": "杨威",
+    "handTaxpayerName": "杨威"
+  },
+  {
     "供应商泛微Id": "11322",
     "供应商名称": "海南虎牙娱乐信息技术有限公司",
     "泛微状态": "1",
@@ -8,6 +58,96 @@
     "handVendorCode": "V-C-CN-OT-OTH-0151",
     "handVendorName": "海南虎牙娱乐信息技术有限公司",
     "handTaxpayerName": "海南虎牙娱乐信息技术有限公司"
+  },
+  {
+    "供应商泛微Id": "11924",
+    "供应商名称": "深圳市众乐互娱网络有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "2384",
+    "handVendorCode": "V-C-CN-MC-ADV-0006",
+    "handVendorName": "深圳市众乐互娱网络有限公司",
+    "handTaxpayerName": "深圳市众乐互娱网络有限公司"
+  },
+  {
+    "供应商泛微Id": "11927",
+    "供应商名称": "VSPN MALAYSIA SDN BHD",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "18235",
+    "handVendorCode": "006000",
+    "handVendorName": "VSPN MALAYSIA SDN.BHD.",
+    "handTaxpayerName": "VSPN MALAYSIA SDN. BHD."
+  },
+  {
+    "供应商泛微Id": "12458",
+    "供应商名称": "上海正策律师事务所",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "2740",
+    "handVendorCode": "V-C-CN-OT-IPC-0013",
+    "handVendorName": "上海正策律师事务所",
+    "handTaxpayerName": "上海正策律师事务所"
+  },
+  {
+    "供应商泛微Id": "12918",
+    "供应商名称": "杨倩",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "2912",
+    "handVendorCode": "V-I-CN-OT-OTH-0309",
+    "handVendorName": "杨倩",
+    "handTaxpayerName": "杨倩"
+  },
+  {
+    "供应商泛微Id": "16480",
+    "供应商名称": "Company Falcon Sport",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "17534",
+    "handVendorCode": "V-C-CN-SP-TAL-0120",
+    "handVendorName": "Company Falcon Sport",
+    "handTaxpayerName": "Company Falcon Sport"
+  },
+  {
+    "供应商泛微Id": "1851",
+    "供应商名称": "海南新竞界网络服务有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "769",
+    "handVendorCode": "V-C-CN-OT-OTH-0056",
+    "handVendorName": "海南新竞界网络服务有限公司",
+    "handTaxpayerName": "海南新竞界网络服务有限公司"
+  },
+  {
+    "供应商泛微Id": "18682",
+    "供应商名称": "成都竞涌文化传播有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "18706",
+    "handVendorCode": "044000",
+    "handVendorName": "成都竞涌文化传播有限公司",
+    "handTaxpayerName": "成都竞涌文化传播有限公司"
+  },
+  {
+    "供应商泛微Id": "1953",
+    "供应商名称": "上海哔哩哔哩电竞信息科技有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "759",
+    "handVendorCode": "V-C-CN-SP-TAL-0001",
+    "handVendorName": "上海哔哩哔哩电竞信息科技有限公司",
+    "handTaxpayerName": "上海哔哩哔哩电竞信息科技有限公司"
+  },
+  {
+    "供应商泛微Id": "2085",
+    "供应商名称": "朱超",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "1845",
+    "handVendorCode": "V-I-CN-OT-OTH-0041",
+    "handVendorName": "朱超",
+    "handTaxpayerName": "朱超"
   },
   {
     "供应商泛微Id": "2703",
@@ -20,6 +160,106 @@
     "handTaxpayerName": "诺泰文化传媒工作室"
   },
   {
+    "供应商泛微Id": "2894",
+    "供应商名称": "北京微梦传媒股份有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "10883",
+    "handVendorCode": "V-C-CN-MC-ADV-0023",
+    "handVendorName": "北京微梦传媒股份有限公司",
+    "handTaxpayerName": "北京微梦传媒股份有限公司"
+  },
+  {
+    "供应商泛微Id": "2940",
+    "供应商名称": "上海千亦麒建筑装饰工程有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "9683",
+    "handVendorCode": "V-C-CN-OT-OTH-3960",
+    "handVendorName": "上海千亦麒建筑装饰工程有限公司",
+    "handTaxpayerName": "上海千亦麒建筑装饰工程有限公司"
+  },
+  {
+    "供应商泛微Id": "2943",
+    "供应商名称": "北京易成时代科技有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "8130",
+    "handVendorCode": "V-C-CN-OT-OTH-3484",
+    "handVendorName": "北京易成时代科技有限公司",
+    "handTaxpayerName": "北京易成时代科技有限公司"
+  },
+  {
+    "供应商泛微Id": "2999",
+    "供应商名称": "奥禹特文化发展有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "10173",
+    "handVendorCode": "V-C-CN-SP-SMC-0012",
+    "handVendorName": "奥禹特文化发展有限公司",
+    "handTaxpayerName": "奥禹特文化发展有限公司"
+  },
+  {
+    "供应商泛微Id": "3023",
+    "供应商名称": "南京竞灵文化创意有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "8026",
+    "handVendorCode": "V-C-CN-SP-TAL-0019",
+    "handVendorName": "南京竞灵文化创意有限公司",
+    "handTaxpayerName": "南京竞灵文化创意有限公司"
+  },
+  {
+    "供应商泛微Id": "3029",
+    "供应商名称": "北石可染(无锡)影视文化有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "10827",
+    "handVendorCode": "V-C-CN-SP-CON-0046",
+    "handVendorName": "北石可染（无锡）影视文化有限公司",
+    "handTaxpayerName": "北石可染（无锡）影视文化有限公司"
+  },
+  {
+    "供应商泛微Id": "3089",
+    "供应商名称": "上海起浪市场营销有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "10326",
+    "handVendorCode": "V-C-CN-OT-OTH-4151",
+    "handVendorName": "上海起浪市场营销有限公司",
+    "handTaxpayerName": "上海起浪市场营销有限公司"
+  },
+  {
+    "供应商泛微Id": "5957",
+    "供应商名称": "上饶市天同文化传播有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "23139",
+    "handVendorCode": "V-C-CN-OT-OTH-6842",
+    "handVendorName": "上饶市天同文化传播有限公司",
+    "handTaxpayerName": "上饶市天同文化传播有限公司"
+  },
+  {
+    "供应商泛微Id": "6375",
+    "供应商名称": "上海竞综文化传媒有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "1670",
+    "handVendorCode": "V-C-CN-OT-OTH-0260",
+    "handVendorName": "上海竞综文化传媒有限公司",
+    "handTaxpayerName": "上海竞综文化传媒有限公司"
+  },
+  {
+    "供应商泛微Id": "786",
+    "供应商名称": "腾讯云计算(北京)有限责任公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "5336",
+    "handVendorCode": "V-C-CN-IT-CLO-0001",
+    "handVendorName": "腾讯云计算（北京）有限责任公司",
+    "handTaxpayerName": "腾讯云计算（北京）有限责任公司"
+  },
+  {
     "供应商泛微Id": "809",
     "供应商名称": "上海厚翰信息科技有限公司",
     "泛微状态": "1",
@@ -28,5 +268,15 @@
     "handVendorCode": "002000",
     "handVendorName": "上海厚翰信息科技有限公司",
     "handTaxpayerName": "上海厚翰信息科技有限公司"
+  },
+  {
+    "供应商泛微Id": "9077",
+    "供应商名称": "陈三姝",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "15485",
+    "handVendorCode": "V-I-CN-SP-TPS-0117",
+    "handVendorName": "陈三姝",
+    "handTaxpayerName": "陈三姝"
   }
 ]

@@ -16,6 +16,8 @@
 | `ar_invoice_opening` | 应收期初 - 应收报账单 | 开票记录 + 收款登记 | 应收报账单期初数据导入模板 |
 | `ar_invoice_opening_db` | 应收期初 - 应收报账单(DB直连版) | 泛微 `uf_xtyykp` + `uf_skdj` | 应收报账单期初数据导入模板 |
 | `contract_anchor_db` | 合同迁移 - 智书主播流程(DB直连版) | 泛微 `uf_htk` + `uf_zbkp` / `uf_zbkp_dt1` | 智书合同字段-主播流程 |
+| `contract_general_db` | 合同迁移 - 智书一般流程(DB直连版) | 泛微 `uf_htk` + 项目&订单清洗表 | 智书合同字段-一般流程 |
+| `contract_general_attachments_db` | 合同迁移 - 一般流程附件下载(DB直连版) | 泛微 `uf_htk` + `workflow_docshareinfo` / `docimagefile` | 合同初稿/合同签署稿/合同生效稿 |
 | `invoice_info_db` | 发票信息(DB直连版) | 泛微 `fnainvoiceledger` + `fnainvoiceledgerdtl` | 发票信息清洗导入表 |
 | `all` | 一次跑核心 DB 导入任务 | 依次执行 `ap_payment_opening_extra_db`、`ap_prepayment_opening_db`、`ar_invoice_opening_db`、`invoice_info_db` | 多个模板/清洗表 |
 
@@ -112,6 +114,26 @@ DB 直连版源数据不读 Excel；供应商预付从泛微 `uf_yfkxx` / `uf_yf
 - **关键映射**：合同执行人、合同状态/二级类型/所属平台枚举、主播身份证/战队/签约金等从主播卡片补充；对方主体按客户/供应商分别映射到中台编码；我方主体按合同用印范围映射到核算主体编码。
 - **默认值**：计价方式=固定总价，合同期限类型=固定期限，是否需要验收=否，打印模式=黑白双面打印，签约形式=纸质签约-不限制我方/对方先签约，盖章份数=3。
 - **产出**：`output/contract_anchor_db/智书合同字段_主播流程_合同迁移_<YYYYMMDD>.xlsx`。
+
+### contract_general_db（合同迁移 - 智书一般流程 DB 直连版）
+
+按法务映射规则和「智书合同字段-一般流程」模板，把泛微非主播合同库清洗成智书一般流程导入数据。
+
+- **源表**：泛微 `uf_htk` 主表；项目/订单字段按公共项目&订单清洗表映射。
+- **行过滤**：排除合同类型=主播协议，保留合同签署状态 ∈ {审批完成, 已归档}。
+- **输出 sheet**：`字段模板`、`关联合同`、`相关单据-订单信息`、`采购申请`、`订单信息明细`、`对方信息`、`我方主体列表`、`付款计划`、`收款计划`、`合同附件`、`其他附件`；`选项` 和 `DropdownOptions` 保留模板原样。
+- **关键映射**：合同二级分类按《合同数据迁移-二级分类映射规则》由合同编号前缀、项目/标题关键词和主体信息推导；合同执行人取工号；对方/我方主体映射到中台编码；订单字段按项目&订单清洗表一对一回填。
+- **合同附件**：`合同附件` sheet 只写附件名称，不执行文件下载；附件下载单独运行 `python run.py contract_general_attachments_db`。
+- **产出**：`output/contract_general_db/智书合同字段_一般流程_<YYYYMMDD>.xlsx`。
+
+### contract_general_attachments_db（一般流程合同附件下载 DB 直连版）
+
+单独下载一般流程合同附件，不影响 `contract_general_db` 的 Excel 生成。
+
+- **附件来源**：`uf_htk.htqdg` 作为合同生效稿兜底；结合 `workflow_docshareinfo` 最终节点文档补充合同初稿/合同签署稿。
+- **目录结构**：`output/contract_general_db/一般流程合同附件_<YYYYMMDD>/<合同编码>/合同初稿|合同签署稿|合同生效稿/附件文件`。
+- **配置**：`.env` 填 `WEAVER_CONTRACT_ATTACHMENT_COOKIE` 后运行；为空时只生成下载清单。
+- **产出清单**：`output/contract_general_db/一般流程合同附件下载清单_<YYYYMMDD>.xlsx`。
 
 ## 公共清洗口径
 

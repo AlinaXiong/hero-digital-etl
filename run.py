@@ -13,6 +13,7 @@ from datetime import datetime
 from etl import common as c
 
 from etl.tasks import (
+    anti_bribery_signers_db,
     ap_payment_opening,
     ap_payment_opening_db,
     ap_payment_opening_extra_db,
@@ -21,11 +22,14 @@ from etl.tasks import (
     ar_invoice_opening,
     ar_invoice_opening_db,
     contract_anchor_db,
+    contract_general_attachments_db,
+    contract_general_db,
     invoice_info_db,
 )
 
 # 登记任务:任务名 -> run 函数。新增任务在这里加一行。
 TASKS = {
+    'anti_bribery_signers_db': anti_bribery_signers_db.run,  # 反商业贿赂协议签署情况补登(DB直连版)
     'ap_payment_opening': ap_payment_opening.run,         # 应付期初 对公付款单
     'ap_payment_opening_db': ap_payment_opening_db.run,   # 应付期初 对公付款单(DB直连版)
     'ap_payment_opening_extra_db': ap_payment_opening_extra_db.run,  # 应付期初 批量费用流程/只转入外部成本(DB直连版)
@@ -34,6 +38,8 @@ TASKS = {
     'ar_invoice_opening': ar_invoice_opening.run,         # 应收期初 应收报账单
     'ar_invoice_opening_db': ar_invoice_opening_db.run,   # 应收期初 应收报账单(DB直连版)
     'contract_anchor_db': contract_anchor_db.run,         # 合同迁移 主播流程(DB直连版)
+    'contract_general_attachments_db': contract_general_attachments_db.run,  # 合同迁移 一般流程附件下载(DB直连版)
+    'contract_general_db': contract_general_db.run,       # 合同迁移 一般流程(DB直连版)
     'invoice_info_db': invoice_info_db.run,               # 发票信息(DB直连版)
 }
 
