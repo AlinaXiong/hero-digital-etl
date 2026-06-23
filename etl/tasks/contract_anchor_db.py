@@ -416,6 +416,43 @@ def _set(row, field_name, value):
     raise KeyError(f'模板缺少字段: {field_name}')
 
 
+def _chunked(items, size=5000):
+    batch = []
+    for item in items:
+        batch.append(item)
+        if len(batch) >= size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def build_feishu_employee_id_map(code_values):
+    """员工工号(V编号) -> 飞书 user_id。
+
+    来源: 汉得 hfins_base.hfbs_employee.feishu_employee_id, 按 employee_code(员工编号)关联。
+    泛微侧的工号取自 hrmjobtitles.JOBTITLENAME(即 `合同执行人员工号`), 与汉得 employee_code 同口径。
+    """
+    codes = c.clean_codes(_text(code) for code in code_values if _text(code))
+    if not codes:
+        return {}
+    result = {}
+    for batch in _chunked(sorted(set(codes))):
+        df = c.query_db(
+            'ZT',
+            'hfins_base',
+            'SELECT employee_code, feishu_employee_id FROM hfbs_employee '
+            f'WHERE employee_code IN ({c.in_placeholders(batch)})',
+            batch,
+        )
+        for _, row in df.iterrows():
+            code = _text(row.get('employee_code'))
+            feishu_id = _text(row.get('feishu_employee_id'))
+            if code and feishu_id:
+                result[code] = feishu_id
+    return result
+
+
 def build_fw_project_info_map_for_ids(project_values):
     """泛微项目浏览框 ID -> 泛微项目编号/名称,兼容历史项目表。"""
     project_ids = c.clean_codes(
@@ -1475,6 +1512,10 @@ def resolve_source_values(source_df):
     df['订单编号'] = df['合同所属项目编号'].map(contract_order_mapping_value)
     df['合同执行人员'] = df['合同执行人员ID'].map(
         lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
+    df['合同执行人员工号'] = df['合同执行人员ID'].map(
+        lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
+    feishu_id_map = build_feishu_employee_id_map(df['合同执行人员工号'])
+    df['合同执行人飞书ID'] = df['合同执行人员工号'].map(lambda code: feishu_id_map.get(_text(code), ''))
     df['合同一级类型判定'] = df.apply(
         lambda row: _contract_type_label(row['合同类型'], row['合同二级类型']),
         axis=1,
@@ -1608,6 +1649,8 @@ def build_main_output(source_df, headers):
         _set(row, 'custom_15_78cf503c57194e4fb8ad03ded1c4ad60（打印模式）', DEFAULT_PRINT_MODE)
         _set(row, 'custom_10_9a2a0e99771346c98bfb6cfb893e1bee（签署日期）', c.format_date(source['合同签订日期']))
         _set(row, 'custom_1001_948719050bfe402ab083c98e52fa71b2（合同执行人）', _text(source['合同执行人员']))
+        _set(row, 'custom_1001_948719050bfe402ab083c98e52fa71b2（合同执行人）飞书user_id',
+             _text(source['合同执行人飞书ID']))
         _set(row, 'custom_1024_61820798c0f348658d8daa64f8b2aef9（主播卡片）',
              source['主播卡片导入ID'])
         _set(row, 'custom_1_ab6f99ee02e549469ec5b2d4a5a98452（主播姓名）',

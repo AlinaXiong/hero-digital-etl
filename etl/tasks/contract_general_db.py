@@ -81,7 +81,7 @@ DEFAULT_PRINT_MODE = '黑白单面打印'
 DEFAULT_INVOICE_TYPE = '增值税专用发票'
 # 税率按百分数口径(13 = 13%); 赛事源直接取 srsl/zcsl, 仅在源无值时用此兜底默认(6%)。
 DEFAULT_TAX_RATE = '6'
-DEFAULT_TAX_ITEM = '其他'
+DEFAULT_TAX_ITEM = '生产生活服务'
 DEFAULT_BANK_FEE_BEARER = '各自承担'
 DEFAULT_FIRST_SEAL_PARTY = '我方'
 DEFAULT_SIGN_FORM = '纸质签约'
@@ -1602,7 +1602,7 @@ def build_main_output(source_df, headers):
         _set(row, 'custom_15_b293866468ac4ab4bb11b5cb8c9bbb37（支出税目）', DEFAULT_TAX_ITEM)
         _set(row, 'custom_15_e46e1f9b6eb0469987f0656a999cdf09（银行手续费承担方）',
              DEFAULT_BANK_FEE_BEARER)
-        deposit_amount = _round_amount(source.get('押金')) or _round_amount(source.get('保证金'))
+        deposit_amount = (_round_amount(source.get('押金')) or 0) + (_round_amount(source.get('保证金')) or 0)
         _set(row, 'custom_1012_7e2c970e63f648268eaefbd13d6bfc8f（押金/保证金）',
              deposit_amount if deposit_amount else '')
         _set(row, 'sign_type_code（先盖章方）', DEFAULT_FIRST_SEAL_PARTY)
