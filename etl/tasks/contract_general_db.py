@@ -79,11 +79,12 @@ DEFAULT_VALIDITY_TYPE = '固定期限'
 DEFAULT_ACCEPTANCE_REQUIRED = '否'
 DEFAULT_PRINT_MODE = '黑白单面打印'
 DEFAULT_INVOICE_TYPE = '增值税专用发票'
-DEFAULT_TAX_RATE = '0.06'
+# 税率按百分数口径(13 = 13%); 赛事源直接取 srsl/zcsl, 仅在源无值时用此兜底默认(6%)。
+DEFAULT_TAX_RATE = '6'
 DEFAULT_TAX_ITEM = '其他'
 DEFAULT_BANK_FEE_BEARER = '各自承担'
 DEFAULT_FIRST_SEAL_PARTY = '我方'
-DEFAULT_SIGN_FORM = '纸质签约-不限制我方/对方先签约'
+DEFAULT_SIGN_FORM = '纸质签约'
 DEFAULT_SEAL_NUMBER = 2
 DEFAULT_PREPAID = '否'
 DEFAULT_PAYMENT_NATURE = '一般付款'
@@ -153,6 +154,11 @@ SELECT
     h.bczzbhsc AS `补充/终止编号生成`,
     h.htszxmbh AS `合同所属项目编号ID`,
     h.htszxm AS `合同所属项目`,
+    NULL AS `收入税率`,
+    NULL AS `支出税率`,
+    NULL AS `押金`,
+    NULL AS `保证金`,
+    NULL AS `采购申请单ID`,
     rb.workflowid AS `流程类型ID`,
     wb.workflowname AS `流程名称`
 FROM uf_htk h
@@ -222,6 +228,11 @@ SELECT
     NULL AS `补充/终止编号生成`,
     h.xmbh AS `合同所属项目编号ID`,
     h.xmmc AS `合同所属项目`,
+    h.srsl AS `收入税率`,
+    h.zcsl AS `支出税率`,
+    h.yj AS `押金`,
+    h.bzj AS `保证金`,
+    h.cgsqddx AS `采购申请单ID`,
     rb.workflowid AS `流程类型ID`,
     wb.workflowname AS `流程名称`
 FROM uf_htsp h
@@ -293,6 +304,21 @@ def _number(value, default=0.0):
 
 def _round_amount(value):
     return round(_number(value), 2)
+
+
+def _format_tax_rate(value):
+    """税率按源库百分数口径输出, 去掉多余的尾随零: 13.00->'13'、1.0000->'1'、13.5->'13.5'。
+
+    空值返回 '', 由调用方决定是否回退默认税率。
+    """
+    text = _text(value)
+    if not text:
+        return ''
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return text
+    return f'{number:.4f}'.rstrip('0').rstrip('.') or '0'
 
 
 @lru_cache(maxsize=8192)
@@ -1102,6 +1128,57 @@ def build_cost_center_platform_map(cost_center_values):
     return result
 
 
+def build_feishu_employee_id_map(code_values):
+    """员工工号(V编号) -> 飞书 user_id。
+
+    来源: 汉得 hfins_base.hfbs_employee.feishu_employee_id, 按 employee_code(员工编号)关联。
+    泛微侧的工号取自 hrmjobtitles.JOBTITLENAME(即 `合同执行人员工号`), 与汉得 employee_code 同口径。
+    """
+    codes = c.clean_codes(_text(code) for code in code_values if _text(code))
+    if not codes:
+        return {}
+    result = {}
+    for batch in _chunked(sorted(set(codes))):
+        df = c.query_db(
+            'ZT',
+            'hfins_base',
+            'SELECT employee_code, feishu_employee_id FROM hfbs_employee '
+            f'WHERE employee_code IN ({c.in_placeholders(batch)})',
+            batch,
+        )
+        for _, row in df.iterrows():
+            code = _text(row.get('employee_code'))
+            feishu_id = _text(row.get('feishu_employee_id'))
+            if code and feishu_id:
+                result[code] = feishu_id
+    return result
+
+
+def build_purchase_request_code_map(values):
+    """采购申请对象ID(uf_htsp.cgsqddx -> uf_cgspxx.id) -> 采购申请单编号(uf_cgspxx.dh)。"""
+    request_ids = c.clean_codes(
+        request_id
+        for value in values
+        for request_id in c.parse_browser_ids(value)
+    )
+    if not request_ids:
+        return {}
+    result = {}
+    for batch in _chunked(sorted(set(request_ids))):
+        df = c.query_db(
+            'FW',
+            'vspn_xtyy',
+            f'SELECT id, dh FROM uf_cgspxx WHERE id IN ({c.in_placeholders(batch)})',
+            batch,
+        )
+        for _, row in df.iterrows():
+            request_id = c.format_code(row['id'])
+            code = _text(row.get('dh'))
+            if request_id and code:
+                result[request_id] = code
+    return result
+
+
 # ============================ 分类 / 金额 ============================
 def _contract_prefix(contract_number):
     text = _text(contract_number).upper()
@@ -1360,6 +1437,17 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
         lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
     df['合同执行人员工号'] = df['合同执行人员ID'].map(
         lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
+    feishu_id_map = _timed('  ├─合同执行人飞书ID映射(汉得)',
+                           lambda: build_feishu_employee_id_map(df['合同执行人员工号']))
+    df['合同执行人飞书ID'] = df['合同执行人员工号'].map(lambda code: feishu_id_map.get(_text(code), ''))
+    purchase_request_map = _timed('  ├─采购申请单编号映射',
+                                  lambda: build_purchase_request_code_map(df.get('采购申请单ID', pd.Series(dtype=object))))
+    df['采购申请单编号'] = df.get('采购申请单ID', pd.Series('', index=df.index)).map(
+        lambda value: ';'.join(
+            purchase_request_map[request_id]
+            for request_id in c.parse_browser_ids(value)
+            if purchase_request_map.get(request_id)
+        ))
     df['泛微项目编号'] = df['合同所属项目编号ID'].map(
         lambda value: _lookup_first_browser_value(project_map, value) or _text(value))
     df['泛微项目名称'] = df['合同所属项目']
@@ -1499,20 +1587,24 @@ def build_main_output(source_df, headers):
         _set(row, 'end_date（合同期限-结束日期）', c.format_date(source['合同有效期截止时间']))
         _set(row, 'remark（合同说明）', _text(source['合同摘要'])[:150])
         _set(row, 'custom_1001_948719050bfe402ab083c98e52fa71b2（合同执行人）飞书user_id',
-             _text(source['合同执行人员工号']))
+             _text(source['合同执行人飞书ID']))
         _set(row, 'custom_15_78cf503c57194e4fb8ad03ded1c4ad60（打印模式）', DEFAULT_PRINT_MODE)
         _set(row, 'custom_10_9a2a0e99771346c98bfb6cfb893e1bee（签署日期）', c.format_date(source['合同签订日期']))
         _set(row, 'custom_15_de8944334b104d52b28d9472ab0584ef（专项品类）', '')
         _set(row, 'custom_13_c9805a6fe9f245ebbfeea13407277306（是否需要验收）', DEFAULT_ACCEPTANCE_REQUIRED)
         _set(row, 'custom_1012_cec7052f613b465980f23f7004e2f82c（采购金额）', out_amount if out_amount else '')
         _set(row, 'custom_15_e5f7b7cb17b34602adf790f0ac8d69a1（发票种类）', DEFAULT_INVOICE_TYPE)
-        _set(row, 'custom_15_7b0d0e2f63a148729f929ba985c227c2（收入税率）', DEFAULT_TAX_RATE)
+        _set(row, 'custom_15_7b0d0e2f63a148729f929ba985c227c2（收入税率）',
+             _format_tax_rate(source.get('收入税率')) or DEFAULT_TAX_RATE)
         _set(row, 'custom_15_b293866468ac4ab4bb11b5cb8c9bbb37（收入税目）', DEFAULT_TAX_ITEM)
-        _set(row, 'custom_15_7b0d0e2f63a148729f929ba985c227c2（支出税率）', DEFAULT_TAX_RATE)
+        _set(row, 'custom_15_7b0d0e2f63a148729f929ba985c227c2（支出税率）',
+             _format_tax_rate(source.get('支出税率')) or DEFAULT_TAX_RATE)
         _set(row, 'custom_15_b293866468ac4ab4bb11b5cb8c9bbb37（支出税目）', DEFAULT_TAX_ITEM)
         _set(row, 'custom_15_e46e1f9b6eb0469987f0656a999cdf09（银行手续费承担方）',
              DEFAULT_BANK_FEE_BEARER)
-        _set(row, 'custom_1012_7e2c970e63f648268eaefbd13d6bfc8f（押金/保证金）', '')
+        deposit_amount = _round_amount(source.get('押金')) or _round_amount(source.get('保证金'))
+        _set(row, 'custom_1012_7e2c970e63f648268eaefbd13d6bfc8f（押金/保证金）',
+             deposit_amount if deposit_amount else '')
         _set(row, 'sign_type_code（先盖章方）', DEFAULT_FIRST_SEAL_PARTY)
         _set(row, 'sign_type_code（签约形式）', DEFAULT_SIGN_FORM)
         _set(row, 'seal_number（盖章份数）待确认必填项', DEFAULT_SEAL_NUMBER)
@@ -1559,7 +1651,18 @@ def build_related_order_output(source_df, headers):
 
 
 def build_purchase_request_output(source_df, headers):
-    return pd.DataFrame(columns=headers)
+    rows = []
+    for source in source_df.to_dict('records'):
+        contract_number = _text(source['合同编号'])
+        for code in _text(source.get('采购申请单编号')).split(';'):
+            code = code.strip()
+            if not code:
+                continue
+            row = _new_row(headers)
+            _set(row, 'contract_number（合同编码）', contract_number)
+            _set(row, 'custom_1024_7db9a8ee2b3d4a3f9d9835dd9fee69df（采购申请）', code)
+            rows.append(row)
+    return pd.DataFrame(rows, columns=headers)
 
 
 def build_order_detail_output(source_df, headers):
@@ -1859,7 +1962,7 @@ MAIN_ISSUE_SOURCE_FIELDS = {
     'contract_number（合同编码）': '合同编号',
     'contract_name（合同名称）': '合同标题',
     'contractCategory(智书框架合同类型)': '合同分类依据',
-    'custom_1001_948719050bfe402ab083c98e52fa71b2（合同执行人）飞书user_id': '合同执行人员ID',
+    'custom_1001_948719050bfe402ab083c98e52fa71b2（合同执行人）飞书user_id': '合同执行人员工号',
     'start_date（合同期限-开始日期）': '合同有效期起始时间',
     'end_date（合同期限-结束日期）': '合同有效期截止时间',
     'remark（合同说明）': '合同摘要',
@@ -1986,7 +2089,8 @@ def run():
             {'字段': 'custom_13_c9805a6fe9f245ebbfeea13407277306（是否需要验收）', '默认值': DEFAULT_ACCEPTANCE_REQUIRED},
             {'字段': 'custom_15_78cf503c57194e4fb8ad03ded1c4ad60（打印模式）', '默认值': DEFAULT_PRINT_MODE},
             {'字段': 'custom_15_e5f7b7cb17b34602adf790f0ac8d69a1（发票种类）', '默认值': DEFAULT_INVOICE_TYPE},
-            {'字段': 'custom_15_7b0d0e2f63a148729f929ba985c227c2（收入/支出税率）', '默认值': DEFAULT_TAX_RATE},
+            {'字段': 'custom_15_7b0d0e2f63a148729f929ba985c227c2（收入/支出税率）',
+             '默认值': f'赛事取源值srsl/zcsl(百分数), 无源值时默认 {DEFAULT_TAX_RATE}'},
             {'字段': 'custom_15_b293866468ac4ab4bb11b5cb8c9bbb37（收入/支出税目）', '默认值': DEFAULT_TAX_ITEM},
             {'字段': 'custom_15_e46e1f9b6eb0469987f0656a999cdf09（银行手续费承担方）', '默认值': DEFAULT_BANK_FEE_BEARER},
             {'字段': 'sign_type_code（先盖章方）', '默认值': DEFAULT_FIRST_SEAL_PARTY},
