@@ -106,6 +106,7 @@ SELECT
     h.bczzbhsc AS `补充/终止编号生成`,
     h.htszxmbh AS `合同所属项目编号ID`,
     h.htszxm AS `合同所属项目`,
+    h.modedatacreater AS `合同创建人ID`,
     rb.workflowid AS `流程类型ID`,
     wb.workflowname AS `流程名称`
 FROM uf_htk h
@@ -1471,7 +1472,8 @@ def resolve_source_values(source_df):
         FW_TABLE,
         ['htlx', 'htejlx', 'htzt', 'szpt', 'bglx'],
     )
-    employee_map = c.build_fw_employee_info_map_for_ids(df['合同执行人员ID'])
+    employee_map = c.build_fw_employee_info_map_for_ids(
+        pd.concat([df['合同执行人员ID'], df['合同创建人ID']], ignore_index=True))
     company_info_map = build_fw_company_info_map_for_values(df['合同用印范围ID'])
     customer_info_map = build_customer_info_map_for_values(df['合同客户ID'])
     supplier_info_map = build_supplier_info_map_for_values(df['合同供应商ID'])
@@ -1514,8 +1516,14 @@ def resolve_source_values(source_df):
         lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
     df['合同执行人员工号'] = df['合同执行人员ID'].map(
         lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
-    feishu_id_map = build_feishu_employee_id_map(df['合同执行人员工号'])
+    df['合同创建人'] = df['合同创建人ID'].map(
+        lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
+    df['合同创建人工号'] = df['合同创建人ID'].map(
+        lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
+    feishu_id_map = build_feishu_employee_id_map(
+        pd.concat([df['合同执行人员工号'], df['合同创建人工号']], ignore_index=True))
     df['合同执行人飞书ID'] = df['合同执行人员工号'].map(lambda code: feishu_id_map.get(_text(code), ''))
+    df['合同创建人user_id'] = df['合同创建人工号'].map(lambda code: feishu_id_map.get(_text(code), ''))
     df['合同一级类型判定'] = df.apply(
         lambda row: _contract_type_label(row['合同类型'], row['合同二级类型']),
         axis=1,
@@ -1651,6 +1659,8 @@ def build_main_output(source_df, headers):
         _set(row, 'custom_1001_948719050bfe402ab083c98e52fa71b2（合同执行人）', _text(source['合同执行人员']))
         _set(row, 'custom_1001_948719050bfe402ab083c98e52fa71b2（合同执行人）飞书user_id',
              _text(source['合同执行人飞书ID']))
+        _set(row, '合同创建人', _text(source['合同创建人']))
+        _set(row, '合同创建人user_id', _text(source['合同创建人user_id']))
         _set(row, 'custom_1024_61820798c0f348658d8daa64f8b2aef9（主播卡片）',
              source['主播卡片导入ID'])
         _set(row, 'custom_1_ab6f99ee02e549469ec5b2d4a5a98452（主播姓名）',

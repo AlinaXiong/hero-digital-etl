@@ -159,6 +159,7 @@ SELECT
     NULL AS `押金`,
     NULL AS `保证金`,
     NULL AS `采购申请单ID`,
+    h.modedatacreater AS `合同创建人ID`,
     rb.workflowid AS `流程类型ID`,
     wb.workflowname AS `流程名称`
 FROM uf_htk h
@@ -233,6 +234,7 @@ SELECT
     h.yj AS `押金`,
     h.bzj AS `保证金`,
     h.cgsqddx AS `采购申请单ID`,
+    h.modedatacreater AS `合同创建人ID`,
     rb.workflowid AS `流程类型ID`,
     wb.workflowname AS `流程名称`
 FROM uf_htsp h
@@ -1417,7 +1419,8 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
         option_table,
         ['htlx', 'htejlx', 'htzt', 'bglx'],
     )
-    employee_map = _timed('  ├─员工映射', lambda: c.build_fw_employee_info_map_for_ids(df['合同执行人员ID']))
+    employee_map = _timed('  ├─员工映射', lambda: c.build_fw_employee_info_map_for_ids(
+        pd.concat([df['合同执行人员ID'], df['合同创建人ID']], ignore_index=True)))
     company_info_map = _timed('  ├─我方主体映射', lambda: build_fw_company_info_map_for_values(df['合同用印范围ID']))
     customer_info_map = _timed('  ├─客户映射', lambda: build_customer_info_map_for_values(df['合同客户ID']))
     supplier_info_map = _timed('  ├─供应商映射(汉得匹配)', lambda: build_supplier_info_map_for_values(df['合同供应商ID']))
@@ -1437,9 +1440,15 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
         lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
     df['合同执行人员工号'] = df['合同执行人员ID'].map(
         lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
-    feishu_id_map = _timed('  ├─合同执行人飞书ID映射(汉得)',
-                           lambda: build_feishu_employee_id_map(df['合同执行人员工号']))
+    df['合同创建人'] = df['合同创建人ID'].map(
+        lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
+    df['合同创建人工号'] = df['合同创建人ID'].map(
+        lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
+    feishu_id_map = _timed('  ├─合同执行人/创建人飞书ID映射(汉得)',
+                           lambda: build_feishu_employee_id_map(
+                               pd.concat([df['合同执行人员工号'], df['合同创建人工号']], ignore_index=True)))
     df['合同执行人飞书ID'] = df['合同执行人员工号'].map(lambda code: feishu_id_map.get(_text(code), ''))
+    df['合同创建人user_id'] = df['合同创建人工号'].map(lambda code: feishu_id_map.get(_text(code), ''))
     purchase_request_map = _timed('  ├─采购申请单编号映射',
                                   lambda: build_purchase_request_code_map(df.get('采购申请单ID', pd.Series(dtype=object))))
     df['采购申请单编号'] = df.get('采购申请单ID', pd.Series('', index=df.index)).map(
@@ -1588,6 +1597,9 @@ def build_main_output(source_df, headers):
         _set(row, 'remark（合同说明）', _text(source['合同摘要'])[:150])
         _set(row, 'custom_1001_948719050bfe402ab083c98e52fa71b2（合同执行人）飞书user_id',
              _text(source['合同执行人飞书ID']))
+        _set(row, '合同执行人', _text(source['合同执行人员']))
+        _set(row, '合同创建人', _text(source['合同创建人']))
+        _set(row, '合同创建人user_id', _text(source['合同创建人user_id']))
         _set(row, 'custom_15_78cf503c57194e4fb8ad03ded1c4ad60（打印模式）', DEFAULT_PRINT_MODE)
         _set(row, 'custom_10_9a2a0e99771346c98bfb6cfb893e1bee（签署日期）', c.format_date(source['合同签订日期']))
         _set(row, 'custom_15_de8944334b104d52b28d9472ab0584ef（专项品类）', '')
