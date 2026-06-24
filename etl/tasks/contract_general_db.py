@@ -40,6 +40,9 @@ DATE_SUFFIX = c.today_suffix()
 
 TEMPLATE_FILE = TEMPLATE_DIR / '智书合同字段-一般流程.xlsx'
 RULE_CSV = c.RULES_DIR / '业财项目_数据映射规则 - 合同数据映射规则-for法务.csv'
+# 专项品类映射: 泛微采购品类树(uf_xt_cgpldy)叶子 -> 原一级/二级/三级路径 -> 终版二级分类。
+SPECIAL_CATEGORY_CSV = c.RULES_DIR / '预算项&项目类型底稿 - 供应商分类【新旧mapping】.csv'
+SPECIAL_CATEGORY_TABLE = 'uf_xt_cgpldy'
 OUTPUT_FILE = OUTPUT_DIR / f'智书合同字段_一般流程_{DATE_SUFFIX}.xlsx'
 EXCEPTION_FILE = OUTPUT_DIR / f'未匹配清单_一般流程_{DATE_SUFFIX}.xlsx'
 
@@ -159,6 +162,7 @@ SELECT
     NULL AS `押金`,
     NULL AS `保证金`,
     NULL AS `采购申请单ID`,
+    NULL AS `专项分类编码`,
     h.modedatacreater AS `合同创建人ID`,
     rb.workflowid AS `流程类型ID`,
     wb.workflowname AS `流程名称`
@@ -234,6 +238,7 @@ SELECT
     h.yj AS `押金`,
     h.bzj AS `保证金`,
     h.cgsqddx AS `采购申请单ID`,
+    h.zxflcg AS `专项分类编码`,
     h.modedatacreater AS `合同创建人ID`,
     rb.workflowid AS `流程类型ID`,
     wb.workflowname AS `流程名称`
@@ -1412,6 +1417,91 @@ def resolve_amounts(row):
     return round(amount, 2), round(in_amount, 2), round(out_amount, 2)
 
 
+# ============================ 专项品类映射 ============================
+_SPECIAL_CATEGORY_CACHE = None
+
+
+def _strip_category_suffix(value):
+    """去掉终版二级分类的英文后缀, 如 '市场调研及数据分析-RES' -> '市场调研及数据分析'。"""
+    return re.sub(r'-[A-Za-z]+$', '', _text(value))
+
+
+def build_special_category_path_map():
+    """泛微采购品类树(uf_xt_cgpldy): 叶子id -> [一级, 二级, 三级] 名称链(沿 sjpl 上溯)。"""
+    tree = c.query_db('FW', 'vspn_xtyy', f'SELECT id, plmc, sjpl FROM {SPECIAL_CATEGORY_TABLE}')
+    name = {}
+    parent = {}
+    for _, row in tree.iterrows():
+        node_id = c.format_code(row['id'])
+        if not node_id:
+            continue
+        name[node_id] = _text(row['plmc'])
+        parent[node_id] = c.format_code(row['sjpl']) or None
+    path_map = {}
+    for node_id in name:
+        parts = []
+        cur = node_id
+        seen = set()
+        while cur and cur in name and cur not in seen:
+            seen.add(cur)
+            parts.append(name[cur])
+            cur = parent.get(cur)
+        path_map[node_id] = list(reversed(parts))
+    return path_map
+
+
+def load_special_category_final_mapping():
+    """供应商分类【新旧mapping】CSV: 原一级/二级/三级 -> 终版二级分类(去英文后缀)。
+
+    返回 (full, ac):
+      full —— '一级/二级/三级' 精确键(无冲突);
+      ac   —— '一级/三级' 回退键(剔除冲突项), 用于吸收海外分支二级命名漂移。
+    """
+    raw = pd.read_csv(SPECIAL_CATEGORY_CSV, header=None, skiprows=2, encoding='utf-8-sig')
+    full = {}
+    ac = {}
+    ac_conflict = set()
+    for _, row in raw.iterrows():
+        first, second, third = _text(row[0]), _text(row[1]), _text(row[2])
+        final_label = _strip_category_suffix(row[6])
+        if not first or not final_label:
+            continue
+        full[f'{first}/{second}/{third}'] = final_label
+        ac_key = f'{first}/{third}'
+        if ac_key in ac and ac[ac_key] != final_label:
+            ac_conflict.add(ac_key)
+        ac[ac_key] = final_label
+    for key in ac_conflict:
+        ac.pop(key, None)
+    return full, ac
+
+
+def _special_category_maps():
+    global _SPECIAL_CATEGORY_CACHE
+    if _SPECIAL_CATEGORY_CACHE is None:
+        path_map = build_special_category_path_map()
+        full, ac = load_special_category_final_mapping()
+        _SPECIAL_CATEGORY_CACHE = (path_map, full, ac)
+    return _SPECIAL_CATEGORY_CACHE
+
+
+def resolve_special_category(code):
+    """专项分类编码(zxflcg, 形如 '45_60', 末段为品类树叶子id) -> 终版二级分类。"""
+    code = _text(code)
+    if '_' not in code:
+        return ''
+    path_map, full, ac = _special_category_maps()
+    leaf = c.format_code(code.rsplit('_', 1)[-1])
+    parts = path_map.get(leaf)
+    if not parts:
+        return ''
+    if '/'.join(parts) in full:
+        return full['/'.join(parts)]
+    if len(parts) >= 2:
+        return ac.get(f'{parts[0]}/{parts[-1]}', '')
+    return ''
+
+
 # ============================ 源值解析 ============================
 def resolve_source_values(source_df, option_table=FW_TABLE):
     df = source_df.copy()
@@ -1496,6 +1586,7 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
     df['合同分类'] = df.apply(resolve_contract_category, axis=1)
     df['合同分类依据'] = df.apply(resolve_contract_category_basis, axis=1)
     df['收支类型'] = df.apply(resolve_pay_type, axis=1)
+    df['专项品类'] = df.get('专项分类编码', pd.Series('', index=df.index)).map(resolve_special_category)
     amount_tuples = df.apply(resolve_amounts, axis=1)
     df['合同总额_解析'] = amount_tuples.map(lambda item: item[0])
     df['收入总额_解析'] = amount_tuples.map(lambda item: item[1])
@@ -1580,9 +1671,11 @@ def build_main_output(source_df, headers):
         in_amount = source['收入总额_解析']
         out_amount = source['支出总额_解析']
 
+        contract_name = _text(source['合同标题'])
         _set(row, 'contract_number（合同编码）', _text(source['合同编号']))
-        _set(row, 'contract_name（合同名称）', _text(source['合同标题']))
-        _set(row, 'contractCategory(智书框架合同类型)', source['合同分类'])
+        _set(row, 'contract_name（合同名称）', contract_name)
+        _set(row, 'contractCategory(智书框架合同类型)',
+             '其他-保密协议' if '保密协议' in contract_name else source['合同分类'])
         _set(row, 'pay_type_code（收支类型）', source['收支类型'])
         _set(row, 'property_type_code（计价方式）', DEFAULT_PROPERTY_TYPE)
         _set(row, 'estimated_amount（预估金额）', amount)
@@ -1602,7 +1695,7 @@ def build_main_output(source_df, headers):
         _set(row, '合同创建人user_id', _text(source['合同创建人user_id']))
         _set(row, 'custom_15_78cf503c57194e4fb8ad03ded1c4ad60（打印模式）', DEFAULT_PRINT_MODE)
         _set(row, 'custom_10_9a2a0e99771346c98bfb6cfb893e1bee（签署日期）', c.format_date(source['合同签订日期']))
-        _set(row, 'custom_15_de8944334b104d52b28d9472ab0584ef（专项品类）', '')
+        _set(row, 'custom_15_de8944334b104d52b28d9472ab0584ef（专项品类）', _text(source.get('专项品类')))
         _set(row, 'custom_13_c9805a6fe9f245ebbfeea13407277306（是否需要验收）', DEFAULT_ACCEPTANCE_REQUIRED)
         _set(row, 'custom_1012_cec7052f613b465980f23f7004e2f82c（采购金额）', out_amount if out_amount else '')
         _set(row, 'custom_15_e5f7b7cb17b34602adf790f0ac8d69a1（发票种类）', DEFAULT_INVOICE_TYPE)
@@ -1863,6 +1956,15 @@ def build_payment_plan_output(source_df, headers):
         rows.append(row)
 
     for source in source_df.to_dict('records'):
+        # 押金/保证金: 合同若有押金或保证金, 额外补一行付款计划, 金额为两者之和。
+        deposit_amount = (_round_amount(source.get('押金')) or 0) + (_round_amount(source.get('保证金')) or 0)
+        if deposit_amount:
+            add_row(
+                source, deposit_amount,
+                _first_non_blank(source['合同有效期截止时间'], source['合同签订日期']),
+                '押金/保证金',
+                _plan_row_id(source, 'P', 'D'),
+            )
         details = _htsp_plan_details(source, plan_map, PLAN_TYPE_PAYMENT)
         if details:
             # 赛事: 用 dt4 真实收支计划明细, 每行一条付款计划。
