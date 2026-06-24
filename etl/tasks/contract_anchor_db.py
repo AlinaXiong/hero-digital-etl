@@ -22,6 +22,7 @@ if __package__ is None or __package__ == '':
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from etl import common as c
+from etl import feishu
 
 
 # ============================ 文件 / 模板 ============================
@@ -107,6 +108,7 @@ SELECT
     h.htszxmbh AS `合同所属项目编号ID`,
     h.htszxm AS `合同所属项目`,
     h.modedatacreater AS `合同创建人ID`,
+    h.modedatacreater AS `申请人ID`,
     rb.workflowid AS `流程类型ID`,
     wb.workflowname AS `流程名称`
 FROM uf_htk h
@@ -452,6 +454,23 @@ def build_feishu_employee_id_map(code_values):
             if code and feishu_id:
                 result[code] = feishu_id
     return result
+
+
+_EMPLOYMENT_STATUS_CACHE = None
+
+
+def _employment_status_map():
+    """飞书在职/离职映射; 缺凭据或接口异常时降级为空映射(申请人状态留空), 不中断迁移。"""
+    global _EMPLOYMENT_STATUS_CACHE
+    if _EMPLOYMENT_STATUS_CACHE is None:
+        try:
+            _EMPLOYMENT_STATUS_CACHE = feishu.get_employee_status_maps()
+            by_number, by_name = _EMPLOYMENT_STATUS_CACHE
+            print(f'[合同迁移-主播流程] 飞书员工状态: 工号 {len(by_number)} / 唯一姓名 {len(by_name)}')
+        except Exception as error:
+            print(f'[合同迁移-主播流程] 飞书员工状态获取失败, 申请人状态留空: {error}')
+            _EMPLOYMENT_STATUS_CACHE = ({}, {})
+    return _EMPLOYMENT_STATUS_CACHE
 
 
 def build_fw_project_info_map_for_ids(project_values):
@@ -1473,7 +1492,7 @@ def resolve_source_values(source_df):
         ['htlx', 'htejlx', 'htzt', 'szpt', 'bglx'],
     )
     employee_map = c.build_fw_employee_info_map_for_ids(
-        pd.concat([df['合同执行人员ID'], df['合同创建人ID']], ignore_index=True))
+        pd.concat([df['合同执行人员ID'], df['合同创建人ID'], df['申请人ID']], ignore_index=True))
     company_info_map = build_fw_company_info_map_for_values(df['合同用印范围ID'])
     customer_info_map = build_customer_info_map_for_values(df['合同客户ID'])
     supplier_info_map = build_supplier_info_map_for_values(df['合同供应商ID'])
@@ -1520,6 +1539,9 @@ def resolve_source_values(source_df):
         lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
     df['合同创建人工号'] = df['合同创建人ID'].map(
         lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
+    status_by_number, status_by_name = _employment_status_map()
+    applicant_status = c.build_applicant_status_map(df['申请人ID'], status_by_number, status_by_name)
+    df['申请人状态'] = df['申请人ID'].map(lambda value: applicant_status.get(c.format_code(value), ''))
     feishu_id_map = build_feishu_employee_id_map(
         pd.concat([df['合同执行人员工号'], df['合同创建人工号']], ignore_index=True))
     df['合同执行人飞书ID'] = df['合同执行人员工号'].map(lambda code: feishu_id_map.get(_text(code), ''))
@@ -1661,6 +1683,7 @@ def build_main_output(source_df, headers):
              _text(source['合同执行人飞书ID']))
         _set(row, '合同创建人', _text(source['合同创建人']))
         _set(row, '合同创建人user_id', _text(source['合同创建人user_id']))
+        _set(row, '申请人状态', _text(source.get('申请人状态')))
         _set(row, 'custom_1024_61820798c0f348658d8daa64f8b2aef9（主播卡片）',
              source['主播卡片导入ID'])
         _set(row, 'custom_1_ab6f99ee02e549469ec5b2d4a5a98452（主播姓名）',

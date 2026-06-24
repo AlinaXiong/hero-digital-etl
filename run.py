@@ -11,6 +11,7 @@ import sys
 from datetime import datetime
 
 from etl import common as c
+from etl import export_feishu_employees
 
 from etl.tasks import (
     anti_bribery_signers_db,
@@ -41,6 +42,7 @@ TASKS = {
     'contract_general_attachments_db': contract_general_attachments_db.run,  # 合同迁移 一般流程附件下载(DB直连版)
     'contract_general_db': contract_general_db.run,       # 合同迁移 一般流程(DB直连版)
     'invoice_info_db': invoice_info_db.run,               # 发票信息(DB直连版)
+    'export_feishu_employees': export_feishu_employees.run,  # 飞书全量员工信息导出Excel
 }
 
 ALL_TASK_NAMES = (

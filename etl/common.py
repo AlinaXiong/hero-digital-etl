@@ -510,6 +510,45 @@ def build_fw_employee_info_map_for_ids(user_ids):
     return employee_map
 
 
+def build_applicant_status_map(fw_user_ids, status_by_number, status_by_name_unique):
+    """泛微用户ID -> '在职'/'离职'/''(未匹配)。
+
+    泛微 hrmjobtitles.JOBTITLENAME 常为占位'Default', 故两级匹配飞书:
+      1) 泛微 JOBTITLENAME 工号直接命中飞书工号;
+      2) 泛微姓名(LASTNAME)在飞书唯一命中(重名则留空)。
+    status_by_number: 工号 -> enum_name; status_by_name_unique: 唯一姓名 -> enum_name。
+    """
+    ids = clean_codes(fw_user_ids)
+    if not ids or (not status_by_number and not status_by_name_unique):
+        return {}
+    info = query_db(
+        'FW', 'vspn_xtyy',
+        'SELECT r.id, r.LASTNAME AS nm, j.JOBTITLENAME AS gonghao '
+        'FROM hrmresource r LEFT JOIN hrmjobtitles j ON r.JOBTITLE = j.id '
+        f'WHERE r.id IN ({in_placeholders(ids)})',
+        ids,
+    )
+
+    def _label(status):
+        return '在职' if status == 'hired' else '离职'
+
+    result = {}
+    for _, row in info.iterrows():
+        employee_id = format_code(row['id'])
+        if not employee_id:
+            continue
+        gonghao = _cell_text(row['gonghao'])
+        if gonghao in status_by_number:
+            result[employee_id] = _label(status_by_number[gonghao])
+            continue
+        name = _cell_text(row['nm'])
+        if name in status_by_name_unique:
+            result[employee_id] = _label(status_by_name_unique[name])
+            continue
+        result[employee_id] = ''
+    return result
+
+
 def build_fw_company_name_map_for_ids(company_ids):
     """泛微公司主体ID -> 公司主体名称。
 

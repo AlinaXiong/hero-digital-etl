@@ -29,6 +29,7 @@ if __package__ is None or __package__ == '':
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from etl import common as c
+from etl import feishu
 from etl.tasks.ap_prepayment_opening_db import build_fw_project_code_map_for_ids
 
 
@@ -164,6 +165,7 @@ SELECT
     NULL AS `采购申请单ID`,
     NULL AS `专项分类编码`,
     h.modedatacreater AS `合同创建人ID`,
+    h.modedatacreater AS `申请人ID`,
     rb.workflowid AS `流程类型ID`,
     wb.workflowname AS `流程名称`
 FROM uf_htk h
@@ -240,6 +242,7 @@ SELECT
     h.cgsqddx AS `采购申请单ID`,
     h.zxflcg AS `专项分类编码`,
     h.modedatacreater AS `合同创建人ID`,
+    h.sqr AS `申请人ID`,
     rb.workflowid AS `流程类型ID`,
     wb.workflowname AS `流程名称`
 FROM uf_htsp h
@@ -1485,6 +1488,23 @@ def _special_category_maps():
     return _SPECIAL_CATEGORY_CACHE
 
 
+_EMPLOYMENT_STATUS_CACHE = None
+
+
+def _employment_status_map():
+    """飞书在职/离职映射; 缺凭据或接口异常时降级为空映射(申请人状态留空), 不中断迁移。"""
+    global _EMPLOYMENT_STATUS_CACHE
+    if _EMPLOYMENT_STATUS_CACHE is None:
+        try:
+            _EMPLOYMENT_STATUS_CACHE = feishu.get_employee_status_maps()
+            by_number, by_name = _EMPLOYMENT_STATUS_CACHE
+            print(f'[合同迁移-一般流程] 飞书员工状态: 工号 {len(by_number)} / 唯一姓名 {len(by_name)}')
+        except Exception as error:
+            print(f'[合同迁移-一般流程] 飞书员工状态获取失败, 申请人状态留空: {error}')
+            _EMPLOYMENT_STATUS_CACHE = ({}, {})
+    return _EMPLOYMENT_STATUS_CACHE
+
+
 def resolve_special_category(code):
     """专项分类编码(zxflcg, 形如 '45_60', 末段为品类树叶子id) -> 终版二级分类。"""
     code = _text(code)
@@ -1510,7 +1530,7 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
         ['htlx', 'htejlx', 'htzt', 'bglx'],
     )
     employee_map = _timed('  ├─员工映射', lambda: c.build_fw_employee_info_map_for_ids(
-        pd.concat([df['合同执行人员ID'], df['合同创建人ID']], ignore_index=True)))
+        pd.concat([df['合同执行人员ID'], df['合同创建人ID'], df['申请人ID']], ignore_index=True)))
     company_info_map = _timed('  ├─我方主体映射', lambda: build_fw_company_info_map_for_values(df['合同用印范围ID']))
     customer_info_map = _timed('  ├─客户映射', lambda: build_customer_info_map_for_values(df['合同客户ID']))
     supplier_info_map = _timed('  ├─供应商映射(汉得匹配)', lambda: build_supplier_info_map_for_values(df['合同供应商ID']))
@@ -1534,6 +1554,9 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
         lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
     df['合同创建人工号'] = df['合同创建人ID'].map(
         lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
+    status_by_number, status_by_name = _employment_status_map()
+    applicant_status = c.build_applicant_status_map(df['申请人ID'], status_by_number, status_by_name)
+    df['申请人状态'] = df['申请人ID'].map(lambda value: applicant_status.get(c.format_code(value), ''))
     feishu_id_map = _timed('  ├─合同执行人/创建人飞书ID映射(汉得)',
                            lambda: build_feishu_employee_id_map(
                                pd.concat([df['合同执行人员工号'], df['合同创建人工号']], ignore_index=True)))
@@ -1693,6 +1716,7 @@ def build_main_output(source_df, headers):
         _set(row, '合同执行人', _text(source['合同执行人员']))
         _set(row, '合同创建人', _text(source['合同创建人']))
         _set(row, '合同创建人user_id', _text(source['合同创建人user_id']))
+        _set(row, '申请人状态', _text(source.get('申请人状态')))
         _set(row, 'custom_15_78cf503c57194e4fb8ad03ded1c4ad60（打印模式）', DEFAULT_PRINT_MODE)
         _set(row, 'custom_10_9a2a0e99771346c98bfb6cfb893e1bee（签署日期）', c.format_date(source['合同签订日期']))
         _set(row, 'custom_15_de8944334b104d52b28d9472ab0584ef（专项品类）', _text(source.get('专项品类')))
