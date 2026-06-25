@@ -24,6 +24,7 @@ from etl.tasks import (
     ar_invoice_opening_db,
     contract_anti_bribery_attachments_db,
     contract_anti_bribery_db,
+    contract_anchor_attachments_db,
     contract_anchor_db,
     contract_general_attachments_db,
     contract_general_db,
@@ -43,6 +44,7 @@ TASKS = {
     'contract_anti_bribery_db': contract_anti_bribery_db.run,  # 合同迁移 反商业贿赂协议(DB直连版)
     'contract_anti_bribery_attachments_db': contract_anti_bribery_attachments_db.run,  # 反商业贿赂协议附件下载(DB直连版)
     'contract_anchor_db': contract_anchor_db.run,         # 合同迁移 主播流程(DB直连版)
+    'contract_anchor_attachments_db': contract_anchor_attachments_db.run,  # 合同迁移 主播流程附件下载(DB直连版)
     'contract_general_attachments_db': contract_general_attachments_db.run,  # 合同迁移 一般流程附件下载(DB直连版)
     'contract_general_db': contract_general_db.run,       # 合同迁移 一般流程(DB直连版)
     'invoice_info_db': invoice_info_db.run,               # 发票信息(DB直连版)

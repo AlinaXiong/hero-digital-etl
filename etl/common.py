@@ -10,6 +10,7 @@
 import os
 import re
 import json
+import atexit
 import unicodedata
 import html
 from datetime import date
@@ -65,28 +66,116 @@ def _sqlalchemy_echo_enabled():
 
 
 _ENGINE_CACHE = {}
+_SSH_TUNNELS = {}
 
 
-def _db_engine(prefix, database):
-    """按前缀(FW/ZT)建 SQLAlchemy engine。只跑 SELECT,不写生产库。"""
+def _env_bool(name, default=False):
+    value = os.getenv(name, '').strip().lower()
+    if not value:
+        return default
+    return value in ('1', 'true', 't', 'y', 'yes', '是')
+
+
+def _effective_db_prefix(prefix):
+    """兼容老代码:设置 HAND_AS_ZT=1 后,所有 ZT 查询改走汉得生产环境。"""
+    if prefix == 'ZT' and _env_bool('HAND_AS_ZT', False):
+        return 'HAND'
+    return prefix
+
+
+def _close_ssh_tunnels():
+    for tunnel in list(_SSH_TUNNELS.values()):
+        try:
+            tunnel.stop()
+        except Exception:
+            pass
+
+
+atexit.register(_close_ssh_tunnels)
+
+
+def _ssh_tunnel_config(prefix):
+    enabled = _env_bool(f'{prefix}_SSH_ENABLED', False) or bool(os.getenv(f'{prefix}_SSH_HOST', '').strip())
+    if not enabled:
+        return None
+    required = {
+        'ssh_host': f'{prefix}_SSH_HOST',
+        'ssh_port': f'{prefix}_SSH_PORT',
+        'ssh_user': f'{prefix}_SSH_USER',
+        'ssh_pass': f'{prefix}_SSH_PASS',
+    }
+    missing = [env_name for env_name in required.values() if not os.getenv(env_name, '').strip()]
+    if missing:
+        raise RuntimeError(f'缺少 SSH 跳板环境变量: {", ".join(missing)}')
+    return {
+        'ssh_host': os.environ[required['ssh_host']].strip(),
+        'ssh_port': int(os.environ[required['ssh_port']]),
+        'ssh_user': os.environ[required['ssh_user']].strip(),
+        'ssh_pass': os.environ[required['ssh_pass']],
+    }
+
+
+def _db_config(prefix):
     try:
-        config = {
-            'host': os.environ[f'{prefix}_HOST'],
+        return {
+            'host': os.environ[f'{prefix}_HOST'].strip(),
             'port': int(os.environ[f'{prefix}_PORT']),
-            'username': os.environ[f'{prefix}_USER'],
+            'username': os.environ[f'{prefix}_USER'].strip(),
             'password': os.environ[f'{prefix}_PASS'],
         }
     except KeyError as e:
         raise RuntimeError(f'缺少数据库环境变量 {e};请在 .env 或环境变量配置 {prefix}_HOST/PORT/USER/PASS') from e
 
-    cache_key = (prefix, database, _sqlalchemy_echo_enabled())
+
+def _db_endpoint(prefix, config):
+    tunnel_config = _ssh_tunnel_config(prefix)
+    if not tunnel_config:
+        return config['host'], config['port']
+    try:
+        from sshtunnel import SSHTunnelForwarder
+    except ImportError as exc:
+        raise RuntimeError('使用 SSH 跳板数据库连接需要安装 sshtunnel: pip install sshtunnel') from exc
+
+    tunnel_key = (
+        prefix,
+        tunnel_config['ssh_host'],
+        tunnel_config['ssh_port'],
+        tunnel_config['ssh_user'],
+        config['host'],
+        config['port'],
+    )
+    tunnel = _SSH_TUNNELS.get(tunnel_key)
+    if tunnel is None or not tunnel.is_active:
+        tunnel = SSHTunnelForwarder(
+            (tunnel_config['ssh_host'], tunnel_config['ssh_port']),
+            ssh_username=tunnel_config['ssh_user'],
+            ssh_password=tunnel_config['ssh_pass'],
+            remote_bind_address=(config['host'], config['port']),
+            local_bind_address=('127.0.0.1', 0),
+        )
+        tunnel.start()
+        _SSH_TUNNELS[tunnel_key] = tunnel
+        print(
+            f'[数据库连接] {prefix} SSH 隧道: '
+            f'127.0.0.1:{tunnel.local_bind_port} -> {config["host"]}:{config["port"]}'
+        )
+    return '127.0.0.1', tunnel.local_bind_port
+
+
+def _db_engine(prefix, database):
+    """按前缀(FW/ZT/HAND)建 SQLAlchemy engine。只跑 SELECT,不写生产库。"""
+    prefix = _effective_db_prefix(prefix)
+    config = _db_config(prefix)
+    host, port = _db_endpoint(prefix, config)
+
+    cache_key = (prefix, database, host, port, _sqlalchemy_echo_enabled())
     if cache_key not in _ENGINE_CACHE:
         url = URL.create(
             'mysql+pymysql',
             username=config['username'],
             password=config['password'],
-            host=config['host'],
-            port=config['port'],
+            host=host,
+            port=port,
             database=database,
             query={'charset': 'utf8mb4'},
         )

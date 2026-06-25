@@ -10,6 +10,7 @@
 
 跑法:在项目根执行  python run.py contract_anchor_db
 """
+import os
 import re
 import sys
 from datetime import datetime
@@ -23,6 +24,7 @@ if __package__ is None or __package__ == '':
 
 from etl import common as c
 from etl import feishu
+from etl.tasks import contract_general_db as base
 
 
 # ============================ 文件 / 模板 ============================
@@ -35,12 +37,15 @@ TEMPLATE_FILE = TEMPLATE_DIR / '智书合同字段-主播流程.xlsx'
 RULE_CSV = c.RULES_DIR / '业财项目_数据映射规则 - 合同数据映射规则-for法务.csv'
 OUTPUT_FILE = OUTPUT_DIR / f'智书合同字段_主播流程_{DATE_SUFFIX}.xlsx'
 EXCEPTION_FILE = OUTPUT_DIR / f'未匹配清单_主播流程_{DATE_SUFFIX}.xlsx'
+MANIFEST_FILE = OUTPUT_DIR / f'主播流程合同附件下载清单_{DATE_SUFFIX}.xlsx'
 
 SHEET_MAIN = '字段模板'
 SHEET_OPTIONS = '选项'
 SHEET_COUNTERPARTY = '对方信息'
 SHEET_OUR_PARTY = '我方信息'
 SHEET_FEE_DETAIL = '费用明细'
+SHEET_CONTRACT_ATTACHMENT = '合同附件'
+SHEET_OTHER_ATTACHMENT = '其他附件'
 
 FW_TABLE = 'uf_htk'
 FW_ANCHOR_CARD_TABLE = 'uf_zbkp'
@@ -69,10 +74,28 @@ DEFAULT_VALIDITY_TYPE = '固定期限'
 DEFAULT_ACCEPTANCE_REQUIRED = '否'
 DEFAULT_PRINT_MODE = '黑白双面打印'
 DEFAULT_FIRST_SEAL_PARTY = '我方'
-DEFAULT_SIGN_FORM = '纸质签约-不限制我方/对方先签约'
+DEFAULT_SIGN_FORM = '纸质签约'
 DEFAULT_SEAL_NUMBER = 2
 DEFAULT_PAYBACK_PERIOD_MONTHS = 0
 DEFAULT_CONTRACT_CREATOR_NAME = '黄劭文'
+
+# 法务确认: 以下主播收益/签约金/底薪类字段不参与“必输字段未达100%”校验。
+REQUIRED_CHECK_EXCLUDED_FIELDS = {
+    'custom_5_d6aaf62f8568491c8f5824285e72499d（直播平台的虚拟礼物收益）',
+    'custom_5_fc246ba4165145af92cffb2e6088c4b3（直播平台签约后每月基本合作费）',
+    'custom_5_a8e7beeebc7b4253a9ec3c713d9d790a（自媒体平台账号商务收入）',
+    'custom_5_c0a993cb06774ab38ea3e75187631ab5（自媒体平台支付的自媒体账号收入）',
+    'custom_1012_dbf82175f1964048b83b18550f3bb8d1（官签签约金）',
+    'custom_5_f53355b8e15546a7a187575f07cf59ee（官签签约金分成比例）',
+    'custom_5_def7270057bd4913a1fd087b4b1f128e（本合同项下其他可分配收益）',
+    'custom_1012_3c0986ffce8848caab9249df37e5d49e（固定底薪（每月））',
+    'custom_1012_07b5c0b4f40a414588ce86d43705f5c4（公司签约金）',
+    'custom_1012_65df3bda1aae46a1822c4d4531be5e25（保底费用）',
+}
+REQUIRED_CHECK_EXCLUDED_FIELD_KEYS = {
+    re.sub(r'\s+', '', field)
+    for field in REQUIRED_CHECK_EXCLUDED_FIELDS
+}
 
 
 # ============================ 泛微源 SQL ============================
@@ -103,6 +126,7 @@ SELECT
     h.htyjsr AS `合同预计收入`,
     h.htyjzc AS `合同预计支出`,
     h.htzy AS `合同摘要`,
+    h.htqdg AS `合同附件DOCID`,
     h.glkjxy AS `关联框架协议ID`,
     h.bglx AS `变更类型ID`,
     h.bczzbhsc AS `补充/终止编号生成`,
@@ -177,6 +201,7 @@ EXPECTED_FW_FIELDS = {
         'htyjsr': '合同预计收入',
         'htyjzc': '合同预计支出',
         'htzy': '合同摘要',
+        'htqdg': '合同签定稿',
         'glkjxy': '关联框架协议',
         'bglx': '变更类型',
         'bczzbhsc': '补充/终止编号生成',
@@ -262,7 +287,14 @@ def _sheet_headers(sheet_name):
 def _template_headers():
     return {
         sheet_name: _sheet_headers(sheet_name)
-        for sheet_name in (SHEET_MAIN, SHEET_COUNTERPARTY, SHEET_OUR_PARTY, SHEET_FEE_DETAIL)
+        for sheet_name in (
+            SHEET_MAIN,
+            SHEET_COUNTERPARTY,
+            SHEET_OUR_PARTY,
+            SHEET_FEE_DETAIL,
+            SHEET_CONTRACT_ATTACHMENT,
+            SHEET_OTHER_ATTACHMENT,
+        )
     }
 
 
@@ -301,7 +333,7 @@ def _add_flow_audit_sheet(output_file, source_df):
         '主合同匹配方式', '主合同编号', '主合同标题', '主合同流程类型ID', '主合同流程名称',
         '主合同类型ID', '主合同类型', '主合同二级类型ID', '主合同二级类型',
         '主合同一级类型判定', '主合同主播卡片ID', '主合同主播姓名', '主合同主播昵称',
-        '主合同战队名称', '主合同所属平台ID', '主播信息来源',
+        '主合同战队名称', '主合同所属平台ID', '主播信息来源', '主播资料来源', 'Hand主播档案匹配方式',
         '最终主播卡片导入ID', '最终主播卡片编号', '最终主播身份证号',
         '主合同智书合同类型', '智书合同类型', '分类依据',
     ]
@@ -334,6 +366,8 @@ def _add_flow_audit_sheet(output_file, source_df):
             _text(row.get('主合同战队名称')),
             _text(row.get('主合同所属平台ID')),
             _text(row.get('主播信息来源')),
+            _text(row.get('主播资料来源')),
+            _text(row.get('Hand主播档案匹配方式')),
             _text(row.get('主播卡片导入ID')),
             _text(row.get('主播卡片编号')),
             _text(row.get('主播身份证号码')),
@@ -403,7 +437,6 @@ def _new_row(headers):
 
 _HEADER_LOOKUP_CACHE = {}
 _CLEANED_PROJECT_CANDIDATES_CACHE = None
-_CONTRACT_ORDER_MAPPING_CACHE = None
 
 
 def _set(row, field_name, value):
@@ -497,47 +530,41 @@ def _build_employee_info_by_name(names, status_by_number, status_by_name):
     }
 
 
-def _cleanable_order_infos_for_source(row):
-    order_code = _text(row.get('订单编号'))
-    if order_code:
-        info = c.cleanable_order_info_for_order(order_code)
-        if info:
-            return [info]
-    infos = []
-    seen_orders = set()
-    for project_code in (row.get('合同所属项目编号'), row.get('合同所属项目编号ID')):
-        for info in c.cleanable_order_infos_for_project(project_code):
-            order = _text(info.get('订单编号'))
-            if order and order not in seen_orders:
-                seen_orders.add(order)
-                infos.append(info)
-    return infos
-
-
-def _order_manager_names_for_source(row):
-    names = []
-    for info in _cleanable_order_infos_for_source(row):
-        for name in info.get('项目经理候选', []):
-            if name and name not in names:
-                names.append(name)
-    return names
-
-
 def _apply_contract_creator_rules(df, status_by_number, status_by_name):
+    df['原合同申请人'] = df['申请人']
+    df['原合同申请人工号'] = df['申请人工号']
+    df['原合同申请人user_id'] = df['申请人user_id']
+    df['原合同申请人状态'] = df['申请人状态']
+    df['原合同执行人'] = df['合同执行人员']
+    df['原合同执行人工号'] = df['合同执行人员工号']
+    df['原合同执行人user_id'] = df['合同执行人飞书ID']
+    df['原合同执行人状态'] = df['合同执行人状态']
     df['原合同创建人'] = df['合同创建人']
     df['原合同创建人工号'] = df['合同创建人工号']
     df['原合同创建人user_id'] = df['合同创建人user_id']
     df['原合同创建人状态'] = df['合同创建人状态']
-    df['订单项目经理候选'] = ''
-    df['合同创建人调整方式'] = '创建人在职/无需调整'
+    df['合同创建人'] = df.apply(
+        lambda row: _first_non_blank(row.get('申请人'), row.get('合同创建人')),
+        axis=1,
+    )
+    df['合同创建人工号'] = df.apply(
+        lambda row: _first_non_blank(row.get('申请人工号'), row.get('合同创建人工号')),
+        axis=1,
+    )
+    df['合同创建人user_id'] = df.apply(
+        lambda row: _first_non_blank(row.get('申请人user_id'), row.get('合同创建人user_id')),
+        axis=1,
+    )
+    df['合同创建人状态'] = df.apply(
+        lambda row: _text(row.get('申请人状态')) if _text(row.get('申请人')) else _text(row.get('合同创建人状态')),
+        axis=1,
+    )
+    df['合同创建人调整方式'] = '申请人/创建人在职或未确认离职,无需调整'
     left_mask = df['合同创建人状态'].map(_text) == '离职'
     if not bool(left_mask.any()):
         return df
 
-    manager_names = []
-    for _, row in df.loc[left_mask].iterrows():
-        manager_names.extend(_order_manager_names_for_source(row))
-    employee_info_by_name = _build_employee_info_by_name(manager_names, status_by_number, status_by_name)
+    employee_info_by_name = _build_employee_info_by_name([DEFAULT_CONTRACT_CREATOR_NAME], status_by_number, status_by_name)
     default_info = employee_info_by_name.get(DEFAULT_CONTRACT_CREATOR_NAME, {
         'name': DEFAULT_CONTRACT_CREATOR_NAME,
         'code': '',
@@ -545,20 +572,20 @@ def _apply_contract_creator_rules(df, status_by_number, status_by_name):
         'status': _employee_status_label(DEFAULT_CONTRACT_CREATOR_NAME, '', status_by_number, status_by_name),
     })
 
-    for index, row in df.loc[left_mask].iterrows():
-        manager_names = _order_manager_names_for_source(row)
-        df.at[index, '订单项目经理候选'] = '、'.join(manager_names)
-        selected = None
-        for manager_name in manager_names:
-            info = employee_info_by_name.get(manager_name)
-            if info and info.get('status') == '在职' and info.get('user_id'):
-                selected = info
-                break
-        if selected:
-            df.at[index, '合同创建人调整方式'] = '原创建人离职,更新为订单项目经理'
+    for index, _ in df.loc[left_mask].iterrows():
+        row = df.loc[index]
+        executor_info = {
+            'name': _text(row.get('合同执行人员')),
+            'code': _text(row.get('合同执行人员工号')),
+            'user_id': _text(row.get('合同执行人飞书ID')),
+            'status': _text(row.get('合同执行人状态')),
+        }
+        if executor_info['name'] and executor_info['status'] != '离职':
+            selected = executor_info
+            df.at[index, '合同创建人调整方式'] = '申请人离职,更新为合同执行人'
         else:
             selected = default_info
-            df.at[index, '合同创建人调整方式'] = '原创建人离职,项目经理离职/缺失,更新为黄劭文'
+            df.at[index, '合同创建人调整方式'] = '申请人离职,合同执行人离职/缺失,更新为黄劭文'
         df.at[index, '合同创建人'] = selected.get('name', '')
         df.at[index, '合同创建人工号'] = selected.get('code', '')
         df.at[index, '合同创建人user_id'] = selected.get('user_id', '')
@@ -702,69 +729,6 @@ def choose_cleaned_project_info(project_id, project_name, candidates_map):
     return candidates[0]
 
 
-def load_contract_order_mapping():
-    """从 0621 订单/结算表读取 原泛微项目编码 -> 唯一订单编号。"""
-    global _CONTRACT_ORDER_MAPPING_CACHE
-    if _CONTRACT_ORDER_MAPPING_CACHE is not None:
-        return _CONTRACT_ORDER_MAPPING_CACHE
-
-    mapping_file = _cleaned_mapping_file()
-    if mapping_file is None:
-        _CONTRACT_ORDER_MAPPING_CACHE = ({}, {})
-        return _CONTRACT_ORDER_MAPPING_CACHE
-
-    sheet_names = [
-        '全量订单主表_清洗后',
-        '全量订单明细行表_清洗后',
-        '全量结算明细表_清洗后',
-        '填协同关系表',
-        '全量订单明细表（下单或报价行）_清洗后',
-    ]
-    rows = []
-    for sheet_name in sheet_names:
-        try:
-            order_df = _read_cleaned_sheet_with_header(mapping_file, sheet_name, ['原泛微项目编码', '订单编号'])
-        except ValueError:
-            continue
-        if '是否可洗流程' in order_df.columns:
-            order_df = order_df[order_df['是否可洗流程'].map(_text).str.upper().str.contains('Y', na=False)]
-        for _, row in order_df.iterrows():
-            project_code = _text(row.get('原泛微项目编码'))
-            order_code = _text(row.get('订单编号'))
-            if project_code and order_code:
-                rows.append({
-                    '项目编号': project_code,
-                    '订单编号': order_code,
-                    '映射来源': sheet_name,
-                })
-
-    by_project = {}
-    for row in rows:
-        by_project.setdefault(row['项目编号'], []).append(row)
-
-    safe_map = {}
-    ambiguous_map = {}
-    for project_code, items in by_project.items():
-        order_codes = []
-        seen = set()
-        for item in items:
-            order_code = item['订单编号']
-            if order_code not in seen:
-                seen.add(order_code)
-                order_codes.append(order_code)
-        if len(order_codes) == 1:
-            safe_map[project_code] = order_codes[0]
-        else:
-            ambiguous_map[project_code] = order_codes
-    _CONTRACT_ORDER_MAPPING_CACHE = (safe_map, ambiguous_map)
-    return _CONTRACT_ORDER_MAPPING_CACHE
-
-
-def contract_order_mapping_value(project_code):
-    safe_map, _, = load_contract_order_mapping()
-    return safe_map.get(_text(project_code), '') or c.project_order_mapping_value(project_code, '订单编号')
-
-
 def _read_anchor_required_rules(headers_by_sheet):
     raw = pd.read_csv(RULE_CSV, encoding='utf-8-sig').iloc[1:, :15].copy()
     raw.columns = [
@@ -801,6 +765,8 @@ def _read_anchor_required_rules(headers_by_sheet):
         note = _first_non_blank(rule['note'], rule['mcn_note'])
         if note and actual_field not in remarks[sheet_name]:
             remarks[sheet_name][actual_field] = note
+        if _normalize_field_name(actual_field) in REQUIRED_CHECK_EXCLUDED_FIELD_KEYS:
+            continue
         if _text(rule['required']).upper() == 'Y' and actual_field not in required[sheet_name]:
             required[sheet_name].append(actual_field)
     return required, remarks
@@ -1031,6 +997,308 @@ def build_anchor_vendor_info_maps(source_df):
     return by_id_number, by_name
 
 
+def _query_hand_anchor_profiles(header_ids, id_numbers, names):
+    selects = {
+        'anchor_profile_list': (
+            "'anchor_profile_list' AS source_table, 0 AS source_priority, "
+            "header_id, bill_code, real_name, certificate_number, enable, '' AS state, last_update_date"
+        ),
+        'anchor_profile_header': (
+            "'anchor_profile_header' AS source_table, 1 AS source_priority, "
+            "header_id, bill_code, real_name, certificate_number, '' AS enable, state, last_update_date"
+        ),
+    }
+    filters = {
+        'anchor_profile_list': '',
+        'anchor_profile_header': " AND (delete_flag IS NULL OR delete_flag <> 'Y')",
+    }
+    frames = []
+    for table_name, select_clause in selects.items():
+        for column_name, values in (
+                ('header_id', header_ids),
+                ('certificate_number', id_numbers),
+                ('real_name', names)):
+            values = c.clean_text_values(values)
+            for batch in _chunked(values):
+                frames.append(c.query_db(
+                    'HAND',
+                    'hfins',
+                    f'SELECT {select_clause} FROM {table_name} '
+                    f'WHERE {column_name} IN ({c.in_placeholders(batch)}){filters[table_name]}',
+                    batch,
+                ))
+    if not frames:
+        return pd.DataFrame()
+    profile_df = pd.concat(frames, ignore_index=True).drop_duplicates()
+    if profile_df.empty:
+        return profile_df
+    profile_df['_enable_score'] = profile_df['enable'].map(lambda value: 0 if _text(value).upper() == 'Y' else 1)
+    profile_df['_updated_at'] = pd.to_datetime(profile_df['last_update_date'], errors='coerce')
+    return profile_df.sort_values(
+        ['source_priority', '_enable_score', '_updated_at'],
+        ascending=[True, True, False],
+        na_position='last',
+    )
+
+
+def _hand_platform_code(platform_value, platform_map):
+    code = c.format_code(platform_value)
+    if code and code in platform_map:
+        return code
+    value_key = c.normalize_name(platform_value)
+    if not value_key:
+        return ''
+    for option_code, option_name in platform_map.items():
+        if c.normalize_name(option_name) == value_key:
+            return option_code
+    for option_code, aliases in _platform_aliases(platform_map).items():
+        if any(c.normalize_name(alias) == value_key for alias in aliases):
+            return option_code
+    return ''
+
+
+def _query_hand_anchor_platform_details(header_ids, platform_map):
+    header_ids = c.clean_codes(header_ids)
+    if not header_ids:
+        return {}
+    frames = []
+    tables = (
+        ('anchor_platform_list_line', 0),
+        ('anchor_platform_line', 1),
+    )
+    for table_name, priority in tables:
+        for batch in _chunked(header_ids):
+            frames.append(c.query_db(
+                'HAND',
+                'hfins',
+                f"SELECT '{table_name}' AS source_table, {priority} AS source_priority, "
+                "header_id, line_id, anchor_nickname, anchor_id, platform, team_name, last_update_date "
+                f'FROM {table_name} '
+                f'WHERE header_id IN ({c.in_placeholders(batch)})',
+                batch,
+            ))
+    if not frames:
+        return {}
+    detail_df = pd.concat(frames, ignore_index=True).drop_duplicates()
+    if detail_df.empty:
+        return {}
+    detail_df['_updated_at'] = pd.to_datetime(detail_df['last_update_date'], errors='coerce')
+    detail_df['_line_id'] = detail_df['line_id'].map(lambda value: int(c.format_code(value) or 0))
+    detail_df = detail_df.sort_values(
+        ['header_id', 'source_priority', '_updated_at', '_line_id'],
+        ascending=[True, True, False, False],
+        na_position='last',
+    )
+    result = {}
+    seen = set()
+    for _, row in detail_df.iterrows():
+        header_id = c.format_code(row.get('header_id'))
+        if not header_id:
+            continue
+        platform_name = _text(row.get('platform'))
+        item = {
+            'room_id': _text(row.get('anchor_id')),
+            'platform_code': _hand_platform_code(platform_name, platform_map),
+            'platform_name': platform_name,
+            'status_code': '0',
+            'anchor_nickname': _text(row.get('anchor_nickname')),
+            'team_name': _text(row.get('team_name')),
+            'source_table': _text(row.get('source_table')),
+        }
+        dedupe_key = (
+            header_id,
+            item['room_id'],
+            item['platform_code'],
+            item['platform_name'],
+            item['anchor_nickname'],
+            item['team_name'],
+        )
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        result.setdefault(header_id, []).append(item)
+    return result
+
+
+def _revenue_info_from_row(row):
+    return {
+        'official_signing_bonus': _round_amount(row.get('official_signing_bonus_income'))
+        if _text(row.get('official_signing_bonus_income')) else '',
+        'official_signing_bonus_share_ratio': _number(row.get('official_signing_bonus_ratio'), default='')
+        if _text(row.get('official_signing_bonus_ratio')) else '',
+        'base_salary_monthly': _round_amount(row.get('fixed_base_salary'))
+        if _text(row.get('fixed_base_salary')) else '',
+        'company_signing_bonus': _round_amount(row.get('company_signing_bonus'))
+        if _text(row.get('company_signing_bonus')) else '',
+    }
+
+
+def _query_hand_anchor_revenue(header_ids):
+    header_ids = c.clean_codes(header_ids)
+    empty = {}, {}
+    if not header_ids:
+        return empty
+    tables = (
+        ('anchor_contract_relation_list_line', 0, 'contract_number'),
+        ('anchor_contract_relation_line', 1, 'contract_number'),
+        ('anchor_revenue_ratio_list_line', 2, "'' AS contract_number"),
+        ('anchor_revenue_ratio_line', 3, "'' AS contract_number"),
+    )
+    frames = []
+    for table_name, priority, contract_expr in tables:
+        for batch in _chunked(header_ids):
+            frames.append(c.query_db(
+                'HAND',
+                'hfins',
+                f"SELECT '{table_name}' AS source_table, {priority} AS source_priority, "
+                f"header_id, line_id, {contract_expr}, official_signing_bonus_income, "
+                "official_signing_bonus_ratio, company_signing_bonus, fixed_base_salary, last_update_date "
+                f'FROM {table_name} '
+                f'WHERE header_id IN ({c.in_placeholders(batch)})',
+                batch,
+            ))
+    if not frames:
+        return empty
+    revenue_df = pd.concat(frames, ignore_index=True).drop_duplicates()
+    if revenue_df.empty:
+        return empty
+    revenue_df['_updated_at'] = pd.to_datetime(revenue_df['last_update_date'], errors='coerce')
+    revenue_df['_line_id'] = revenue_df['line_id'].map(lambda value: int(c.format_code(value) or 0))
+    revenue_df = revenue_df.sort_values(
+        ['header_id', 'source_priority', '_updated_at', '_line_id'],
+        ascending=[True, True, False, False],
+        na_position='last',
+    )
+    by_header_contract = {}
+    by_header = {}
+    for _, row in revenue_df.iterrows():
+        header_id = c.format_code(row.get('header_id'))
+        if not header_id:
+            continue
+        info = _revenue_info_from_row(row)
+        if not any(_text(value) for value in info.values()):
+            continue
+        contract_number = _text(row.get('contract_number'))
+        if contract_number:
+            by_header_contract.setdefault((header_id, contract_number), info)
+        by_header.setdefault(header_id, info)
+    return by_header_contract, by_header
+
+
+def _merge_card_infos(*infos):
+    merged = {}
+    for info in infos:
+        merged = _merge_card_info(merged, info or {})
+    return merged
+
+
+def _unique_map_by_key(infos, key_func):
+    grouped = {}
+    for info in infos:
+        key = key_func(info)
+        if key:
+            grouped.setdefault(key, []).append(info)
+    result = {}
+    for key, values in grouped.items():
+        header_ids = {c.format_code(value.get('card_id')) for value in values if c.format_code(value.get('card_id'))}
+        if len(header_ids) == 1:
+            result[key] = values[0]
+    return result
+
+
+def build_hand_anchor_card_info_map(source_df, fw_card_info_map, fw_identity_card_info_map, platform_map):
+    """按 Hand 主播档案补齐主播信息; Hand 优先,泛微卡片仅作为兜底。"""
+    header_ids = []
+    id_numbers = []
+    names = []
+    fw_seed_by_index = {}
+
+    for index, row in source_df.iterrows():
+        card_id = c.format_code(row.get('主播卡片ID'))
+        fw_seed = _merge_card_infos(
+            fw_card_info_map.get(card_id, {}),
+            fw_identity_card_info_map.get(index, {}),
+        )
+        fw_seed_by_index[index] = fw_seed
+        header_ids.extend(c.clean_codes([card_id, fw_seed.get('card_id')]))
+        id_numbers.extend(c.clean_text_values([fw_seed.get('id_number')]))
+        names.extend(c.clean_text_values([
+            row.get('主播姓名'),
+            fw_seed.get('name'),
+        ]))
+
+    try:
+        profile_df = _query_hand_anchor_profiles(header_ids, id_numbers, names)
+    except Exception as error:
+        raise RuntimeError(f'Hand主播档案获取失败,无法判断主播合同是否可导入: {error}') from error
+    if profile_df.empty:
+        print('[合同迁移-主播流程] Hand主播档案匹配: 0 行')
+        return {}
+
+    profiles_by_header = {}
+    for _, row in profile_df.iterrows():
+        header_id = c.format_code(row.get('header_id'))
+        if header_id and header_id not in profiles_by_header:
+            profiles_by_header[header_id] = row.to_dict()
+
+    details_by_header = _query_hand_anchor_platform_details(profiles_by_header.keys(), platform_map)
+    revenue_by_header_contract, revenue_by_header = _query_hand_anchor_revenue(profiles_by_header.keys())
+
+    infos = []
+    for header_id, row in profiles_by_header.items():
+        details = details_by_header.get(header_id, [])
+        first_detail = details[0] if details else {}
+        revenue = revenue_by_header.get(header_id, {})
+        info = {
+            'card_id': header_id,
+            'card_number': _text(row.get('bill_code')),
+            'name': _text(row.get('real_name')),
+            'nickname': _text(first_detail.get('anchor_nickname')),
+            'id_number': _text(row.get('certificate_number')),
+            'team_name': _text(first_detail.get('team_name')),
+            'official_signing_bonus': revenue.get('official_signing_bonus', ''),
+            'official_signing_bonus_share_ratio': revenue.get('official_signing_bonus_share_ratio', ''),
+            'base_salary_monthly': revenue.get('base_salary_monthly', ''),
+            'company_signing_bonus': revenue.get('company_signing_bonus', ''),
+            'source_table': _text(row.get('source_table')),
+            'details': details,
+        }
+        infos.append(info)
+
+    by_header = {info['card_id']: info for info in infos if info.get('card_id')}
+    by_id_number = _unique_map_by_key(infos, lambda info: _text(info.get('id_number')))
+    by_name = _unique_map_by_key(infos, lambda info: c.normalize_name(info.get('name')))
+
+    result = {}
+    method_count = {}
+    for index, row in source_df.iterrows():
+        fw_seed = fw_seed_by_index.get(index, {})
+        candidates = [
+            ('Hand主播档案ID', by_header.get(c.format_code(row.get('主播卡片ID')))),
+            ('Hand身份证号', by_id_number.get(_text(fw_seed.get('id_number')))),
+            ('Hand主播姓名', by_name.get(c.normalize_name(_first_non_blank(row.get('主播姓名'), fw_seed.get('name'))))),
+        ]
+        selected_method = ''
+        selected_info = {}
+        for method, info in candidates:
+            if info:
+                selected_method = method
+                selected_info = info.copy()
+                break
+        if not selected_info:
+            continue
+        exact_revenue = revenue_by_header_contract.get((selected_info.get('card_id'), _text(row.get('合同编号'))))
+        if exact_revenue:
+            selected_info.update(exact_revenue)
+            selected_method = f'{selected_method}+合同编号'
+        selected_info['match_method'] = selected_method
+        result[index] = selected_info
+        method_count[selected_method] = method_count.get(selected_method, 0) + 1
+
+    print(f'[合同迁移-主播流程] Hand主播档案匹配: {len(result)}/{len(source_df)}; {method_count}')
+    return result
+
+
 def resolve_anchor_vendor_info(source, by_id_number, by_name):
     """按身份证号优先、主播姓名兜底,取主播对应的 Hand 供应商编码信息。"""
     id_number = _text(source.get('主播身份证号码'))
@@ -1231,8 +1499,27 @@ def _merge_card_info(primary, fallback):
     fallback = fallback or {}
     for key, value in fallback.items():
         if key == 'details':
-            if not merged.get('details'):
-                merged[key] = value
+            existing = merged.get('details') or []
+            seen = {
+                (
+                    _text(item.get('room_id')),
+                    _text(item.get('platform_code')),
+                    _text(item.get('platform_name')),
+                    _text(item.get('anchor_nickname')),
+                )
+                for item in existing
+            }
+            for item in value or []:
+                dedupe_key = (
+                    _text(item.get('room_id')),
+                    _text(item.get('platform_code')),
+                    _text(item.get('platform_name')),
+                    _text(item.get('anchor_nickname')),
+                )
+                if dedupe_key not in seen:
+                    existing.append(item)
+                    seen.add(dedupe_key)
+            merged[key] = existing
             continue
         if not _text(merged.get(key, '')) and _text(value):
             merged[key] = value
@@ -1652,7 +1939,6 @@ def resolve_source_values(source_df):
         _first_non_blank(source_name, info.get('name', ''), _first_browser_value(project_name_map, value))
         for source_name, info, value in zip(df['合同所属项目'], cleaned_project_info, df['合同所属项目编号ID'])
     ]
-    df['订单编号'] = df['合同所属项目编号'].map(contract_order_mapping_value)
     df['合同执行人员'] = df['合同执行人员ID'].map(
         lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
     df['合同执行人员工号'] = df['合同执行人员ID'].map(
@@ -1661,15 +1947,54 @@ def resolve_source_values(source_df):
         lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
     df['合同创建人工号'] = df['合同创建人ID'].map(
         lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
+    df['合同创建人联系方式'] = df['合同创建人ID'].map(
+        lambda value: ';'.join(c.clean_text_values(
+            employee_map.get(c.format_code(value), {}).get(field, '')
+            for field in ('workcode', 'loginid', 'mobile', 'telephone', 'email')
+        )))
+    df['申请人'] = df['申请人ID'].map(
+        lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
+    df['申请人工号'] = df['申请人ID'].map(
+        lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
+    df['申请人联系方式'] = df['申请人ID'].map(
+        lambda value: ';'.join(c.clean_text_values(
+            employee_map.get(c.format_code(value), {}).get(field, '')
+            for field in ('workcode', 'loginid', 'mobile', 'telephone', 'email')
+        )))
     status_by_number, status_by_name = _employment_status_map()
     applicant_status = c.build_applicant_status_map(df['申请人ID'], status_by_number, status_by_name)
     creator_status = c.build_applicant_status_map(df['合同创建人ID'], status_by_number, status_by_name)
+    executor_status = c.build_applicant_status_map(df['合同执行人员ID'], status_by_number, status_by_name)
     df['申请人状态'] = df['申请人ID'].map(lambda value: applicant_status.get(c.format_code(value), ''))
     df['合同创建人状态'] = df['合同创建人ID'].map(lambda value: creator_status.get(c.format_code(value), ''))
+    df['合同执行人状态'] = df['合同执行人员ID'].map(lambda value: executor_status.get(c.format_code(value), ''))
     feishu_id_map = build_feishu_employee_id_map(
-        pd.concat([df['合同执行人员工号'], df['合同创建人工号']], ignore_index=True))
+        pd.concat([df['合同执行人员工号'], df['合同创建人工号'], df['申请人工号']], ignore_index=True))
+    feishu_id_by_name = base.build_feishu_employee_id_map_by_name(df['申请人'])
+    contact_values = []
+    for value in pd.concat([df['合同创建人联系方式'], df['申请人联系方式']], ignore_index=True):
+        contact_values.extend(c.clean_text_values(_text(value).split(';')))
+    feishu_id_by_contact = base.build_feishu_employee_id_map_by_contact(contact_values)
     df['合同执行人飞书ID'] = df['合同执行人员工号'].map(lambda code: feishu_id_map.get(_text(code), ''))
-    df['合同创建人user_id'] = df['合同创建人工号'].map(lambda code: feishu_id_map.get(_text(code), ''))
+    df['合同创建人user_id'] = df.apply(
+        lambda row: feishu_id_map.get(_text(row.get('合同创建人工号')), '')
+        or next((
+            feishu_id_by_contact.get(contact)
+            for contact in c.clean_text_values(_text(row.get('合同创建人联系方式')).split(';'))
+            if feishu_id_by_contact.get(contact)
+        ), ''),
+        axis=1,
+    )
+    df['申请人user_id'] = df.apply(
+        lambda row: feishu_id_map.get(_text(row.get('申请人工号')), '')
+        or next((
+            feishu_id_by_contact.get(contact)
+            for contact in c.clean_text_values(_text(row.get('申请人联系方式')).split(';'))
+            if feishu_id_by_contact.get(contact)
+        ), '')
+        or feishu_id_by_name.get(_text(row.get('申请人')), ''),
+        axis=1,
+    )
     df = _apply_contract_creator_rules(df, status_by_number, status_by_name)
     df['合同一级类型判定'] = df.apply(
         lambda row: _contract_type_label(row['合同类型'], row['合同二级类型']),
@@ -1697,10 +2022,17 @@ def resolve_source_values(source_df):
     df['合同主表所属平台'] = df['所属平台ID'].map(lambda value: option_maps['szpt'].get(c.format_code(value), ''))
     card_info_map = build_anchor_card_info_map(df['主播卡片ID'])
     identity_card_info_map = build_anchor_card_info_map_by_identity(df)
+    hand_card_info_by_index = build_hand_anchor_card_info_map(
+        df,
+        card_info_map,
+        identity_card_info_map,
+        option_maps['szpt'],
+    )
 
     def card_info(row):
         card_id = c.format_code(row['主播卡片ID'])
-        return _merge_card_info(
+        return _merge_card_infos(
+            hand_card_info_by_index.get(row.name, {}),
             card_info_map.get(card_id, {}),
             identity_card_info_map.get(row.name, {}),
         )
@@ -1709,9 +2041,11 @@ def resolve_source_values(source_df):
         return card_info(row).get(field, '')
 
     df['主播卡片导入ID'] = df.apply(
-        lambda row: _excel_id_value(row['主播卡片ID'], card_field(row, 'card_id')),
+        lambda row: _excel_id_value(card_field(row, 'card_id'), row['主播卡片ID']),
         axis=1,
     )
+    df['主播资料来源'] = df.apply(lambda row: _text(card_field(row, 'source_table')), axis=1)
+    df['Hand主播档案匹配方式'] = df.apply(lambda row: _text(card_field(row, 'match_method')), axis=1)
     df['主播卡片编号'] = df.apply(lambda row: card_field(row, 'card_number'), axis=1)
     df['主播身份证号码'] = df.apply(lambda row: card_field(row, 'id_number'), axis=1)
     df['主播姓名_卡片'] = df.apply(lambda row: card_field(row, 'name'), axis=1)
@@ -1721,6 +2055,14 @@ def resolve_source_values(source_df):
     df['官签签约金分成比例'] = df.apply(lambda row: card_field(row, 'official_signing_bonus_share_ratio'), axis=1)
     df['固定底薪（每月）'] = df.apply(lambda row: card_field(row, 'base_salary_monthly'), axis=1)
     df['公司签约金'] = df.apply(lambda row: card_field(row, 'company_signing_bonus'), axis=1)
+    no_hand_anchor_mask = df['Hand主播档案匹配方式'].map(_text) == ''
+    excluded_no_hand_anchor_df = df.loc[no_hand_anchor_mask, [
+        '合同编号', '合同标题', '主播卡片ID', '主播姓名', '主播昵称', '主播身份证号码',
+    ]].copy()
+    if not excluded_no_hand_anchor_df.empty:
+        excluded_no_hand_anchor_df['说明'] = 'Hand anchor_profile 未按主播档案ID/身份证号/主播姓名命中,按规则不导入'
+        print(f'[合同迁移-主播流程] Hand主播档案未命中不导入: {len(excluded_no_hand_anchor_df)} 条')
+        df = df.loc[~no_hand_anchor_mask].copy()
     platform_results = df.apply(
         lambda row: resolve_anchor_platform(row, card_info(row), option_maps['szpt']),
         axis=1,
@@ -1758,6 +2100,8 @@ def resolve_source_values(source_df):
     df.attrs['supplier_info_map'] = supplier_info_map
     df.attrs['card_info_map'] = card_info_map
     df.attrs['identity_card_info_map'] = identity_card_info_map
+    df.attrs['hand_card_info_by_index'] = hand_card_info_by_index
+    df.attrs['excluded_no_hand_anchor_df'] = excluded_no_hand_anchor_df
     return df
 
 
@@ -1786,9 +2130,8 @@ def build_main_output(source_df, headers):
 
         _set(row, 'contract_number（合同编码）', _text(source['合同编号']))
         _set(row, 'contract_name（合同名称）', _text(source['合同标题']))
-        _set(row, '合同审批状态', _text(source.get('合同审批状态')))
+        _set(row, '泛微合同状态', _text(source.get('合同审批状态')))
         _set(row, '合同状态', resolve_contract_status_label(source['合同签署状态ID']))
-        _set(row, '订单编号', '')  # 暂留空,待项目/订单映射口径确认后再回填
         _set(row, 'contractCategory(智书框架合同类型)', source['合同分类'])
         _set(row, 'pay_type_code（收支类型）', source['收支类型'])
         _set(row, 'property_type_code（计价方式）', DEFAULT_PROPERTY_TYPE)
@@ -1953,6 +2296,98 @@ def build_fee_detail_output(source_df, headers):
     return pd.DataFrame(rows, columns=headers), pd.DataFrame(source_rows)
 
 
+def _anchor_attachment_download_root():
+    configured = os.getenv(base.ATTACHMENT_DOWNLOAD_ROOT_ENV, '').strip()
+    if configured:
+        return Path(configured)
+    return OUTPUT_DIR / f'主播流程合同附件_{DATE_SUFFIX}'
+
+
+def build_contract_attachment_manifest(source_df):
+    old_output_dir = base.OUTPUT_DIR
+    try:
+        base.OUTPUT_DIR = OUTPUT_DIR
+        manifest_df, missing_df = base.build_contract_attachment_manifest(source_df)
+    finally:
+        base.OUTPUT_DIR = old_output_dir
+
+    if manifest_df.empty:
+        return manifest_df, missing_df
+
+    download_root = _anchor_attachment_download_root()
+    used_paths = set()
+    manifest_df = manifest_df.copy()
+    for index, row in manifest_df.iterrows():
+        contract_dir = base._sanitize_path_part(
+            row.get('contract_number（合同编码）'),
+            f'contract_{_text(row.get("合同ID"))}',
+        )
+        target_sheet = _text(row.get('attachment_sheet')) or SHEET_OTHER_ATTACHMENT
+        target_dir = download_root / contract_dir / base._sanitize_path_part(target_sheet, target_sheet)
+        target_name = base._build_target_filename(row.get('attachment_name'), row.get('imagefileid'))
+        target_path = target_dir / target_name
+        if target_path in used_paths:
+            target_path = target_dir / f'{target_path.stem}_{row.get("imagefileid")}{target_path.suffix}'
+        used_paths.add(target_path)
+        manifest_df.at[index, 'target_path'] = str(target_path)
+    return manifest_df, missing_df
+
+
+def _build_attachment_sheet_output(manifest_df, headers, target_sheet, field_name):
+    rows = []
+    seen = set()
+    for meta in manifest_df.to_dict('records'):
+        if _text(meta.get('attachment_sheet')) != target_sheet:
+            continue
+        contract_number = _text(meta.get('contract_number（合同编码）'))
+        attachment_name = _text(meta.get('attachment_name'))
+        dedupe_key = (target_sheet, contract_number, attachment_name)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        row = _new_row(headers)
+        _set(row, 'contract_number（合同编码）', contract_number)
+        _set(row, field_name, attachment_name)
+        rows.append(row)
+    return pd.DataFrame(rows, columns=headers)
+
+
+def build_contract_attachment_output(source_df, contract_headers, other_headers):
+    manifest_df, missing_df = build_contract_attachment_manifest(source_df)
+    contract_output_df = _build_attachment_sheet_output(
+        manifest_df,
+        contract_headers,
+        SHEET_CONTRACT_ATTACHMENT,
+        'contract_files.contract_causes（合同附件）',
+    )
+    other_output_df = _build_attachment_sheet_output(
+        manifest_df,
+        other_headers,
+        SHEET_OTHER_ATTACHMENT,
+        'contract_files.contract_attachments（其他附件）',
+    )
+    return contract_output_df, other_output_df, manifest_df, missing_df
+
+
+def _download_enabled(cookie):
+    flag = os.getenv(base.ATTACHMENT_DOWNLOAD_ENABLED_ENV, '').strip().lower()
+    if flag in ('0', 'false', 'n', 'no', '否'):
+        return False
+    return bool(_text(cookie))
+
+
+def _download_attachment_manifest_16_workers(manifest_df, cookie):
+    old_workers = os.environ.get(base.ATTACHMENT_DOWNLOAD_WORKERS_ENV)
+    os.environ[base.ATTACHMENT_DOWNLOAD_WORKERS_ENV] = '16'
+    try:
+        return base.download_attachment_manifest(manifest_df, cookie, log_prefix='主播流程合同附件')
+    finally:
+        if old_workers is None:
+            os.environ.pop(base.ATTACHMENT_DOWNLOAD_WORKERS_ENV, None)
+        else:
+            os.environ[base.ATTACHMENT_DOWNLOAD_WORKERS_ENV] = old_workers
+
+
 def build_status_breakdown():
     option_maps = c.build_fw_select_option_maps(FW_TABLE, ['htzt'])
     df = _query_fw(STATUS_BREAKDOWN_SQL)
@@ -1967,8 +2402,8 @@ def build_status_breakdown():
 MAIN_ISSUE_SOURCE_FIELDS = {
     'contract_number（合同编码）': '合同编号',
     'contract_name（合同名称）': '合同标题',
+    '泛微合同状态': '合同审批状态',
     '合同状态': '合同签署状态ID',
-    '订单编号': '合同所属项目编号',
     'contractCategory(智书框架合同类型)': '合同二级类型',
     'custom_1001_948719050bfe402ab083c98e52fa71b2（合同执行人）': '合同执行人员ID',
     'start_date（合同期限-开始日期）': '合同有效期起始时间',
@@ -2025,6 +2460,20 @@ def collect_missing_final_anchor_card(source_df):
     return result
 
 
+def collect_excluded_no_hand_anchor(source_df):
+    excluded_df = source_df.attrs.get('excluded_no_hand_anchor_df', pd.DataFrame())
+    if excluded_df.empty:
+        return pd.DataFrame(columns=[
+            '合同编号', '合同标题', '主播卡片ID', '主播姓名', '主播昵称',
+            '主播身份证号码', '说明',
+        ])
+    columns = [
+        '合同编号', '合同标题', '主播卡片ID', '主播姓名', '主播昵称',
+        '主播身份证号码', '说明',
+    ]
+    return excluded_df[[column for column in columns if column in excluded_df.columns]].drop_duplicates()
+
+
 def run():
     headers_by_sheet = _template_headers()
     required_by_sheet, remarks_by_sheet = _read_anchor_required_rules(headers_by_sheet)
@@ -2038,21 +2487,38 @@ def run():
         source_df, headers_by_sheet[SHEET_OUR_PARTY])
     fee_detail_output_df, fee_detail_source_df = build_fee_detail_output(
         source_df, headers_by_sheet[SHEET_FEE_DETAIL])
+    contract_attachment_output_df, other_attachment_output_df, manifest_df, missing_df = build_contract_attachment_output(
+        source_df,
+        headers_by_sheet[SHEET_CONTRACT_ATTACHMENT],
+        headers_by_sheet[SHEET_OTHER_ATTACHMENT],
+    )
 
     print('[合同迁移-主播流程] 字段模板行数:', len(main_output_df))
     print('[合同迁移-主播流程] 对方信息行数:', len(counterparty_output_df))
     print('[合同迁移-主播流程] 我方信息行数:', len(our_party_output_df))
     print('[合同迁移-主播流程] 费用明细行数:', len(fee_detail_output_df))
+    print('[合同迁移-主播流程] 合同附件行数:', len(contract_attachment_output_df))
+    print('[合同迁移-主播流程] 其他附件行数:', len(other_attachment_output_df))
 
     output_file = _write_template_sheets_with_fallback(TEMPLATE_FILE, OUTPUT_FILE, {
         SHEET_MAIN: main_output_df,
         SHEET_COUNTERPARTY: counterparty_output_df,
         SHEET_OUR_PARTY: our_party_output_df,
         SHEET_FEE_DETAIL: fee_detail_output_df,
+        SHEET_CONTRACT_ATTACHMENT: contract_attachment_output_df,
+        SHEET_OTHER_ATTACHMENT: other_attachment_output_df,
     })
     _add_flow_audit_sheet(output_file, source_df)
     _add_platform_audit_sheet(output_file, source_df)
     print('已写出:', output_file)
+
+    if manifest_df.empty:
+        print('[合同迁移-主播流程] 没有可列示附件。')
+    else:
+        manifest_df = manifest_df.copy()
+        manifest_df['status'] = 'listed_only'
+        manifest_df['error'] = '主播主流程任务仅生成附件名称/下载清单;下载请单独运行 contract_anchor_attachments_db'
+        print(f'[合同迁移-主播流程] 附件清单行数: {len(manifest_df)}; 未执行下载')
 
     exception_sheets = {
         '过滤状态分布': build_status_breakdown(),
@@ -2088,16 +2554,12 @@ def run():
         ),
         '对方主体编码_未匹配': collect_missing_counterparty(counterparty_source_df),
         '我方主体编码_未匹配': collect_missing_our_party(our_party_source_df),
+        'Hand主播档案未命中_不导入': collect_excluded_no_hand_anchor(source_df),
         '主播卡片补充信息_未匹配': collect_missing_anchor_card(source_df),
         '最终主播卡片_未匹配': collect_missing_final_anchor_card(source_df),
+        '合同附件下载清单': manifest_df,
+        '合同附件DOCID_缺失映射': missing_df,
     }
-    exception_sheets.update(c.collect_order_mapping_issues(
-        source_df,
-        doc_col='合同编号',
-        project_col='合同所属项目编号',
-        project_id_col='合同所属项目编号ID',
-        project_name_col='合同所属项目名称',
-    ))
     exception_sheets.update({
         f'字段模板_{name}': df
         for name, df in _collect_missing_details(
@@ -2112,6 +2574,12 @@ def run():
     exception_file = _write_exceptions_with_fallback(EXCEPTION_FILE, exception_sheets)
     if exception_file:
         print('已写出:', exception_file)
+    manifest_file = _write_exceptions_with_fallback(MANIFEST_FILE, {
+        '合同附件下载清单': manifest_df,
+        '合同附件DOCID_缺失映射': missing_df,
+    })
+    if manifest_file:
+        print('已写出:', manifest_file)
 
 
 if __name__ == '__main__':
