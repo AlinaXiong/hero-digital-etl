@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
 """应付期初 —— 对公付款单 / 批量费用流程 / 只转入外部成本(DB 直连版)。
 
-按《业财项目_数据映射规则.xlsx》-「应付期初」生成期初对公付款单导入模板的三个 sheet:
+按《业财项目_数据映射规则.xlsx》-「应付期初」生成期初对公付款单导入模板:
+    0. 汇总
     1. 期初对公付款单导入
     2. 批量费用流程
     3. 只转入外部成本
 
 跑法:在项目根执行  python run.py ap_payment_opening_extra_db
 """
+import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -27,16 +30,19 @@ TEMPLATE_DIR = c.TPL_DIR / 'ap_payment_opening'
 OUTPUT_DIR = c.OUT_DIR / TASK_NAME
 DATE_SUFFIX = c.today_suffix()
 
-PROJECT_FILTER_FILE = Path.home() / 'Downloads' / '数据清洗涉及泛微项目编码_0624_分类.xlsx'
+PROJECT_FILTER_ENV = 'PROJECT_FILTER_XLSX'
+PROJECT_FILTER_DEFAULT_FILE = c.RULES_DIR / '数据清洗涉及泛微项目编码_0624_分类.xlsx'
+PROJECT_FILTER_FILE = Path(os.getenv(PROJECT_FILTER_ENV, '').strip() or PROJECT_FILTER_DEFAULT_FILE)
 
 TEMPLATE_FILE = TEMPLATE_DIR / '英雄期初对公付款单导入模版.xlsx'
-OUTPUT_FILE = OUTPUT_DIR / f'英雄期初对公付款单导入_应付期初_补充_{DATE_SUFFIX}.xlsx'
-EXCEPTION_FILE = OUTPUT_DIR / f'未匹配清单_应付期初_补充_{DATE_SUFFIX}.xlsx'
+OUTPUT_FILE = OUTPUT_DIR / f'英雄期初对公付款单导入_应付期初全量_{DATE_SUFFIX}.xlsx'
+EXCEPTION_FILE = OUTPUT_DIR / f'未匹配清单_应付期初全量_{DATE_SUFFIX}.xlsx'
 BASE_SUPPLIER_VENDOR_MISSING_FILE = OUTPUT_DIR / f'Hand按ID查不到的供应商_期初对公付款单导入_{DATE_SUFFIX}.xlsx'
 MCN_SUPPLIER_VENDOR_MISSING_FILE = OUTPUT_DIR / f'Hand按ID查不到的供应商_MCN对公付款_{DATE_SUFFIX}.xlsx'
 BATCH_SUPPLIER_VENDOR_MISSING_FILE = OUTPUT_DIR / f'Hand按ID查不到的供应商_批量费用流程_{DATE_SUFFIX}.xlsx'
 
 BASE_TEMPLATE_SHEET = '期初对公付款单导入'
+SUMMARY_SHEET = '汇总'
 SHEET_BATCH = '批量费用流程'
 SHEET_EXTERNAL_COST = '只转入外部成本'
 SHEET_MCN_OUTBOUND = 'MCN对外付款流程'
@@ -259,6 +265,7 @@ SELECT
     d.fyx AS `费用项名称`,
     d.je AS `金额`,
     d.fjhzbid AS `主播房间号`,
+    d.sfzh AS `身份证号`,
     d.zbnc AS `主播昵称`
 FROM formtable_main_33 m
 JOIN formtable_main_33_dt1 d ON d.mainid = m.id
@@ -291,6 +298,7 @@ SELECT * FROM (
         d.fyx AS `费用项名称`,
         COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
         d.zbid AS `主播房间号`,
+        d.sfzh AS `身份证号`,
         d.zbnc AS `主播昵称`
     FROM formtable_main_66 m
     JOIN formtable_main_66_dt3 d ON d.mainid = m.id
@@ -318,6 +326,7 @@ SELECT * FROM (
         d.fyx AS `费用项名称`,
         COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
         d.zbid AS `主播房间号`,
+        d.sfzh AS `身份证号`,
         d.zbnc AS `主播昵称`
     FROM formtable_main_66 m
     JOIN formtable_main_66_dt4 d ON d.mainid = m.id
@@ -345,6 +354,7 @@ SELECT * FROM (
         d.fyx AS `费用项名称`,
         COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
         d.zbid AS `主播房间号`,
+        d.sfzh AS `身份证号`,
         d.zbmc AS `主播昵称`
     FROM formtable_main_66 m
     JOIN formtable_main_66_dt5 d ON d.mainid = m.id
@@ -372,6 +382,7 @@ SELECT * FROM (
         d.fyx AS `费用项名称`,
         COALESCE(d.fkje, d.zcje, d.jsje) AS `金额`,
         NULL AS `主播房间号`,
+        NULL AS `身份证号`,
         NULL AS `主播昵称`
     FROM formtable_main_66 m
     JOIN formtable_main_66_dt6 d ON d.mainid = m.id
@@ -404,6 +415,7 @@ SELECT
     d.fyx AS `费用项名称`,
     COALESCE(d.dkje, d.yfuje, d.skje, d.yfaje) AS `金额`,
     d.zbid AS `主播房间号`,
+    d.sfzh AS `身份证号`,
     d.zbnc AS `主播昵称`
 FROM formtable_main_38 m
 JOIN formtable_main_38_dt4 d ON d.mainid = m.id
@@ -424,6 +436,33 @@ def _text(value):
         return ''
     text = str(value).strip()
     return '' if text in ('', 'nan', 'None', 'NaT') else text
+
+
+def _fanwei_fee_code(raw_code):
+    text = _text(raw_code)
+    if '_' in text:
+        text = text.rsplit('_', 1)[-1]
+    return text
+
+
+def _fanwei_fee_item_display(raw_value, raw_name=''):
+    """输出泛微页面里的费用项显示值,如 N24下单成本。"""
+    value = _text(raw_value)
+    name = _text(raw_name)
+    if name:
+        code = _fanwei_fee_code(value)
+        if code and not name.startswith(code):
+            return f'{code}{name}'
+        return name
+    if '/' in value:
+        return value.rsplit('/', 1)[-1]
+    code = _fanwei_fee_code(value)
+    fallback_name = load_mcn_fee_names().get(code, '')
+    return f'{code}{fallback_name}' if code and fallback_name else code
+
+
+def _id_number_key(value):
+    return _text(value).replace(' ', '').upper()
 
 
 def _first_browser_value(mapping, value):
@@ -455,6 +494,8 @@ def _chunks(values, size=SQL_BATCH_SIZE):
 
 _PROJECT_FILTER_CACHE = None
 _PROJECT_FILTER_ID_CACHE = {}
+_MCN_FEE_NAME_CACHE = None
+_MCN_FEE_SUBJECT_CACHE = None
 
 
 def load_project_filter_codes():
@@ -479,6 +520,41 @@ def load_project_filter_codes():
         f"| MCN {len(result[MCN_PROJECT_SHEET])} 个",
     )
     _PROJECT_FILTER_CACHE = result
+    return result
+
+
+def load_mcn_fee_names():
+    """MCN 泛微旧费用项编码 -> 旧费用项名称,用于补齐源表缺失的费用项名称。"""
+    global _MCN_FEE_NAME_CACHE
+    if _MCN_FEE_NAME_CACHE is not None:
+        return _MCN_FEE_NAME_CACHE
+
+    df = pd.read_excel(c.RULE_XLSX, sheet_name='MCN泛微新旧科目映射底表', header=None, dtype=str)
+    result = {}
+    for _, row in df.iloc[2:].iterrows():
+        code = _fanwei_fee_code(row[1] if 1 < len(row) else '')
+        name = _text(row[2] if 2 < len(row) else '')
+        if code and name:
+            result[code] = name
+    _MCN_FEE_NAME_CACHE = result
+    return result
+
+
+def load_mcn_fee_subjects():
+    """MCN 泛微旧费用项编码 -> (费用项目编码,费用项目描述)。"""
+    global _MCN_FEE_SUBJECT_CACHE
+    if _MCN_FEE_SUBJECT_CACHE is not None:
+        return _MCN_FEE_SUBJECT_CACHE
+
+    df = pd.read_excel(c.RULE_XLSX, sheet_name='MCN泛微新旧科目映射底表', header=None, dtype=str)
+    result = {}
+    for _, row in df.iloc[2:].iterrows():
+        old_code = _fanwei_fee_code(row[1] if 1 < len(row) else '')
+        subject_code = _text(row[5] if 5 < len(row) else '')
+        subject_name = _text(row[6] if 6 < len(row) else '')
+        if old_code and subject_code:
+            result[old_code] = (subject_code, subject_name)
+    _MCN_FEE_SUBJECT_CACHE = result
     return result
 
 
@@ -629,6 +705,18 @@ def _apply_order_project_columns(output_df, source_df, table_order=EVENT_PROJECT
     df['泛微项目编号'] = project_codes
     df['订单编号'] = project_codes.map(lambda value: c.project_order_mapping_value(value, '订单编号'))
     df['订单名称'] = project_codes.map(lambda value: c.project_order_mapping_value(value, '订单标题'))
+    if '费用项编码' in source_df.columns:
+        fee_names = (
+            source_df['费用项名称']
+            if '费用项名称' in source_df.columns
+            else pd.Series('', index=source_df.index)
+        )
+        df['泛微费用项目编码'] = [
+            _fanwei_fee_item_display(code, name)
+            for code, name in zip(source_df['费用项编码'], fee_names)
+        ]
+    elif '预算科目' in source_df.columns:
+        df['泛微费用项目编码'] = source_df['预算科目'].where(source_df['预算科目'].notna(), '')
     return df[OUTPUT_COLUMNS]
 
 
@@ -717,7 +805,108 @@ def _mcn_fee_subject_item(subject_lookup, raw_code, index):
     key = _mcn_fee_subject_key(raw_code, subject_lookup)
     if not key:
         return ''
-    return subject_lookup.get(key, ('', ''))[index]
+    item = subject_lookup.get(key)
+    if item:
+        return item[index]
+    return load_mcn_fee_subjects().get(_fanwei_fee_code(raw_code), ('', ''))[index]
+
+
+def build_hand_anchor_room_map(id_numbers):
+    keys = c.clean_text_values(_id_number_key(value) for value in id_numbers)
+    if not keys:
+        return {}
+
+    rows = []
+    for batch in _chunks(keys):
+        batch_rows = c.query_db(
+            'ZT',
+            'hfins',
+            f'''
+            SELECT certificate_number, anchor_id
+            FROM (
+                SELECT p.certificate_number, l.anchor_id
+                FROM anchor_profile_list p
+                JOIN anchor_platform_list_line l ON l.header_id = p.header_id
+                WHERE REPLACE(UPPER(p.certificate_number), ' ', '') IN ({c.in_placeholders(batch)})
+                  AND COALESCE(p.enable, 'Y') <> 'N'
+                  AND COALESCE(l.anchor_id, '') <> ''
+                UNION ALL
+                SELECT p.certificate_number, l.anchor_id
+                FROM anchor_profile_header p
+                JOIN anchor_platform_line l ON l.header_id = p.header_id
+                WHERE REPLACE(UPPER(p.certificate_number), ' ', '') IN ({c.in_placeholders(batch)})
+                  AND COALESCE(p.delete_flag, 'N') <> 'Y'
+                  AND COALESCE(l.anchor_id, '') <> ''
+            ) x
+            ''',
+            list(batch) + list(batch),
+        )
+        rows.append(batch_rows)
+
+    if not rows:
+        return {}
+    result = {}
+    room_df = pd.concat(rows, ignore_index=True)
+    for _, row in room_df.iterrows():
+        key = _id_number_key(row['certificate_number'])
+        room = _text(row['anchor_id'])
+        if not key or not room:
+            continue
+        result.setdefault(key, [])
+        if room not in result[key]:
+            result[key].append(room)
+    return {key: ';'.join(rooms) for key, rooms in result.items()}
+
+
+def build_fw_anchor_room_map(room_values):
+    room_ids = c.clean_codes(
+        room_id
+        for value in room_values
+        for room_id in c.parse_browser_ids(value)
+    )
+    if not room_ids:
+        return {}
+
+    result = {}
+    for batch in _chunks(room_ids):
+        room_df = c.query_db(
+            'FW',
+            'vspn_xtyy',
+            f'''
+            SELECT id, zbid
+            FROM uf_zbkp_dt1
+            WHERE id IN ({c.in_placeholders(batch)})
+              AND COALESCE(zbid, '') <> ''
+            ''',
+            batch,
+        )
+        for _, row in room_df.iterrows():
+            room_id = c.format_code(row['id'])
+            room_no = _text(row['zbid'])
+            if room_id and room_no:
+                result[room_id] = room_no
+    return result
+
+
+def _resolve_fw_anchor_room(value, room_map):
+    mapped = _first_browser_value(room_map, value)
+    return mapped or _text(value)
+
+
+def resolve_anchor_room_numbers(source_df):
+    hand_room_map = build_hand_anchor_room_map(source_df.get('身份证号', pd.Series(dtype=str)))
+    fw_room_map = build_fw_anchor_room_map(source_df.get('主播房间号', pd.Series(dtype=str)))
+    hand_hits = 0
+    result = []
+    for _, row in source_df.iterrows():
+        hand_room = hand_room_map.get(_id_number_key(row.get('身份证号')))
+        if hand_room:
+            hand_hits += 1
+            result.append(hand_room)
+        else:
+            result.append(_resolve_fw_anchor_room(row.get('主播房间号'), fw_room_map))
+    print(f'[应付期初-MCN主播相关付款流程] 主播房间号: 汉得身份证命中 {hand_hits}/{len(source_df)} 行')
+    return result
 
 
 def _resolve_company_name(company_map, value):
@@ -755,8 +944,46 @@ def _move_sheets_to_front(workbook, sheet_names):
     workbook._sheets = ordered_sheets + remaining_sheets
 
 
+def _build_summary_df(sheet_to_df):
+    summary_frames = []
+    summary_columns = ['来源Sheet']
+    for output_df in sheet_to_df.values():
+        for column_name in output_df.columns:
+            if column_name not in summary_columns:
+                summary_columns.append(column_name)
+
+    for sheet_name, output_df in sheet_to_df.items():
+        summary_part = output_df.copy()
+        summary_part.insert(0, '来源Sheet', sheet_name)
+        summary_frames.append(summary_part.reindex(columns=summary_columns))
+
+    if not summary_frames:
+        return pd.DataFrame(columns=summary_columns)
+    return pd.concat(summary_frames, ignore_index=True)
+
+
+def _save_workbook(workbook, output_file):
+    try:
+        workbook.save(output_file)
+        return output_file
+    except PermissionError:
+        fallback_file = output_file.with_name(
+            f'{output_file.stem}_{datetime.now().strftime("%H%M%S")}{output_file.suffix}'
+        )
+        print(f'[应付期初] 输出文件被占用，已改写到: {fallback_file}')
+        workbook.save(fallback_file)
+        return fallback_file
+
+
 def write_output_workbook(base_output_df, batch_output_df, external_output_df, mcn_output_dfs=None):
     wb = load_workbook(TEMPLATE_FILE)
+    sheet_to_df = {
+        BASE_TEMPLATE_SHEET: base_output_df,
+        SHEET_BATCH: batch_output_df,
+        SHEET_EXTERNAL_COST: external_output_df,
+        **(mcn_output_dfs or {}),
+    }
+    _fill_sheet(_copy_template_sheet(wb, SUMMARY_SHEET), _build_summary_df(sheet_to_df))
     _fill_sheet(wb[BASE_TEMPLATE_SHEET], base_output_df)
     _fill_sheet(_copy_template_sheet(wb, SHEET_BATCH), batch_output_df)
     _fill_sheet(_copy_template_sheet(wb, SHEET_EXTERNAL_COST), external_output_df)
@@ -764,11 +991,10 @@ def write_output_workbook(base_output_df, batch_output_df, external_output_df, m
         _fill_sheet(_copy_template_sheet(wb, sheet_name), output_df)
     _move_sheets_to_front(
         wb,
-        [BASE_TEMPLATE_SHEET, SHEET_BATCH, SHEET_EXTERNAL_COST, *(mcn_output_dfs or {}).keys()],
+        [SUMMARY_SHEET, BASE_TEMPLATE_SHEET, SHEET_BATCH, SHEET_EXTERNAL_COST, *(mcn_output_dfs or {}).keys()],
     )
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(OUTPUT_FILE)
-    return OUTPUT_FILE
+    return _save_workbook(wb, OUTPUT_FILE)
 
 
 def _allocate_group_amounts(group, total_col):
@@ -1019,7 +1245,10 @@ def build_mcn_payment_output(source_df):
         lambda value: _mcn_fee_subject_item(subject_lookup, value, 0))
     output_df['费用项目描述'] = source_df['费用项编码'].map(
         lambda value: _mcn_fee_subject_item(subject_lookup, value, 1))
-    output_df['主播房间号'] = source_df['主播房间号'].map(_text)
+    if source_df['来源流程'].map(_text).eq('MCN主播相关付款流程').all():
+        output_df['主播房间号'] = resolve_anchor_room_numbers(source_df)
+    else:
+        output_df['主播房间号'] = ''
     output_df['报账币种'] = 'CNY'
     output_df['报账金额（支付币种）'] = amount.map(c.round_amount)
     output_df['泛微费用项目编码'] = source_df['费用项编码'].map(_text)
@@ -1356,8 +1585,8 @@ def run():
         c.report_fill(output_df, required_cols)
 
     # 4. 写入模板:同一个 Excel 内写入六个数据 sheet,lov 页保留。
-    write_output_workbook(base_output_df, batch_output_df, external_output_df, mcn_output_dfs)
-    print('已写出:', OUTPUT_FILE)
+    output_file = write_output_workbook(base_output_df, batch_output_df, external_output_df, mcn_output_dfs)
+    print('已写出:', output_file)
 
     # 5. 问题清单
     exception_sheets = {}
