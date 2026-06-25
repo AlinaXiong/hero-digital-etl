@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+from openpyxl import load_workbook
 
 if __package__ is None or __package__ == '':
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -30,9 +31,16 @@ TEMPLATE_FILE = TEMPLATE_DIR / '英雄期初预付款单导入模版.xlsx'
 OUTPUT_FILE = OUTPUT_DIR / f'英雄期初预付款单导入_预付期初_{DATE_SUFFIX}.xlsx'
 EXCEPTION_FILE = OUTPUT_DIR / f'未匹配清单_预付期初_{DATE_SUFFIX}.xlsx'
 SUPPLIER_VENDOR_MISSING_FILE = OUTPUT_DIR / f'Hand按ID查不到的供应商_预付期初_{DATE_SUFFIX}.xlsx'
+MCN_SUPPLIER_VENDOR_MISSING_FILE = OUTPUT_DIR / f'Hand按ID查不到的供应商_MCN预付期初_{DATE_SUFFIX}.xlsx'
 
 TEMPLATE_SHEET_SUPPLIER = '期初供应商预付款单&期初投资付款单导入'
 TEMPLATE_SHEET_GIG = '期初灵工预付款单导入'
+SHEET_MCN_PREPAYMENT = 'MCN预付款流程'
+SHEET_MCN_PREPAYMENT_ORDER = 'MCN预付款流程(订单)'
+SHEET_MCN_ANCHOR_PREPAYMENT = 'MCN主播相关预付款'
+SHEET_MCN_OUTBOUND_PREPAYMENT = 'MCN对外付款非直付'
+SHEET_MCN_OUTBOUND_ORDER_PREPAYMENT = 'MCN对外付款订单非直付'
+SHEET_MCN_ANCHOR_PLATFORM_PREPAYMENT = 'MCN主播付款非直付'
 RULE_SHEET = '预付期初'
 RULE_TABLE_SUPPLIER = '期初供应商预付款单&期初投资付款单导入'
 RULE_TABLE_GIG = '期初灵工预付款单导入'
@@ -40,6 +48,16 @@ RULE_TABLE_GIG = '期初灵工预付款单导入'
 DOCUMENT_TYPE = 'JK01-2'
 GIG_DOCUMENT_TYPE = 'PP01-2'
 GIG_PLATFORM_VENDOR = {'云账户': 'V-C-CN-HR-PAY-0001', '赛利得': 'V-C-CN-OT-OTH-6573'}
+PROJECT_FILTER_FILE = Path.home() / 'Downloads' / '数据清洗涉及泛微项目编码_0624_分类.xlsx'
+EVENT_PROJECT_SHEET = '赛事'
+MCN_PROJECT_SHEET = 'MCN'
+EVENT_PROJECT_TABLES = ('uf_xtyyxmkp', 'uf_xmkp', 'view_xmjkzb')
+MCN_PROJECT_TABLES = ('uf_xmkp', 'view_xmjkzb', 'uf_xtyyxmkp')
+SQL_BATCH_SIZE = 800
+SOURCE_SYSTEM = 'FW'
+DIRECT_PAYMENT_PLATFORM_CODE = '2'
+PREPAYMENT_YES_CODE = '0'
+PREPAYMENT_NO_CODE = '1'
 
 SUPPLIER_OUTPUT_COLUMNS = [
     '来源系统',
@@ -121,6 +139,24 @@ GIG_ISSUE_SOURCE_FIELDS = {
     '收款方编码': '实际收款方',
     '订单编号': '项目编号',
 }
+MCN_SUPPLIER_ISSUE_SOURCE_FIELDS = {
+    '申请人工号': '申请人',
+    '收款方编码': '供应商',
+    '核算主体编号': '公司主体',
+    '费用项目编码': '预算科目',
+    '预付款支付币种': '',
+    '订单编号': '项目编号',
+}
+MCN_GIG_ISSUE_SOURCE_FIELDS = {
+    '申请人工号': '申请人',
+    '灵工平台收款方编码': '供应商',
+    '核算主体编号': '公司主体',
+    '费用项目编码': '预算科目',
+    '收款方编码': '实际收款方',
+    '订单编号': '项目编号',
+}
+GIG_NOT_INVOLVED_REQUIRED_COLUMNS = {'保证金标志'}
+MCN_GIG_NOT_INVOLVED_REQUIRED_COLUMNS = {'保证金标志', '备注'}
 
 FW_SUPPLIER_TABLE = 'uf_yfkxx'
 FW_SUPPLIER_DETAIL_TABLE = 'uf_yfkxx_dt1'
@@ -131,6 +167,14 @@ FW_GIG_WORKFLOW_TABLE = 'formtable_main_279'
 FW_GIG_BUDGET_TABLE = 'formtable_main_279_dt3'
 FW_GIG_RECIPIENT_TABLE = 'formtable_main_279_dt4'
 FW_PROJECT_TABLE = 'uf_xtyyxmkp'
+FW_MCN_PREPAYMENT_TABLE = 'formtable_main_29'
+FW_MCN_PREPAYMENT_ORDER_TABLE = 'formtable_main_83'
+FW_MCN_ANCHOR_TABLE = 'formtable_main_38'
+FW_MCN_OUTBOUND_TABLE = 'formtable_main_33'
+FW_MCN_OUTBOUND_ORDER_TABLE = 'formtable_main_66'
+FW_MCN_PREPAYMENT_OFFSET_TABLE = 'formtable_main_30'
+FW_MCN_PREPAYMENT_ORDER_OFFSET_TABLE = 'formtable_main_82'
+FW_MCN_ANCHOR_OFFSET_TABLE = 'formtable_main_105'
 
 
 # ============================ 枚举 / 过滤口径 ============================
@@ -188,35 +232,21 @@ LEFT JOIN (
     JOIN uf_dgfktz p ON p.id = x.mainid
     WHERE x.yfkxx IS NOT NULL
       AND x.yfkxx <> ''
-      AND p.sqrq >= %(date_from)s
-      AND p.lcz = %(approved_status_code)s
-      AND (p.sfzf IS NULL OR p.sfzf <> %(void_code)s)
     GROUP BY CAST(x.yfkxx AS CHAR), CAST(x.yskm AS CHAR)
 ) w ON w.prepayment_id = CAST(m.id AS CHAR)
    AND w.budget_subject_id = CAST(d.yskm AS CHAR)
-WHERE m.sqrq >= %(date_from)s
-  AND m.lczt = %(approved_status_code)s
-  AND (m.sfzf IS NULL OR m.sfzf <> %(void_code)s)
+WHERE m.xmbh IN %(project_ids)s
 ORDER BY m.id, d.id
 """
 
 SUPPLIER_STATS_SQL = """
 SELECT
-    SUM(CASE
-        WHEN m.sqrq >= %(date_from)s
-         AND m.lczt = %(approved_status_code)s
-        THEN 1 ELSE 0 END) AS matched_count,
-    SUM(CASE
-        WHEN m.sqrq >= %(date_from)s
-         AND m.lczt = %(approved_status_code)s
-         AND m.sfzf = %(void_code)s
-        THEN 1 ELSE 0 END) AS void_count,
-    SUM(CASE
-        WHEN m.sqrq >= %(date_from)s
-         AND m.lczt = %(approved_status_code)s
-         AND (m.sfzf IS NULL OR m.sfzf <> %(void_code)s)
-        THEN 1 ELSE 0 END) AS kept_count
+    COUNT(DISTINCT m.id) AS document_count,
+    COUNT(*) AS detail_count,
+    SUM(d.yfje) AS amount_total
 FROM uf_yfkxx m
+JOIN uf_yfkxx_dt1 d ON d.mainid = m.id
+WHERE m.xmbh IN %(project_ids)s
 """
 
 GIG_RECIPIENT_SOURCE_SQL = """
@@ -257,9 +287,7 @@ JOIN formtable_main_279 w
   ON CAST(w.requestId AS CHAR) = h.lczsjqqid
 JOIN formtable_main_279_dt4 d
   ON d.mainid = w.id
-WHERE h.sqrq >= %(date_from)s
-  AND h.lczt = %(approved_status_code)s
-  AND (h.sfzf IS NULL OR h.sfzf <> %(void_code)s)
+WHERE COALESCE(NULLIF(CAST(h.xmbh AS CHAR), ''), NULLIF(CAST(w.xmbh AS CHAR), '')) IN %(project_ids)s
 ORDER BY h.id, d.id
 """
 
@@ -269,6 +297,8 @@ SELECT
     w.id AS `流程付款ID`,
     b.id AS `预算明细ID`,
     h.lcbh AS `流程编号`,
+    COALESCE(NULLIF(CAST(h.xmbh AS CHAR), ''), NULLIF(CAST(w.xmbh AS CHAR), '')) AS `项目编号ID`,
+    COALESCE(NULLIF(h.xmmc, ''), NULLIF(w.xmmc, '')) AS `项目名称`,
     b.yskm AS `预算科目ID`,
     b.fysx AS `费用事项`,
     b.fkje AS `预算项金额`,
@@ -278,29 +308,454 @@ JOIN formtable_main_279 w
   ON CAST(w.requestId AS CHAR) = h.lczsjqqid
 JOIN formtable_main_279_dt3 b
   ON b.mainid = w.id
-WHERE h.sqrq >= %(date_from)s
-  AND h.lczt = %(approved_status_code)s
-  AND (h.sfzf IS NULL OR h.sfzf <> %(void_code)s)
+WHERE COALESCE(NULLIF(CAST(h.xmbh AS CHAR), ''), NULLIF(CAST(w.xmbh AS CHAR), '')) IN %(project_ids)s
 ORDER BY h.id, b.id
 """
 
 GIG_STATS_SQL = """
 SELECT
-    SUM(CASE
-        WHEN h.sqrq >= %(date_from)s
-         AND h.lczt = %(approved_status_code)s
-        THEN 1 ELSE 0 END) AS matched_count,
-    SUM(CASE
-        WHEN h.sqrq >= %(date_from)s
-         AND h.lczt = %(approved_status_code)s
-         AND h.sfzf = %(void_code)s
-        THEN 1 ELSE 0 END) AS void_count,
-    SUM(CASE
-        WHEN h.sqrq >= %(date_from)s
-         AND h.lczt = %(approved_status_code)s
-         AND (h.sfzf IS NULL OR h.sfzf <> %(void_code)s)
-        THEN 1 ELSE 0 END) AS kept_count
+    COUNT(DISTINCT h.id) AS document_count,
+    COUNT(*) AS detail_count,
+    SUM(d.sl) AS amount_total
 FROM uf_lgptfk h
+JOIN formtable_main_279 w
+  ON CAST(w.requestId AS CHAR) = h.lczsjqqid
+JOIN formtable_main_279_dt4 d
+  ON d.mainid = w.id
+WHERE COALESCE(NULLIF(CAST(h.xmbh AS CHAR), ''), NULLIF(CAST(w.xmbh AS CHAR), '')) IN %(project_ids)s
+"""
+
+MCN_PREPAYMENT_SOURCE_SQL = """
+SELECT
+    'MCN预付款流程' AS `来源流程`,
+    m.id AS `ID`,
+    m.requestId AS `RequestID`,
+    d.id AS `明细ID`,
+    m.lcbh AS `流程编号`,
+    rb.REQUESTNAME AS `标题`,
+    m.sqrq AS `申请日期`,
+    m.sqr AS `申请人ID`,
+    m.gszt AS `公司主体ID`,
+    COALESCE(m.cbzx1, m.cbzx) AS `成本中心ID`,
+    m.gysmc AS `供应商ID`,
+    m.yhzh AS `银行账号ID`,
+    m.szht AS `主表合同ID`,
+    d.szht AS `明细合同ID`,
+    d.szxm AS `项目编号ID`,
+    d.xmmc AS `项目名称`,
+    d.fjxh AS `费用项编码`,
+    d.fyx AS `费用项名称`,
+    d.je AS `金额`,
+    d.fjhzbid AS `主播房间号`,
+    d.zbnc AS `主播昵称`,
+    d.sfzh AS `身份证号`,
+    d.skr AS `实际收款方`,
+    d.sjh AS `手机号`,
+    d.yhzh AS `明细银行账号`
+FROM formtable_main_29 m
+JOIN formtable_main_29_dt1 d ON d.mainid = m.id
+LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestId
+WHERE d.szxm IN %(project_ids)s
+ORDER BY m.id, d.id
+"""
+
+MCN_PREPAYMENT_ORDER_SOURCE_SQL = """
+SELECT * FROM (
+    SELECT
+        'MCN预付款流程（订单）' AS `来源流程`,
+        m.id AS `ID`,
+        m.requestid AS `RequestID`,
+        d.id AS `明细ID`,
+        m.lcbh AS `流程编号`,
+        rb.REQUESTNAME AS `标题`,
+        m.sqrq AS `申请日期`,
+        m.sqr AS `申请人ID`,
+        m.gszt AS `公司主体ID`,
+        m.cbzx AS `成本中心ID`,
+        m.gysmc AS `供应商ID`,
+        m.yhzh AS `银行账号ID`,
+        m.szht AS `主表合同ID`,
+        NULL AS `明细合同ID`,
+        d.szxm AS `项目编号ID`,
+        d.xmmc AS `项目名称`,
+        d.fjxh AS `费用项编码`,
+        d.fyx AS `费用项名称`,
+        COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
+        d.zbid AS `主播房间号`,
+        d.zbnc AS `主播昵称`,
+        d.sfzh AS `身份证号`,
+        d.skr AS `实际收款方`,
+        d.sjh AS `手机号`,
+        d.yhzh AS `明细银行账号`
+    FROM formtable_main_83 m
+    JOIN formtable_main_83_dt3 d ON d.mainid = m.id
+    LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
+    UNION ALL
+    SELECT
+        'MCN预付款流程（订单）' AS `来源流程`,
+        m.id AS `ID`,
+        m.requestid AS `RequestID`,
+        d.id AS `明细ID`,
+        m.lcbh AS `流程编号`,
+        rb.REQUESTNAME AS `标题`,
+        m.sqrq AS `申请日期`,
+        m.sqr AS `申请人ID`,
+        m.gszt AS `公司主体ID`,
+        m.cbzx AS `成本中心ID`,
+        m.gysmc AS `供应商ID`,
+        m.yhzh AS `银行账号ID`,
+        m.szht AS `主表合同ID`,
+        NULL AS `明细合同ID`,
+        d.szxm AS `项目编号ID`,
+        d.xmmc AS `项目名称`,
+        d.fjxh AS `费用项编码`,
+        d.fyx AS `费用项名称`,
+        COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
+        d.zbid AS `主播房间号`,
+        d.zbnc AS `主播昵称`,
+        d.sfzh AS `身份证号`,
+        d.skr AS `实际收款方`,
+        d.sjh AS `手机号`,
+        d.yhzh AS `明细银行账号`
+    FROM formtable_main_83 m
+    JOIN formtable_main_83_dt4 d ON d.mainid = m.id
+    LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
+    UNION ALL
+    SELECT
+        'MCN预付款流程（订单）' AS `来源流程`,
+        m.id AS `ID`,
+        m.requestid AS `RequestID`,
+        d.id AS `明细ID`,
+        m.lcbh AS `流程编号`,
+        rb.REQUESTNAME AS `标题`,
+        m.sqrq AS `申请日期`,
+        m.sqr AS `申请人ID`,
+        m.gszt AS `公司主体ID`,
+        m.cbzx AS `成本中心ID`,
+        m.gysmc AS `供应商ID`,
+        m.yhzh AS `银行账号ID`,
+        m.szht AS `主表合同ID`,
+        NULL AS `明细合同ID`,
+        d.szxm AS `项目编号ID`,
+        d.xmmc AS `项目名称`,
+        d.fjxh AS `费用项编码`,
+        d.fyx AS `费用项名称`,
+        COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
+        d.zbid AS `主播房间号`,
+        d.zbnc AS `主播昵称`,
+        d.sfzh AS `身份证号`,
+        d.skr AS `实际收款方`,
+        d.sjh AS `手机号`,
+        d.yhzh AS `明细银行账号`
+    FROM formtable_main_83 m
+    JOIN formtable_main_83_dt5 d ON d.mainid = m.id
+    LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
+    UNION ALL
+    SELECT
+        'MCN预付款流程（订单）' AS `来源流程`,
+        m.id AS `ID`,
+        m.requestid AS `RequestID`,
+        d.id AS `明细ID`,
+        m.lcbh AS `流程编号`,
+        rb.REQUESTNAME AS `标题`,
+        m.sqrq AS `申请日期`,
+        m.sqr AS `申请人ID`,
+        m.gszt AS `公司主体ID`,
+        m.cbzx AS `成本中心ID`,
+        m.gysmc AS `供应商ID`,
+        m.yhzh AS `银行账号ID`,
+        m.szht AS `主表合同ID`,
+        NULL AS `明细合同ID`,
+        d.szxm AS `项目编号ID`,
+        d.xmmc AS `项目名称`,
+        d.fjxh AS `费用项编码`,
+        d.fyx AS `费用项名称`,
+        COALESCE(d.dkje, d.zcje, d.jsje) AS `金额`,
+        NULL AS `主播房间号`,
+        NULL AS `主播昵称`,
+        NULL AS `身份证号`,
+        NULL AS `实际收款方`,
+        NULL AS `手机号`,
+        NULL AS `明细银行账号`
+    FROM formtable_main_83 m
+    JOIN formtable_main_83_dt6 d ON d.mainid = m.id
+    LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
+) x
+WHERE x.`项目编号ID` IN %(project_ids)s
+ORDER BY x.`ID`, x.`明细ID`
+"""
+
+MCN_ANCHOR_SOURCE_SELECTS = """
+    SELECT
+        'MCN主播相关付款流程' AS `来源流程`,
+        m.id AS `ID`,
+        m.requestId AS `RequestID`,
+        d.id AS `明细ID`,
+        m.lcbh AS `流程编号`,
+        rb.REQUESTNAME AS `标题`,
+        m.sqrq AS `申请日期`,
+        m.sqr AS `申请人ID`,
+        COALESCE(m.gszt, m.szgs) AS `公司主体ID`,
+        COALESCE(d.cbzx, m.cbzx1, m.cbzxjs) AS `成本中心ID`,
+        m.dfgsmc AS `供应商ID`,
+        COALESCE(m.gysyhzh, m.yhzh) AS `银行账号ID`,
+        m.szht AS `主表合同ID`,
+        d.xght AS `明细合同ID`,
+        d.xmbh AS `项目编号ID`,
+        d.xmmc AS `项目名称`,
+        d.fjxh AS `费用项编码`,
+        d.fyx AS `费用项名称`,
+        {amount_expr} AS `金额`,
+        d.zbid AS `主播房间号`,
+        d.zbnc AS `主播昵称`,
+        d.sfzh AS `身份证号`,
+        d.skr AS `实际收款方`,
+        d.sjh AS `手机号`,
+        d.yhzh AS `明细银行账号`,
+        m.fkpt AS `付款平台ID`,
+        m.sfyfk AS `是否预付ID`
+    FROM formtable_main_38 m
+    JOIN {detail_table} d ON d.mainid = m.id
+    LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestId
+"""
+
+MCN_ANCHOR_PREPAYMENT_SOURCE_SQL = """
+SELECT * FROM (
+""" + "\nUNION ALL\n".join([
+    MCN_ANCHOR_SOURCE_SELECTS.format(detail_table='formtable_main_38_dt4', amount_expr='COALESCE(d.dkje, d.yfuje, d.skje, d.yfaje)'),
+]) + """
+) x
+WHERE x.`是否预付ID` = %(prepayment_yes_code)s
+  AND x.`项目编号ID` IN %(project_ids)s
+ORDER BY x.`ID`, x.`明细ID`
+"""
+
+MCN_ANCHOR_PLATFORM_SOURCE_SQL = """
+SELECT * FROM (
+""" + "\nUNION ALL\n".join([
+    MCN_ANCHOR_SOURCE_SELECTS.format(detail_table='formtable_main_38_dt4', amount_expr='COALESCE(d.dkje, d.yfuje, d.skje, d.yfaje)'),
+]) + """
+) x
+WHERE x.`是否预付ID` = %(prepayment_no_code)s
+  AND (x.`付款平台ID` IS NULL OR CAST(x.`付款平台ID` AS CHAR) <> %(direct_payment_code)s)
+  AND x.`项目编号ID` IN %(project_ids)s
+ORDER BY x.`ID`, x.`明细ID`
+"""
+
+MCN_OUTBOUND_FEE_SOURCE_SQL = """
+SELECT
+    'MCN对外付款流程' AS `来源流程`,
+    m.id AS `ID`,
+    m.requestId AS `RequestID`,
+    d.id AS `明细ID`,
+    m.lcbh AS `流程编号`,
+    rb.REQUESTNAME AS `标题`,
+    m.sqrq AS `申请日期`,
+    m.sqr AS `申请人ID`,
+    COALESCE(m.gszt, m.szgs) AS `公司主体ID`,
+    COALESCE(m.cbzx2, m.cbzx) AS `成本中心ID`,
+    m.dfgsmc AS `平台供应商ID`,
+    m.yhzh AS `平台银行账号ID`,
+    m.fkht AS `主表合同ID`,
+    d.szht AS `明细合同ID`,
+    d.szxm AS `项目编号ID`,
+    d.xmmc AS `项目名称`,
+    d.fjxh AS `费用项编码`,
+    d.fyx AS `费用项名称`,
+    d.je AS `金额`,
+    d.fjhzbid AS `主播房间号`,
+    d.zbnc AS `主播昵称`
+FROM formtable_main_33 m
+JOIN formtable_main_33_dt1 d ON d.mainid = m.id
+LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestId
+WHERE (m.fkpt IS NULL OR CAST(m.fkpt AS CHAR) <> %(direct_payment_code)s)
+  AND d.szxm IN %(project_ids)s
+ORDER BY m.id, d.id
+"""
+
+MCN_OUTBOUND_RECIPIENT_SOURCE_SQL = """
+SELECT
+    m.id AS `ID`,
+    d.id AS `收款人明细ID`,
+    d.skr AS `实际收款方`,
+    d.sfzh AS `身份证号`,
+    d.yhzh AS `明细银行账号`,
+    d.sjh AS `手机号`,
+    COALESCE(d.skje, d.dkje) AS `收款金额`
+FROM formtable_main_33 m
+JOIN formtable_main_33_dt2 d ON d.mainid = m.id
+WHERE (m.fkpt IS NULL OR CAST(m.fkpt AS CHAR) <> %(direct_payment_code)s)
+"""
+
+MCN_OUTBOUND_ORDER_FEE_SOURCE_SQL = """
+SELECT * FROM (
+    SELECT
+        'MCN对外付款流程（订单）' AS `来源流程`,
+        m.id AS `ID`,
+        m.requestid AS `RequestID`,
+        d.id AS `明细ID`,
+        m.lcbh AS `流程编号`,
+        rb.REQUESTNAME AS `标题`,
+        m.sqrq AS `申请日期`,
+        m.sqr AS `申请人ID`,
+        COALESCE(m.gszt, m.szgs) AS `公司主体ID`,
+        m.cbzx AS `成本中心ID`,
+        m.dfgsmc AS `平台供应商ID`,
+        m.yhzh AS `平台银行账号ID`,
+        m.fkht AS `主表合同ID`,
+        NULL AS `明细合同ID`,
+        d.szxm AS `项目编号ID`,
+        d.xmmc AS `项目名称`,
+        d.fjxh AS `费用项编码`,
+        d.fyx AS `费用项名称`,
+        COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
+        d.zbid AS `主播房间号`,
+        d.zbnc AS `主播昵称`
+    FROM formtable_main_66 m
+    JOIN formtable_main_66_dt3 d ON d.mainid = m.id
+    LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
+    WHERE (m.fkpt IS NULL OR CAST(m.fkpt AS CHAR) <> %(direct_payment_code)s)
+    UNION ALL
+    SELECT
+        'MCN对外付款流程（订单）' AS `来源流程`,
+        m.id AS `ID`,
+        m.requestid AS `RequestID`,
+        d.id AS `明细ID`,
+        m.lcbh AS `流程编号`,
+        rb.REQUESTNAME AS `标题`,
+        m.sqrq AS `申请日期`,
+        m.sqr AS `申请人ID`,
+        COALESCE(m.gszt, m.szgs) AS `公司主体ID`,
+        m.cbzx AS `成本中心ID`,
+        m.dfgsmc AS `平台供应商ID`,
+        m.yhzh AS `平台银行账号ID`,
+        m.fkht AS `主表合同ID`,
+        NULL AS `明细合同ID`,
+        d.szxm AS `项目编号ID`,
+        d.xmmc AS `项目名称`,
+        d.fjxh AS `费用项编码`,
+        d.fyx AS `费用项名称`,
+        COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
+        d.zbid AS `主播房间号`,
+        d.zbnc AS `主播昵称`
+    FROM formtable_main_66 m
+    JOIN formtable_main_66_dt4 d ON d.mainid = m.id
+    LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
+    WHERE (m.fkpt IS NULL OR CAST(m.fkpt AS CHAR) <> %(direct_payment_code)s)
+    UNION ALL
+    SELECT
+        'MCN对外付款流程（订单）' AS `来源流程`,
+        m.id AS `ID`,
+        m.requestid AS `RequestID`,
+        d.id AS `明细ID`,
+        m.lcbh AS `流程编号`,
+        rb.REQUESTNAME AS `标题`,
+        m.sqrq AS `申请日期`,
+        m.sqr AS `申请人ID`,
+        COALESCE(m.gszt, m.szgs) AS `公司主体ID`,
+        m.cbzx AS `成本中心ID`,
+        m.dfgsmc AS `平台供应商ID`,
+        m.yhzh AS `平台银行账号ID`,
+        m.fkht AS `主表合同ID`,
+        NULL AS `明细合同ID`,
+        d.szxm AS `项目编号ID`,
+        d.xmmc AS `项目名称`,
+        d.fjxh AS `费用项编码`,
+        d.fyx AS `费用项名称`,
+        COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
+        d.zbid AS `主播房间号`,
+        d.zbmc AS `主播昵称`
+    FROM formtable_main_66 m
+    JOIN formtable_main_66_dt5 d ON d.mainid = m.id
+    LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
+    WHERE (m.fkpt IS NULL OR CAST(m.fkpt AS CHAR) <> %(direct_payment_code)s)
+    UNION ALL
+    SELECT
+        'MCN对外付款流程（订单）' AS `来源流程`,
+        m.id AS `ID`,
+        m.requestid AS `RequestID`,
+        d.id AS `明细ID`,
+        m.lcbh AS `流程编号`,
+        rb.REQUESTNAME AS `标题`,
+        m.sqrq AS `申请日期`,
+        m.sqr AS `申请人ID`,
+        COALESCE(m.gszt, m.szgs) AS `公司主体ID`,
+        m.cbzx AS `成本中心ID`,
+        m.dfgsmc AS `平台供应商ID`,
+        m.yhzh AS `平台银行账号ID`,
+        m.fkht AS `主表合同ID`,
+        NULL AS `明细合同ID`,
+        d.szxm AS `项目编号ID`,
+        d.xmmc AS `项目名称`,
+        d.fjxh AS `费用项编码`,
+        d.fyx AS `费用项名称`,
+        COALESCE(d.fkje, d.zcje, d.jsje) AS `金额`,
+        NULL AS `主播房间号`,
+        NULL AS `主播昵称`
+    FROM formtable_main_66 m
+    JOIN formtable_main_66_dt6 d ON d.mainid = m.id
+    LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
+    WHERE (m.fkpt IS NULL OR CAST(m.fkpt AS CHAR) <> %(direct_payment_code)s)
+) x
+WHERE x.`项目编号ID` IN %(project_ids)s
+ORDER BY x.`ID`, x.`明细ID`
+"""
+
+MCN_OUTBOUND_ORDER_RECIPIENT_SOURCE_SQL = """
+SELECT
+    m.id AS `ID`,
+    d.id AS `收款人明细ID`,
+    d.skr AS `实际收款方`,
+    d.sfzh AS `身份证号`,
+    d.yhzh AS `明细银行账号`,
+    d.sjh AS `手机号`,
+    d.skje AS `收款金额`
+FROM formtable_main_66 m
+JOIN formtable_main_66_dt2 d ON d.mainid = m.id
+WHERE (m.fkpt IS NULL OR CAST(m.fkpt AS CHAR) <> %(direct_payment_code)s)
+"""
+
+MCN_PREPAYMENT_OFFSET_SQL = """
+SELECT
+    m.yfklc AS `关联流程ID`,
+    d.szxm AS `项目编号ID`,
+    d.fjxh AS `费用项编码`,
+    SUM(ABS(COALESCE(d.hsje, 0))) AS `已到票核销金额`
+FROM formtable_main_30 m
+JOIN formtable_main_30_dt1 d ON d.mainid = m.id
+WHERE d.szxm IN %(project_ids)s
+GROUP BY m.yfklc, d.szxm, d.fjxh
+"""
+
+MCN_PREPAYMENT_ORDER_OFFSET_SQL = """
+SELECT `关联流程ID`, `项目编号ID`, `费用项编码`, SUM(`金额`) AS `已到票核销金额`
+FROM (
+    SELECT m.yfklc AS `关联流程ID`, d.szxm AS `项目编号ID`, d.fjxh AS `费用项编码`, ABS(COALESCE(d.ddje, 0)) AS `金额`
+    FROM formtable_main_82 m JOIN formtable_main_82_dt2 d ON d.mainid = m.id
+    UNION ALL
+    SELECT m.yfklc AS `关联流程ID`, d.szxm AS `项目编号ID`, d.fjxh AS `费用项编码`, ABS(COALESCE(d.ddje, 0)) AS `金额`
+    FROM formtable_main_82 m JOIN formtable_main_82_dt3 d ON d.mainid = m.id
+    UNION ALL
+    SELECT m.yfklc AS `关联流程ID`, d.szxm AS `项目编号ID`, d.fjxh AS `费用项编码`, ABS(COALESCE(d.ddje, 0)) AS `金额`
+    FROM formtable_main_82 m JOIN formtable_main_82_dt4 d ON d.mainid = m.id
+    UNION ALL
+    SELECT m.yfklc AS `关联流程ID`, d.szxm AS `项目编号ID`, d.fjxh AS `费用项编码`, ABS(COALESCE(d.dkje, 0)) AS `金额`
+    FROM formtable_main_82 m JOIN formtable_main_82_dt6 d ON d.mainid = m.id
+) x
+WHERE x.`项目编号ID` IN %(project_ids)s
+GROUP BY `关联流程ID`, `项目编号ID`, `费用项编码`
+"""
+
+MCN_ANCHOR_OFFSET_SQL = """
+SELECT
+    m.jmyfklc AS `关联流程ID`,
+    d.xmbh AS `项目编号ID`,
+    d.fjxh AS `费用项编码`,
+    SUM(ABS(COALESCE(d.dkje, d.yfuje, d.skje, d.yfaje, 0))) AS `已到票核销金额`
+FROM formtable_main_105 m
+JOIN formtable_main_105_dt4 d ON d.mainid = m.id
+WHERE d.xmbh IN %(project_ids)s
+GROUP BY m.jmyfklc, d.xmbh, d.fjxh
 """
 
 
@@ -391,13 +846,8 @@ EXPECTED_GIG_WORKFLOW_FIELDS = {
 
 
 # ============================ DB 查询小工具 ============================
-def _query_fw(sql):
-    """查询泛微库,统一带上本任务过滤参数。"""
-    return c.query_db('FW', 'vspn_xtyy', sql, {
-        'date_from': DATE_FROM,
-        'approved_status_code': APPROVED_STATUS_CODE,
-        'void_code': VOID_CODE,
-    })
+def _query_fw(sql, params=None):
+    return c.query_db('FW', 'vspn_xtyy', sql, params or {})
 
 
 # ============================ 源值解析 ============================
@@ -416,11 +866,86 @@ def _lookup_first_browser_value(mapping, value):
     return ''
 
 
-def build_fw_project_code_map_for_ids(project_values):
-    """泛微项目浏览框 ID -> 泛微项目编号。
+def _first_non_blank(*values):
+    for value in values:
+        text = _text(value)
+        if text:
+            return text
+    return ''
 
-    供应商预付 uf_yfkxx.xmbh 存的是项目主数据 uf_xtyyxmkp.id,不是展示编码。
-    """
+
+def _chunks(values, size=SQL_BATCH_SIZE):
+    values = list(values)
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+_PROJECT_FILTER_CACHE = None
+_PROJECT_FILTER_ID_CACHE = {}
+
+
+def load_project_filter_codes():
+    """读取本次清洗白名单:赛事/MCN sheet 的「原泛微项目编码」。"""
+    global _PROJECT_FILTER_CACHE
+    if _PROJECT_FILTER_CACHE is not None:
+        return _PROJECT_FILTER_CACHE
+    if not PROJECT_FILTER_FILE.exists():
+        raise FileNotFoundError(f'项目白名单不存在: {PROJECT_FILTER_FILE}')
+
+    result = {}
+    for sheet_name in (EVENT_PROJECT_SHEET, MCN_PROJECT_SHEET):
+        df = pd.read_excel(PROJECT_FILTER_FILE, sheet_name=sheet_name, dtype=str)
+        code_column = '原泛微项目编码' if '原泛微项目编码' in df.columns else df.columns[0]
+        codes = []
+        for value in df[code_column]:
+            codes.extend(c.split_fanwei_project_codes(value))
+        result[sheet_name] = set(codes)
+    print(
+        '[预付期初-项目白名单] 使用:',
+        PROJECT_FILTER_FILE,
+        f"| 赛事 {len(result[EVENT_PROJECT_SHEET])} 个",
+        f"| MCN {len(result[MCN_PROJECT_SHEET])} 个",
+    )
+    _PROJECT_FILTER_CACHE = result
+    return result
+
+
+def project_filter_codes(sheet_name):
+    return load_project_filter_codes().get(sheet_name, set())
+
+
+def project_filter_ids(sheet_name, table_order):
+    cache_key = (sheet_name, tuple(table_order))
+    if cache_key in _PROJECT_FILTER_ID_CACHE:
+        return _PROJECT_FILTER_ID_CACHE[cache_key]
+
+    codes = sorted(project_filter_codes(sheet_name))
+    result = []
+    seen = set()
+    for table in table_order:
+        for batch in _chunks([code for code in codes if code]):
+            try:
+                project_df = c.query_db(
+                    'FW',
+                    'vspn_xtyy',
+                    f'SELECT id, xmbh FROM {table} '
+                    f'WHERE xmbh IN ({c.in_placeholders(batch)})',
+                    batch,
+                )
+            except Exception:
+                continue
+            for _, row in project_df.iterrows():
+                project_id = c.format_code(row['id'])
+                if project_id and project_id not in seen:
+                    seen.add(project_id)
+                    result.append(project_id)
+    _PROJECT_FILTER_ID_CACHE[cache_key] = tuple(result)
+    print(f'[预付期初-项目白名单] {sheet_name} 反查项目ID {len(result)} 个')
+    return _PROJECT_FILTER_ID_CACHE[cache_key]
+
+
+def build_fw_project_info_map_for_ids(project_values, table_order=EVENT_PROJECT_TABLES):
+    """泛微项目浏览框 ID -> 项目编号/名称,兼容赛事与 MCN 项目台账。"""
     project_ids = c.clean_codes(
         project_id
         for value in project_values
@@ -428,19 +953,91 @@ def build_fw_project_code_map_for_ids(project_values):
     )
     if not project_ids:
         return {}
-    project_df = c.query_db(
-        'FW',
-        'vspn_xtyy',
-        'SELECT id, xmbh AS project_code '
-        f'FROM {FW_PROJECT_TABLE} '
-        f'WHERE id IN ({c.in_placeholders(project_ids)})',
-        project_ids,
-    )
+
+    result = {}
+    remaining = set(project_ids)
+    for table in table_order:
+        if not remaining:
+            break
+        ids = [project_id for project_id in project_ids if project_id in remaining]
+        try:
+            project_df = c.query_db(
+                'FW',
+                'vspn_xtyy',
+                f'SELECT id, xmbh AS project_code, xmmc AS project_name FROM {table} '
+                f'WHERE id IN ({c.in_placeholders(ids)})',
+                ids,
+            )
+        except Exception:
+            try:
+                project_df = c.query_db(
+                    'FW',
+                    'vspn_xtyy',
+                    f"SELECT id, xmbh AS project_code, '' AS project_name FROM {table} "
+                    f'WHERE id IN ({c.in_placeholders(ids)})',
+                    ids,
+                )
+            except Exception:
+                continue
+        for _, row in project_df.iterrows():
+            project_id = c.format_code(row['id'])
+            project_code = _text(row['project_code'])
+            if project_id and project_code and project_id not in result:
+                result[project_id] = {
+                    'code': project_code,
+                    'name': _text(row.get('project_name', '')),
+                }
+                remaining.discard(project_id)
+    return result
+
+
+def build_fw_project_code_map_for_ids(project_values, table_order=EVENT_PROJECT_TABLES):
     return {
-        c.format_code(row['id']): _text(row['project_code'])
-        for _, row in project_df.iterrows()
-        if _text(row['project_code'])
+        project_id: info.get('code', '')
+        for project_id, info in build_fw_project_info_map_for_ids(project_values, table_order).items()
     }
+
+
+def _resolve_project_codes(values, project_map):
+    return values.map(lambda value: _lookup_first_browser_value(project_map, value) or _text(value))
+
+
+def _with_resolved_project_fields(source_df, project_column='项目编号ID', table_order=EVENT_PROJECT_TABLES):
+    df = source_df.copy()
+    if project_column not in df.columns:
+        df['项目编号'] = df['项目编号'] if '项目编号' in df.columns else ''
+        df['项目名称'] = df['项目名称'] if '项目名称' in df.columns else ''
+        return df
+
+    project_info_map = build_fw_project_info_map_for_ids(df[project_column], table_order)
+    project_code_map = {
+        project_id: info.get('code', '')
+        for project_id, info in project_info_map.items()
+    }
+    project_name_map = {
+        project_id: info.get('name', '')
+        for project_id, info in project_info_map.items()
+    }
+    mapped_project_codes = _resolve_project_codes(df[project_column], project_code_map)
+    mapped_project_names = df[project_column].map(lambda value: _lookup_first_browser_value(project_name_map, value))
+    existing_project_names = df['项目名称'] if '项目名称' in df.columns else pd.Series('', index=df.index)
+    df['项目编号'] = mapped_project_codes
+    df['项目名称'] = [
+        _first_non_blank(existing_name, mapped_name)
+        for existing_name, mapped_name in zip(existing_project_names, mapped_project_names)
+    ]
+    return df
+
+
+def _filter_by_project_whitelist(source_df, project_column, sheet_name, table_order, log_label):
+    if source_df.empty:
+        return source_df
+    allowed_codes = project_filter_codes(sheet_name)
+    project_source_df = _with_resolved_project_fields(source_df, project_column, table_order)
+    mask = project_source_df['项目编号'].map(_text).isin(allowed_codes)
+    filtered = source_df.loc[mask].copy()
+    print(f'[{log_label}] 项目白名单过滤: {len(filtered)}/{len(source_df)} 行')
+    return filtered
 
 
 def build_fw_bank_account_map_for_ids(bank_account_values):
@@ -882,7 +1479,7 @@ def build_gig_output(merged_df):
     # 固定值。
     output_df['来源系统'] = 'FW'
     output_df['单据类型'] = GIG_DOCUMENT_TYPE
-    output_df['保证金标志'] = '否'
+    output_df['保证金标志'] = ''
     output_df['收款方类别'] = '供应商'
     output_df['预付款支付币种'] = 'CNY'
     output_df['传送状态'] = '传送成功'
@@ -940,96 +1537,676 @@ def build_gig_output(merged_df):
     return output_df[GIG_OUTPUT_COLUMNS]
 
 
+# ============================ MCN 通用解析/输出 ============================
+def _resolve_company_name(company_map, value):
+    return _lookup_first_browser_value(company_map, value) or company_map.get(c.format_code(value), '')
+
+
+def _mcn_contract_code_map(contract_values):
+    contract_ids = c.clean_codes(
+        contract_id
+        for value in contract_values
+        for contract_id in c.parse_browser_ids(value)
+    )
+    if not contract_ids:
+        return {}
+
+    result = {}
+    for table, code_col in (('uf_htk', 'htbh'), ('uf_htsp', 'htbh')):
+        remaining = [contract_id for contract_id in contract_ids if contract_id not in result]
+        if not remaining:
+            break
+        for batch in _chunks(remaining):
+            try:
+                contract_df = c.query_db(
+                    'FW',
+                    'vspn_xtyy',
+                    f'SELECT id, {code_col} AS contract_code FROM {table} '
+                    f'WHERE id IN ({c.in_placeholders(batch)})',
+                    batch,
+                )
+            except Exception:
+                continue
+            for _, row in contract_df.iterrows():
+                contract_id = c.format_code(row['id'])
+                contract_code = _text(row['contract_code'])
+                if contract_id and contract_code and contract_id not in result:
+                    result[contract_id] = contract_code
+    return result
+
+
+def _mcn_fee_subject_key(raw_code, subject_lookup):
+    code = _text(raw_code)
+    if not code:
+        return ''
+    deepest = code.split('_', 1)[-1].strip()
+    candidates = [c.remove_slashes(code), deepest]
+    if len(deepest) >= 4:
+        candidates.append(f'{deepest[:2]}{deepest[:3]}{deepest}')
+    if len(deepest) >= 3:
+        candidates.append(f'{deepest[:2]}{deepest}')
+    return next((key for key in candidates if key in subject_lookup), c.remove_slashes(code))
+
+
+def _mcn_fee_subject_item(subject_lookup, raw_code, index):
+    key = _mcn_fee_subject_key(raw_code, subject_lookup)
+    return subject_lookup.get(key, ('', ''))[index] if key else ''
+
+
+def resolve_mcn_common_values(source_df):
+    df = source_df.copy()
+    if df.empty:
+        return df
+
+    employee_map = c.build_fw_employee_info_map_for_ids(df['申请人ID'])
+    company_map = c.build_fw_company_name_map_for_ids(df['公司主体ID'])
+    cost_center_map = c.build_fw_cost_center_map_for_ids(df['成本中心ID'])
+    supplier_status_map = c.build_fw_supplier_status_map(df['供应商ID'])
+    bank_account_map = c.build_fw_supplier_bank_account_map_for_ids(df['银行账号ID'])
+    contract_values = pd.concat([df['主表合同ID'], df['明细合同ID']], ignore_index=True)
+    contract_map = _mcn_contract_code_map(contract_values)
+
+    project_df = _with_resolved_project_fields(df, '项目编号ID', MCN_PROJECT_TABLES)
+    df['项目编号'] = project_df['项目编号']
+    df['项目名称'] = [
+        _first_non_blank(existing_name, mapped_name)
+        for existing_name, mapped_name in zip(df['项目名称'], project_df['项目名称'])
+    ]
+    df['申请人'] = df['申请人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
+    df['申请人工号'] = df['申请人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
+    df['公司主体'] = df['公司主体ID'].map(lambda value: _resolve_company_name(company_map, value))
+    df['成本中心'] = df['成本中心ID'].map(lambda value: _lookup_first_browser_value(cost_center_map, value))
+    df['供应商'] = df['供应商ID'].map(lambda value: _selected_supplier_name(value, supplier_status_map))
+    df['银行账号'] = df['银行账号ID'].map(lambda value: _lookup_first_browser_value(bank_account_map, value))
+    df['合同号'] = [
+        _first_non_blank(
+            _lookup_first_browser_value(contract_map, detail_contract),
+            _lookup_first_browser_value(contract_map, main_contract),
+        )
+        for main_contract, detail_contract in zip(df['主表合同ID'], df['明细合同ID'])
+    ]
+    df['预算科目'] = df['费用项编码'].map(_text)
+    return df
+
+
+def _offset_key(flow_id, project_id, fee_code):
+    return (c.format_code(flow_id), c.format_code(project_id), _text(fee_code))
+
+
+def apply_mcn_offset_amounts(source_df, offset_df, link_column):
+    df = source_df.copy()
+    if df.empty:
+        return df
+
+    offset_map = {}
+    if not offset_df.empty:
+        for _, row in offset_df.iterrows():
+            key = _offset_key(row['关联流程ID'], row['项目编号ID'], row['费用项编码'])
+            offset_map[key] = c.round_amount(offset_map.get(key, 0) + float(row['已到票核销金额'] or 0))
+
+    amount = pd.to_numeric(df['金额'], errors='coerce').fillna(0).map(c.round_amount)
+    group_offset = pd.Series(0.0, index=df.index, dtype='float64')
+    for idx, row in df.iterrows():
+        group_offset.loc[idx] = offset_map.get(_offset_key(row[link_column], row['项目编号ID'], row['费用项编码']), 0)
+
+    settled_amount = pd.Series(0.0, index=df.index, dtype='float64')
+    for _, group in df.groupby([link_column, '项目编号ID', '费用项编码'], sort=False, dropna=False):
+        indexes = list(group.index)
+        total_written_off = c.round_amount(group_offset.loc[indexes].iloc[0])
+        if len(indexes) == 1:
+            settled_amount.loc[indexes[0]] = total_written_off
+            continue
+
+        detail_amount = amount.loc[indexes]
+        detail_total = c.round_amount(detail_amount.sum())
+        if detail_total:
+            allocations = [c.round_amount(total_written_off * item / detail_total) for item in detail_amount]
+        else:
+            allocations = [c.round_amount(total_written_off / len(indexes))] * len(indexes)
+        diff = c.round_amount(total_written_off - sum(allocations))
+        allocations[-1] = c.round_amount(allocations[-1] + diff)
+        settled_amount.loc[indexes] = allocations
+
+    df['已到票核销金额'] = settled_amount.map(c.round_amount)
+    df['已付未核金额'] = (amount - settled_amount).map(c.round_amount)
+    return df
+
+
+def build_mcn_supplier_output(source_df):
+    if source_df.empty:
+        return pd.DataFrame(columns=SUPPLIER_OUTPUT_COLUMNS)
+
+    vendor_info_map = c.build_supplier_vendor_info_map_for_rows(
+        source_df['供应商ID'],
+        supplier_texts=source_df['供应商'],
+        document_numbers=source_df['流程编号'],
+        missing_report_file=MCN_SUPPLIER_VENDOR_MISSING_FILE,
+        log_prefix='[预付期初-MCN供应商预付]',
+    )
+    entity_map = c.build_accounting_entity_map_for_names(source_df['公司主体'])
+    subject_lookup = c.build_subject_map()
+    amount = pd.to_numeric(source_df['金额'], errors='coerce')
+
+    def vendor_field(index, field):
+        return vendor_info_map.get(index, {}).get(field, '')
+
+    output_df = pd.DataFrame(index=source_df.index)
+    output_df['来源系统'] = SOURCE_SYSTEM
+    output_df['来源单据编号'] = source_df['流程编号']
+    output_df['申请日期'] = source_df['申请日期'].map(c.format_date)
+    output_df['单据类型'] = DOCUMENT_TYPE
+    output_df['申请人工号'] = source_df['申请人工号']
+    output_df['申请人姓名'] = source_df['申请人']
+    output_df['泛微项目编号'] = source_df['项目编号'].map(_text)
+    output_df['订单编号'] = source_df['项目编号'].map(lambda value: c.project_order_mapping_value(value, '订单编号'))
+    output_df['订单名称'] = source_df['项目编号'].map(lambda value: c.project_order_mapping_value(value, '订单标题'))
+    output_df['核算主体编号'] = source_df['公司主体'].map(lambda value: entity_map.get(c.normalize_name(value), '') if _text(value) else '')
+    output_df['核算主体描述'] = source_df['公司主体']
+    output_df['备注'] = source_df['标题'].map(lambda value: _text(value)[:150])
+    output_df['合同号'] = source_df['合同号']
+    output_df['合同收支计划行'] = ''
+    output_df['保证金标志'] = '否'
+    output_df['收款方编码'] = [vendor_field(index, 'code') for index in source_df.index]
+    output_df['收款方描述'] = [
+        vendor_field(index, 'name') or supplier_name
+        for index, supplier_name in zip(source_df.index, source_df['供应商'])
+    ]
+    output_df['银行账号'] = c.resolve_hand_vendor_bank_accounts(
+        output_df['收款方编码'], source_df['银行账号'])
+    output_df['计划付款日期'] = source_df['申请日期'].map(c.format_date)
+    output_df['银行转账备注'] = ''
+    output_df['费用项目编码'] = source_df['费用项编码'].map(lambda value: _mcn_fee_subject_item(subject_lookup, value, 0))
+    output_df['费用项目描述'] = source_df['费用项编码'].map(lambda value: _mcn_fee_subject_item(subject_lookup, value, 1))
+    output_df['主播房间号'] = source_df['主播房间号'].map(_text)
+    output_df['预付款支付币种'] = 'CNY'
+    output_df['预付款金额（支付币种）'] = amount.map(c.round_amount)
+    output_df['已到票核销金额（支付币种）'] = source_df['已到票核销金额'].map(c.round_amount)
+    output_df['已付未核（支付币种）'] = source_df['已付未核金额'].map(c.round_amount)
+    output_df['泛微费用项目编码'] = source_df['费用项编码'].map(_text)
+    return output_df[SUPPLIER_OUTPUT_COLUMNS]
+
+
+def build_individual_vendor_maps(source_df):
+    id_numbers = c.clean_text_values(source_df.get('身份证号', pd.Series(dtype=str)))
+    by_id_number = {}
+    if id_numbers:
+        placeholders = c.in_placeholders(id_numbers)
+        vendor_df = c.query_db(
+            'ZT',
+            'hfins_base',
+            'SELECT vender_id, vender_code, description, taxpayer_name, tax_id_number, taxpayer_number '
+            'FROM hfbs_system_vender '
+            f'WHERE tax_id_number IN ({placeholders}) OR taxpayer_number IN ({placeholders})',
+            id_numbers + id_numbers,
+        )
+        for _, row in vendor_df.iterrows():
+            code = _text(row['vender_code'])
+            if not code:
+                continue
+            info = {
+                'code': code,
+                'name': _first_non_blank(row.get('description'), row.get('taxpayer_name')),
+                'id': c.format_code(row.get('vender_id')),
+            }
+            for key in (_text(row.get('tax_id_number')), _text(row.get('taxpayer_number'))):
+                if key and key not in by_id_number:
+                    by_id_number[key] = info
+
+    names = c.clean_text_values(source_df.get('实际收款方', pd.Series(dtype=str)))
+    by_name = c.build_hand_vendor_info_by_names(names)
+    return by_id_number, by_name
+
+
+def resolve_individual_vendor_info(row, by_id_number, by_name):
+    id_number = _text(row.get('身份证号'))
+    info = by_id_number.get(id_number) if id_number else None
+    if info and info.get('code'):
+        return info
+    name_key = c.normalize_name(row.get('实际收款方'))
+    name_info = by_name.get(name_key) if name_key else None
+    return name_info if name_info and name_info.get('code') else {}
+
+
+def allocate_mcn_fee_to_recipients(fee_df, recipient_df):
+    if fee_df.empty:
+        return fee_df
+
+    rows = []
+    recipient_by_doc = {
+        key: group.copy()
+        for key, group in recipient_df.groupby('ID', dropna=False)
+    } if not recipient_df.empty else {}
+
+    for doc_id, fee_group in fee_df.groupby('ID', sort=False, dropna=False):
+        recipient_group = recipient_by_doc.get(doc_id)
+        if recipient_group is None or recipient_group.empty:
+            for _, fee_row in fee_group.iterrows():
+                row = fee_row.to_dict()
+                row.update({'收款人明细ID': '', '实际收款方': '', '身份证号': '', '明细银行账号': '', '手机号': '', '预付款金额分摊': fee_row['金额']})
+                rows.append(row)
+            continue
+
+        recipient_group = recipient_group.copy()
+        recipient_amount = pd.to_numeric(recipient_group['收款金额'], errors='coerce').fillna(0).map(c.round_amount)
+        if float(recipient_amount.abs().sum()) == 0:
+            recipient_row = recipient_group.iloc[0]
+            for _, fee_row in fee_group.iterrows():
+                row = fee_row.to_dict()
+                row.update({
+                    '收款人明细ID': recipient_row.get('收款人明细ID', ''),
+                    '实际收款方': recipient_row.get('实际收款方', ''),
+                    '身份证号': recipient_row.get('身份证号', ''),
+                    '明细银行账号': recipient_row.get('明细银行账号', ''),
+                    '手机号': recipient_row.get('手机号', ''),
+                    '预付款金额分摊': fee_row['金额'],
+                })
+                rows.append(row)
+            continue
+
+        recipient_records = []
+        for (_, recipient_row), amount in zip(recipient_group.iterrows(), recipient_amount):
+            record = recipient_row.to_dict()
+            record['_剩余收款金额'] = c.round_amount(abs(amount))
+            recipient_records.append(record)
+        recipient_index = 0
+
+        def append_row(fee_row, recipient_row, allocated_amount):
+            row = fee_row.to_dict()
+            row.update({
+                '收款人明细ID': recipient_row.get('收款人明细ID', ''),
+                '实际收款方': recipient_row.get('实际收款方', ''),
+                '身份证号': recipient_row.get('身份证号', ''),
+                '明细银行账号': recipient_row.get('明细银行账号', ''),
+                '手机号': recipient_row.get('手机号', ''),
+                '预付款金额分摊': allocated_amount,
+            })
+            rows.append(row)
+
+        for _, fee_row in fee_group.iterrows():
+            raw_fee_amount = pd.to_numeric(fee_row['金额'], errors='coerce')
+            if pd.isna(raw_fee_amount):
+                raw_fee_amount = 0
+            amount_sign = -1 if raw_fee_amount < 0 else 1
+            remaining_fee_amount = c.round_amount(abs(raw_fee_amount))
+            if remaining_fee_amount <= 0:
+                append_row(fee_row, recipient_records[min(recipient_index, len(recipient_records) - 1)], fee_row['金额'])
+                continue
+            while remaining_fee_amount > 0:
+                if recipient_index >= len(recipient_records):
+                    append_row(fee_row, recipient_records[-1], c.round_amount(remaining_fee_amount * amount_sign))
+                    break
+                recipient_row = recipient_records[recipient_index]
+                remaining_recipient_amount = recipient_row['_剩余收款金额']
+                if remaining_recipient_amount <= 0:
+                    recipient_index += 1
+                    continue
+                allocated_amount = c.round_amount(min(remaining_fee_amount, remaining_recipient_amount))
+                append_row(fee_row, recipient_row, c.round_amount(allocated_amount * amount_sign))
+                remaining_fee_amount = c.round_amount(remaining_fee_amount - allocated_amount)
+                recipient_row['_剩余收款金额'] = c.round_amount(remaining_recipient_amount - allocated_amount)
+                if recipient_row['_剩余收款金额'] <= 0:
+                    recipient_index += 1
+
+    return pd.DataFrame(rows)
+
+
+def build_mcn_gig_output(source_df, anchor_payee_category=False):
+    if source_df.empty:
+        return pd.DataFrame(columns=GIG_OUTPUT_COLUMNS)
+
+    by_id_number, by_name = build_individual_vendor_maps(source_df)
+    entity_map = c.build_accounting_entity_map_for_names(source_df['公司主体'])
+    subject_lookup = c.build_subject_map()
+    vendor_infos = [resolve_individual_vendor_info(row, by_id_number, by_name) for _, row in source_df.iterrows()]
+    amount = pd.to_numeric(source_df['预付款金额分摊'] if '预付款金额分摊' in source_df.columns else source_df['金额'], errors='coerce')
+
+    output_df = pd.DataFrame(index=source_df.index)
+    output_df['来源系统'] = SOURCE_SYSTEM
+    output_df['来源单据编号'] = source_df['流程编号']
+    output_df['申请日期'] = source_df['申请日期'].map(c.format_date)
+    output_df['单据类型'] = GIG_DOCUMENT_TYPE
+    output_df['申请人工号'] = source_df['申请人工号']
+    output_df['申请人姓名'] = source_df['申请人']
+    output_df['泛微项目编号'] = source_df['项目编号'].map(_text)
+    output_df['订单编号'] = source_df['项目编号'].map(lambda value: c.project_order_mapping_value(value, '订单编号'))
+    output_df['订单名称'] = source_df['项目编号'].map(lambda value: c.project_order_mapping_value(value, '订单标题'))
+    output_df['核算主体编号'] = source_df['公司主体'].map(lambda value: entity_map.get(c.normalize_name(value), '') if _text(value) else '')
+    output_df['核算主体描述'] = source_df['公司主体']
+    output_df['备注_单头'] = source_df['标题'].map(lambda value: _text(value)[:150])
+    output_df['灵工平台收款方编码'] = source_df['供应商'].map(gig_platform_vendor)
+    output_df['合同号'] = source_df['合同号']
+    output_df['合同收支计划行'] = ''
+    output_df['保证金标志'] = ''
+    output_df['计划付款日期'] = source_df['申请日期'].map(c.format_date)
+    output_df['银行转账备注'] = ''
+    output_df['费用项目编码'] = source_df['费用项编码'].map(lambda value: _mcn_fee_subject_item(subject_lookup, value, 0))
+    output_df['费用项目描述'] = source_df['费用项编码'].map(lambda value: _mcn_fee_subject_item(subject_lookup, value, 1))
+    output_df['收款方类别'] = '主播' if anchor_payee_category else '供应商'
+    output_df['收款方编码'] = [
+        info.get('code', '') or _text(payee)
+        for info, payee in zip(vendor_infos, source_df['实际收款方'])
+    ]
+    output_df['备注'] = ''
+    output_df['银行账号'] = c.resolve_hand_vendor_bank_accounts(
+        output_df['收款方编码'], source_df['明细银行账号'])
+    output_df['预付款支付币种'] = 'CNY'
+    output_df['预付款金额（支付币种）'] = amount.map(c.round_amount)
+    output_df['传送状态'] = '传送成功'
+    output_df['支付状态'] = '支付成功'
+    output_df['退款状态'] = ''
+    output_df['核销状态'] = '已核销'
+    output_df['泛微费用项目编码'] = source_df['费用项编码'].map(_text)
+    return output_df[GIG_OUTPUT_COLUMNS]
+
+
+def _fill_sheet(worksheet, output_df):
+    for col_idx, column_name in enumerate(output_df.columns, start=1):
+        worksheet.cell(row=1, column=col_idx).value = column_name
+    if worksheet.max_row > 1:
+        worksheet.delete_rows(2, worksheet.max_row)
+    for row in output_df.itertuples(index=False, name=None):
+        worksheet.append([c._clean_cell_value(v) for v in row])
+
+
+def _copy_template_sheet(workbook, source_sheet_name, target_sheet_name):
+    if target_sheet_name in workbook.sheetnames:
+        del workbook[target_sheet_name]
+    copied = workbook.copy_worksheet(workbook[source_sheet_name])
+    copied.title = target_sheet_name
+    return copied
+
+
+def _move_sheets_to_front(workbook, sheet_names):
+    sheet_name_set = set(sheet_names)
+    ordered_sheets = [workbook[sheet_name] for sheet_name in sheet_names if sheet_name in workbook.sheetnames]
+    remaining_sheets = [sheet for sheet in workbook.worksheets if sheet.title not in sheet_name_set]
+    workbook._sheets = ordered_sheets + remaining_sheets
+
+
+def write_output_workbook(supplier_output_df, gig_output_df, mcn_supplier_outputs, mcn_gig_outputs):
+    wb = load_workbook(TEMPLATE_FILE)
+    _fill_sheet(wb[TEMPLATE_SHEET_SUPPLIER], supplier_output_df)
+    _fill_sheet(wb[TEMPLATE_SHEET_GIG], gig_output_df)
+    for sheet_name, output_df in mcn_supplier_outputs.items():
+        _fill_sheet(_copy_template_sheet(wb, TEMPLATE_SHEET_SUPPLIER, sheet_name), output_df)
+    for sheet_name, output_df in mcn_gig_outputs.items():
+        _fill_sheet(_copy_template_sheet(wb, TEMPLATE_SHEET_GIG, sheet_name), output_df)
+    _move_sheets_to_front(
+        wb,
+        [
+            TEMPLATE_SHEET_SUPPLIER,
+            TEMPLATE_SHEET_GIG,
+            *mcn_supplier_outputs.keys(),
+            *mcn_gig_outputs.keys(),
+        ],
+    )
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(OUTPUT_FILE)
+    return OUTPUT_FILE
+
+
 # ============================ 源读取 ============================
 def read_supplier_source():
-    """从 DB 直接读取过滤后的供应商预付主子合并数据。"""
+    """从 DB 直接读取赛事供应商预付,仅按项目白名单过滤。"""
     c.validate_fw_fields(FW_SUPPLIER_TABLE, EXPECTED_SUPPLIER_FIELDS)
     c.validate_fw_fields(FW_PAYMENT_OFFSET_TABLE, EXPECTED_PAYMENT_OFFSET_FIELDS)
-    stats = _query_fw(SUPPLIER_STATS_SQL).iloc[0]
-    status_name = FLOW_STATUS_MEANINGS.get(APPROVED_STATUS_CODE, '')
-    void_name = VOID_FLAG_MEANINGS.get(VOID_CODE, '')
-    print(f"[预付期初-供应商预付款-DB] SQL过滤: 申请日期>={DATE_FROM} "
-          f"且 流程状态={APPROVED_STATUS_CODE}({status_name}) 且 是否作废≠{VOID_CODE}({void_name})")
-    print(f"  满足前两项 {int(stats['matched_count'] or 0)} 单; "
-          f"其中剔除作废 {int(stats['void_count'] or 0)} 单; "
-          f"最终保留主表 {int(stats['kept_count'] or 0)} 单")
+    event_project_ids = project_filter_ids(EVENT_PROJECT_SHEET, EVENT_PROJECT_TABLES)
+    if not event_project_ids:
+        return pd.DataFrame()
 
-    merged_df = resolve_supplier_source_values(_query_fw(SUPPLIER_SOURCE_SQL))
+    params = {'project_ids': event_project_ids}
+    stats = _query_fw(SUPPLIER_STATS_SQL, params).iloc[0]
+    print('[预付期初-供应商预付款-DB] SQL过滤: 仅保留赛事项目白名单; 不再过滤申请日期/流程状态/作废状态')
+    print(f"  命中主表 {int(stats['document_count'] or 0)} 单 / 明细 {int(stats['detail_count'] or 0)} 行; "
+          f"金额合计 {float(stats['amount_total'] or 0):.2f}")
+    source_df = _query_fw(SUPPLIER_SOURCE_SQL, params)
+    source_df = _filter_by_project_whitelist(
+        source_df, '项目编号ID', EVENT_PROJECT_SHEET, EVENT_PROJECT_TABLES,
+        '预付期初-供应商预付款-DB',
+    )
+    merged_df = resolve_supplier_source_values(source_df)
     print('[预付期初-供应商预付款-DB] SQL主子合并明细行数:', len(merged_df))
     return merged_df
 
 
 def read_gig_source():
-    """从 DB 直接读取过滤后的零工付款头 + 原流程收款人明细 + 原流程预算项明细。"""
+    """从 DB 直接读取赛事零工预付,仅按项目白名单过滤。"""
     c.validate_fw_fields(FW_GIG_HEADER_TABLE, EXPECTED_GIG_HEADER_FIELDS)
     c.validate_fw_fields(FW_GIG_WORKFLOW_TABLE, EXPECTED_GIG_WORKFLOW_FIELDS)
-    stats = _query_fw(GIG_STATS_SQL).iloc[0]
-    status_name = FLOW_STATUS_MEANINGS.get(APPROVED_STATUS_CODE, '')
-    void_name = VOID_FLAG_MEANINGS.get(VOID_CODE, '')
-    print(f"[预付期初-零工预付款-DB] SQL过滤: 申请日期>={DATE_FROM} "
-          f"且 流程状态={APPROVED_STATUS_CODE}({status_name}) 且 是否作废≠{VOID_CODE}({void_name})")
-    print(f"  满足前两项 {int(stats['matched_count'] or 0)} 单; "
-          f"其中剔除作废 {int(stats['void_count'] or 0)} 单; "
-          f"最终保留主表 {int(stats['kept_count'] or 0)} 单")
+    event_project_ids = project_filter_ids(EVENT_PROJECT_SHEET, EVENT_PROJECT_TABLES)
+    if not event_project_ids:
+        return pd.DataFrame()
 
-    recipient_df = resolve_gig_source_values(_query_fw(GIG_RECIPIENT_SOURCE_SQL))
+    params = {'project_ids': event_project_ids}
+    stats = _query_fw(GIG_STATS_SQL, params).iloc[0]
+    print('[预付期初-零工预付款-DB] SQL过滤: 仅保留赛事项目白名单; 不再过滤申请日期/流程状态/作废状态')
+    print(f"  命中主表 {int(stats['document_count'] or 0)} 单 / 明细 {int(stats['detail_count'] or 0)} 行; "
+          f"金额合计 {float(stats['amount_total'] or 0):.2f}")
+    recipient_source_df = _query_fw(GIG_RECIPIENT_SOURCE_SQL, params)
+    recipient_source_df = _filter_by_project_whitelist(
+        recipient_source_df, '项目编号ID', EVENT_PROJECT_SHEET, EVENT_PROJECT_TABLES,
+        '预付期初-零工预付款-收款人',
+    )
+    recipient_df = resolve_gig_source_values(recipient_source_df)
     print('[预付期初-零工预付款-DB] SQL收款人明细行数:', len(recipient_df))
-    budget_df = resolve_gig_budget_values(_query_fw(GIG_BUDGET_SOURCE_SQL))
+    budget_source_df = _query_fw(GIG_BUDGET_SOURCE_SQL, params)
+    budget_source_df = _filter_by_project_whitelist(
+        budget_source_df, '项目编号ID', EVENT_PROJECT_SHEET, EVENT_PROJECT_TABLES,
+        '预付期初-零工预付款-预算项',
+    )
+    budget_df = resolve_gig_budget_values(budget_source_df)
     print('[预付期初-零工预付款-DB] SQL预算项明细行数:', len(budget_df))
     return allocate_gig_budget_to_recipients(recipient_df, budget_df)
+
+
+def _mcn_query_params():
+    mcn_project_ids = project_filter_ids(MCN_PROJECT_SHEET, MCN_PROJECT_TABLES)
+    if not mcn_project_ids:
+        return None
+    return {
+        'project_ids': mcn_project_ids,
+        'direct_payment_code': DIRECT_PAYMENT_PLATFORM_CODE,
+        'prepayment_yes_code': PREPAYMENT_YES_CODE,
+        'prepayment_no_code': PREPAYMENT_NO_CODE,
+    }
+
+
+def _prepare_mcn_platform_columns(source_df):
+    df = source_df.copy()
+    if '供应商ID' not in df.columns and '平台供应商ID' in df.columns:
+        df['供应商ID'] = df['平台供应商ID']
+    if '银行账号ID' not in df.columns and '平台银行账号ID' in df.columns:
+        df['银行账号ID'] = df['平台银行账号ID']
+    return df
+
+
+def read_mcn_supplier_sources():
+    params = _mcn_query_params()
+    if not params:
+        return {
+            SHEET_MCN_PREPAYMENT: pd.DataFrame(),
+            SHEET_MCN_PREPAYMENT_ORDER: pd.DataFrame(),
+            SHEET_MCN_ANCHOR_PREPAYMENT: pd.DataFrame(),
+        }
+
+    specs = [
+        (SHEET_MCN_PREPAYMENT, MCN_PREPAYMENT_SOURCE_SQL, MCN_PREPAYMENT_OFFSET_SQL, 'RequestID'),
+        (SHEET_MCN_PREPAYMENT_ORDER, MCN_PREPAYMENT_ORDER_SOURCE_SQL, MCN_PREPAYMENT_ORDER_OFFSET_SQL, 'RequestID'),
+        (SHEET_MCN_ANCHOR_PREPAYMENT, MCN_ANCHOR_PREPAYMENT_SOURCE_SQL, MCN_ANCHOR_OFFSET_SQL, 'ID'),
+    ]
+    source_by_sheet = {}
+    for sheet_name, source_sql, offset_sql, link_column in specs:
+        source_df = _query_fw(source_sql, params)
+        source_df = _filter_by_project_whitelist(
+            source_df, '项目编号ID', MCN_PROJECT_SHEET, MCN_PROJECT_TABLES,
+            f'预付期初-{sheet_name}',
+        )
+        source_df = resolve_mcn_common_values(source_df)
+        if not source_df.empty:
+            source_df = apply_mcn_offset_amounts(source_df, _query_fw(offset_sql, params), link_column)
+        source_by_sheet[sheet_name] = source_df
+        print(f'[预付期初-{sheet_name}] SQL明细行数:', len(source_df))
+    return source_by_sheet
+
+
+def _read_mcn_platform_gig_source(sheet_name, fee_sql, recipient_sql, params):
+    fee_df = _prepare_mcn_platform_columns(_query_fw(fee_sql, params))
+    fee_df = _filter_by_project_whitelist(
+        fee_df, '项目编号ID', MCN_PROJECT_SHEET, MCN_PROJECT_TABLES,
+        f'预付期初-{sheet_name}',
+    )
+    fee_df = resolve_mcn_common_values(fee_df)
+    recipient_df = _query_fw(recipient_sql, params)
+    if not fee_df.empty and not recipient_df.empty:
+        recipient_df = recipient_df[recipient_df['ID'].isin(fee_df['ID'].dropna().unique())].copy()
+    merged_df = allocate_mcn_fee_to_recipients(fee_df, recipient_df)
+    print(f'[预付期初-{sheet_name}] SQL明细行数:', len(merged_df))
+    return merged_df
+
+
+def read_mcn_gig_sources():
+    params = _mcn_query_params()
+    if not params:
+        return {
+            SHEET_MCN_OUTBOUND_PREPAYMENT: pd.DataFrame(),
+            SHEET_MCN_OUTBOUND_ORDER_PREPAYMENT: pd.DataFrame(),
+            SHEET_MCN_ANCHOR_PLATFORM_PREPAYMENT: pd.DataFrame(),
+        }
+
+    source_by_sheet = {
+        SHEET_MCN_OUTBOUND_PREPAYMENT: _read_mcn_platform_gig_source(
+            SHEET_MCN_OUTBOUND_PREPAYMENT,
+            MCN_OUTBOUND_FEE_SOURCE_SQL,
+            MCN_OUTBOUND_RECIPIENT_SOURCE_SQL,
+            params,
+        ),
+        SHEET_MCN_OUTBOUND_ORDER_PREPAYMENT: _read_mcn_platform_gig_source(
+            SHEET_MCN_OUTBOUND_ORDER_PREPAYMENT,
+            MCN_OUTBOUND_ORDER_FEE_SOURCE_SQL,
+            MCN_OUTBOUND_ORDER_RECIPIENT_SOURCE_SQL,
+            params,
+        ),
+    }
+
+    anchor_df = _query_fw(MCN_ANCHOR_PLATFORM_SOURCE_SQL, params)
+    anchor_df = _filter_by_project_whitelist(
+        anchor_df, '项目编号ID', MCN_PROJECT_SHEET, MCN_PROJECT_TABLES,
+        f'预付期初-{SHEET_MCN_ANCHOR_PLATFORM_PREPAYMENT}',
+    )
+    anchor_df = resolve_mcn_common_values(anchor_df)
+    if not anchor_df.empty:
+        anchor_df['预付款金额分摊'] = anchor_df['金额']
+    source_by_sheet[SHEET_MCN_ANCHOR_PLATFORM_PREPAYMENT] = anchor_df
+    print(f'[预付期初-{SHEET_MCN_ANCHOR_PLATFORM_PREPAYMENT}] SQL明细行数:', len(anchor_df))
+    return source_by_sheet
+
+
+def _required_without(required_cols, excluded_cols):
+    excluded = set(excluded_cols)
+    return [column for column in required_cols if column not in excluded]
+
+
+def _collect_exception_sheets(
+        output_df, source_df, required_cols, rule_table, source_field_map, bank_source_col=None):
+    sheets = {'必输字段未达100%': c.fill_summary(output_df, required_cols, RULE_SHEET, rule_table)}
+    sheets.update(c.collect_field_issues(output_df, source_df, required_cols, source_field_map))
+    if bank_source_col and bank_source_col in source_df.columns:
+        bank_issues = c.collect_hand_vendor_bank_account_issues(output_df, source_df[bank_source_col])
+        if not bank_issues.empty:
+            sheets['银行账号_校验异常'] = bank_issues
+    sheets.update(c.collect_order_mapping_issues(source_df))
+    c.attach_budget_issue_columns(sheets, c.build_budget_issue_map(source_df))
+    return sheets
 
 
 def run():
     # 1. SQL 直接查过滤后的源数据
     supplier_merged_df = read_supplier_source()
     gig_merged_df = read_gig_source()
+    mcn_supplier_sources = read_mcn_supplier_sources()
+    mcn_gig_sources = read_mcn_gig_sources()
 
-    # 2. 构建两个 tab 输出
-    supplier_output_df = build_supplier_output(supplier_merged_df)
+    # 2. 构建原 2 个 sheet + 追加 MCN 6 个 sheet 输出
+    supplier_output_df = (
+        build_supplier_output(supplier_merged_df)
+        if not supplier_merged_df.empty else pd.DataFrame(columns=SUPPLIER_OUTPUT_COLUMNS)
+    )
     print('[预付期初-供应商预付款-DB] 输出明细行数:', len(supplier_output_df))
-    gig_output_df = build_gig_output(gig_merged_df)
+    gig_output_df = (
+        build_gig_output(gig_merged_df)
+        if not gig_merged_df.empty else pd.DataFrame(columns=GIG_OUTPUT_COLUMNS)
+    )
     print('[预付期初-零工预付款-DB] 输出明细行数:', len(gig_output_df))
+    mcn_supplier_outputs = {
+        sheet_name: build_mcn_supplier_output(source_df)
+        for sheet_name, source_df in mcn_supplier_sources.items()
+    }
+    mcn_gig_outputs = {
+        SHEET_MCN_OUTBOUND_PREPAYMENT: build_mcn_gig_output(
+            mcn_gig_sources[SHEET_MCN_OUTBOUND_PREPAYMENT],
+            anchor_payee_category=False,
+        ),
+        SHEET_MCN_OUTBOUND_ORDER_PREPAYMENT: build_mcn_gig_output(
+            mcn_gig_sources[SHEET_MCN_OUTBOUND_ORDER_PREPAYMENT],
+            anchor_payee_category=False,
+        ),
+        SHEET_MCN_ANCHOR_PLATFORM_PREPAYMENT: build_mcn_gig_output(
+            mcn_gig_sources[SHEET_MCN_ANCHOR_PLATFORM_PREPAYMENT],
+            anchor_payee_category=True,
+        ),
+    }
+    for sheet_name, output_df in {**mcn_supplier_outputs, **mcn_gig_outputs}.items():
+        print(f'[预付期初-{sheet_name}] 输出明细行数:', len(output_df))
 
     # 3. 填充率(必输字段以规则表「是否必填」=Y 为准)
     supplier_required = c.required_columns(RULE_SHEET, RULE_TABLE_SUPPLIER)
     gig_required = c.required_columns(RULE_SHEET, RULE_TABLE_GIG)
+    gig_required_effective = _required_without(gig_required, GIG_NOT_INVOLVED_REQUIRED_COLUMNS)
+    mcn_gig_required = _required_without(gig_required, MCN_GIG_NOT_INVOLVED_REQUIRED_COLUMNS)
     print('— 供应商预付款 填充率 —')
     c.report_fill(supplier_output_df, supplier_required)
     print('— 灵工预付款 填充率 —')
-    c.report_fill(gig_output_df, gig_required)
+    c.report_fill(gig_output_df, gig_required_effective)
+    for sheet_name, output_df in mcn_supplier_outputs.items():
+        print(f'— {sheet_name} 填充率 —')
+        c.report_fill(output_df, supplier_required)
+    for sheet_name, output_df in mcn_gig_outputs.items():
+        print(f'— {sheet_name} 填充率 —')
+        c.report_fill(output_df, mcn_gig_required)
 
-    # 4. 写模版(两个 tab 一次写入,lov 页保留)
-    c.write_template_sheets(TEMPLATE_FILE, OUTPUT_FILE, {
-        TEMPLATE_SHEET_SUPPLIER: supplier_output_df,
-        TEMPLATE_SHEET_GIG: gig_output_df,
-    })
+    # 4. 写模版(原 2 个 tab 保留,MCN 6 个 tab 复制模板追加,lov 页保留)
+    write_output_workbook(supplier_output_df, gig_output_df, mcn_supplier_outputs, mcn_gig_outputs)
     print('已写出:', OUTPUT_FILE)
 
     # 5. 问题清单
     exception_sheets = {}
-    supplier_sheets = {'必输字段未达100%': c.fill_summary(
-        supplier_output_df, supplier_required, RULE_SHEET, RULE_TABLE_SUPPLIER)}
-    supplier_sheets.update(c.collect_field_issues(
-        supplier_output_df, supplier_merged_df, supplier_required, SUPPLIER_ISSUE_SOURCE_FIELDS))
-    supplier_bank_issues = c.collect_hand_vendor_bank_account_issues(
-        supplier_output_df, supplier_merged_df['银行卡号'])
-    if not supplier_bank_issues.empty:
-        supplier_sheets['银行账号_校验异常'] = supplier_bank_issues
-    supplier_sheets.update(c.collect_order_mapping_issues(supplier_merged_df))
-    c.attach_budget_issue_columns(supplier_sheets, c.build_budget_issue_map(supplier_merged_df))
+    supplier_sheets = _collect_exception_sheets(
+        supplier_output_df, supplier_merged_df, supplier_required, RULE_TABLE_SUPPLIER,
+        SUPPLIER_ISSUE_SOURCE_FIELDS, bank_source_col='银行卡号',
+    )
     exception_sheets.update({f'供应商_{name}': df for name, df in supplier_sheets.items()})
 
-    gig_sheets = {'必输字段未达100%': c.fill_summary(
-        gig_output_df, gig_required, RULE_SHEET, RULE_TABLE_GIG)}
-    gig_sheets.update(c.collect_field_issues(
-        gig_output_df, gig_merged_df, gig_required, GIG_ISSUE_SOURCE_FIELDS))
-    gig_bank_issues = c.collect_hand_vendor_bank_account_issues(
-        gig_output_df, gig_merged_df['银行账号'])
-    if not gig_bank_issues.empty:
-        gig_sheets['银行账号_校验异常'] = gig_bank_issues
-    gig_sheets.update(c.collect_order_mapping_issues(gig_merged_df))
-    c.attach_budget_issue_columns(gig_sheets, c.build_budget_issue_map(gig_merged_df))
+    gig_sheets = _collect_exception_sheets(
+        gig_output_df, gig_merged_df, gig_required_effective, RULE_TABLE_GIG,
+        GIG_ISSUE_SOURCE_FIELDS, bank_source_col='银行账号',
+    )
     exception_sheets.update({f'灵工_{name}': df for name, df in gig_sheets.items()})
+
+    for sheet_name, output_df in mcn_supplier_outputs.items():
+        source_df = mcn_supplier_sources[sheet_name]
+        sheets = _collect_exception_sheets(
+            output_df, source_df, supplier_required, RULE_TABLE_SUPPLIER,
+            MCN_SUPPLIER_ISSUE_SOURCE_FIELDS, bank_source_col='银行账号',
+        )
+        exception_sheets.update({f'{sheet_name}_{name}': df for name, df in sheets.items()})
+
+    for sheet_name, output_df in mcn_gig_outputs.items():
+        source_df = mcn_gig_sources[sheet_name]
+        sheets = _collect_exception_sheets(
+            output_df, source_df, mcn_gig_required, RULE_TABLE_GIG,
+            MCN_GIG_ISSUE_SOURCE_FIELDS, bank_source_col='明细银行账号',
+        )
+        exception_sheets.update({f'{sheet_name}_{name}': df for name, df in sheets.items()})
 
     c.write_exceptions(EXCEPTION_FILE, exception_sheets)
     print('已写出:', EXCEPTION_FILE, '| 各清单条数:', {k: len(v) for k, v in exception_sheets.items()})
