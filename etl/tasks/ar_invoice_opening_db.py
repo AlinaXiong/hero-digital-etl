@@ -293,6 +293,7 @@ def resolve_source_values(source_df):
     contract_map = c.build_fw_contract_code_map_for_ids(df['开票合同ID'])
     currency_map = c.build_fw_currency_name_map_for_ids(df['开票币种ID'])
     cost_center_map = c.build_fw_cost_center_map_for_ids(df['成本中心ID'])
+    cost_center_code_map = c.build_fw_cost_center_code_map_for_ids(df['成本中心ID'])
     project_map = build_fw_project_code_map_for_ids(df['项目编号ID'])
 
     # [开票表] sqr -> hrmresource / hrmjobtitles
@@ -307,8 +308,12 @@ def resolve_source_values(source_df):
     # [开票表] kpht -> uf_htsp.htbh
     df['开票合同'] = df['开票合同ID'].map(lambda value: contract_map.get(_first_browser_id(value), ''))
     # [开票表] xmbh -> uf_xtyyxmkp.xmbh
-    df['项目编号'] = df['项目编号ID'].map(
-        lambda value: _lookup_first_browser_value(project_map, value) or _text(value))
+    df['项目编号'] = [
+        _lookup_first_browser_value(project_map, project_value)
+        or _text(project_value)
+        or _lookup_first_browser_value(cost_center_code_map, cost_center_value)
+        for project_value, cost_center_value in zip(df['项目编号ID'], df['成本中心ID'])
+    ]
     # [开票表] kpbz -> fnacurrency.CURRENCYNAME
     df['开票币种'] = df['开票币种ID'].map(lambda value: currency_map.get(c.format_code(value), ''))
     # [开票表] cbzx -> uf_cbzx.mc(成本中心名称)

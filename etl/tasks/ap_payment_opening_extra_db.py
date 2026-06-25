@@ -45,9 +45,9 @@ BASE_TEMPLATE_SHEET = '期初对公付款单导入'
 SUMMARY_SHEET = '汇总'
 SHEET_BATCH = '批量费用流程'
 SHEET_EXTERNAL_COST = '只转入外部成本'
-SHEET_MCN_OUTBOUND = 'MCN对外付款流程'
-SHEET_MCN_ORDER = 'MCN对外付款流程(订单)'
-SHEET_MCN_ANCHOR = 'MCN主播相关付款流程'
+SHEET_MCN_OUTBOUND = '期初对公付款-MCN对外付款流程'
+SHEET_MCN_ORDER = '期初对公付款-MCN对外付款流程(订单)'
+SHEET_MCN_ANCHOR = '期初对公付款-MCN主播相关付款流程'
 RULE_SHEET = '应付期初'
 RULE_TABLE = '期初对公付款单'
 
@@ -57,6 +57,7 @@ SOURCE_SYSTEM = 'FW'
 VIRTUAL_VENDOR_NAME = '外部成本转移虚拟供应商'
 DIRECT_PAYMENT_PLATFORM_CODE = '2'
 NOT_PREPAYMENT_CODE = '1'
+DEPARTMENT_MODULE_CODE = '1'
 EVENT_PROJECT_SHEET = '赛事'
 MCN_PROJECT_SHEET = 'MCN'
 EVENT_PROJECT_TABLES = ('uf_xtyyxmkp', 'uf_xmkp', 'view_xmjkzb')
@@ -118,6 +119,7 @@ SELECT
     m.xmbh AS `项目编号`,
     m.gszt AS `公司主体ID`,
     m.rzdw AS `成本中心ID`,
+    cc.bh AS `成本中心编号`,
     m.bz AS `备注`,
     m.xght AS `相关合同ID`,
     m.gys AS `供应商ID`,
@@ -130,8 +132,16 @@ SELECT
     d.yskm AS `预算科目ID`
 FROM uf_dgfktz m
 JOIN uf_dgfktz_dt1 d ON d.mainid = m.id
+LEFT JOIN uf_cbzx cc ON cc.id = m.rzdw
 WHERE m.lcly IN %(source_codes)s
-  AND m.xmbh IN %(project_ids)s
+  AND (
+      m.xmbh IN %(project_ids)s
+      OR (
+          (m.xmbh IS NULL OR CAST(m.xmbh AS CHAR) = '')
+          AND m.sqrq >= %(date_from)s
+          AND cc.bh IN %(project_codes)s
+      )
+  )
 ORDER BY m.id, d.id
 """
 
@@ -142,8 +152,16 @@ SELECT
     SUM(d.fkje) AS amount_total
 FROM uf_dgfktz m
 JOIN uf_dgfktz_dt1 d ON d.mainid = m.id
+LEFT JOIN uf_cbzx cc ON cc.id = m.rzdw
 WHERE m.lcly IN %(source_codes)s
-  AND m.xmbh IN %(project_ids)s
+  AND (
+      m.xmbh IN %(project_ids)s
+      OR (
+          (m.xmbh IS NULL OR CAST(m.xmbh AS CHAR) = '')
+          AND m.sqrq >= %(date_from)s
+          AND cc.bh IN %(project_codes)s
+      )
+  )
 """
 
 BATCH_SOURCE_SQL = """
@@ -156,13 +174,24 @@ SELECT
     d.xmbh AS `项目编号ID`,
     m.gszt AS `公司主体ID`,
     COALESCE(NULLIF(CAST(d.cbzx AS CHAR), ''), CAST(m.cbzx AS CHAR)) AS `成本中心ID`,
+    cc.bh AS `成本中心编号`,
+    d.yslx AS `核算模块ID`,
     COALESCE(NULLIF(d.bz, ''), NULLIF(m.pcbz, ''), NULLIF(m.fypcbz, ''), NULLIF(m.fypcmc, '')) AS `备注`,
     m.dwfkdw AS `供应商ID`,
     d.je AS `金额`,
     COALESCE(d.yskm, d.fyxh) AS `预算科目ID`
 FROM uf_plfy m
 JOIN uf_plfy_dt1 d ON d.mainid = m.id
-WHERE d.xmbh IN %(project_ids)s
+LEFT JOIN uf_cbzx cc ON cc.id = COALESCE(NULLIF(CAST(d.cbzx AS CHAR), ''), CAST(m.cbzx AS CHAR))
+WHERE (
+      d.xmbh IN %(project_ids)s
+      OR (
+          (d.xmbh IS NULL OR CAST(d.xmbh AS CHAR) = '')
+          AND d.jlrq >= %(date_from)s
+          AND d.yslx = %(department_module_code)s
+          AND cc.bh IN %(project_codes)s
+      )
+  )
 ORDER BY d.jlrq, m.id, d.id
 """
 
@@ -173,7 +202,16 @@ SELECT
     SUM(d.je) AS amount_total
 FROM uf_plfy m
 JOIN uf_plfy_dt1 d ON d.mainid = m.id
-WHERE d.xmbh IN %(project_ids)s
+LEFT JOIN uf_cbzx cc ON cc.id = COALESCE(NULLIF(CAST(d.cbzx AS CHAR), ''), CAST(m.cbzx AS CHAR))
+WHERE (
+      d.xmbh IN %(project_ids)s
+      OR (
+          (d.xmbh IS NULL OR CAST(d.xmbh AS CHAR) = '')
+          AND d.jlrq >= %(date_from)s
+          AND d.yslx = %(department_module_code)s
+          AND cc.bh IN %(project_codes)s
+      )
+  )
 """
 
 EXTERNAL_COST_SOURCE_SQL = """
@@ -193,6 +231,8 @@ SELECT
     m.zcgszt AS `转出公司主体ID`,
     m.zrcbzx AS `转入成本中心ID`,
     m.zccbzx AS `转出成本中心ID`,
+    zrcc.bh AS `转入成本中心编号`,
+    zccc.bh AS `转出成本中心编号`,
     m.zrzcjehz AS `转入总金额`,
     m.zczcjehz AS `转出总金额`,
     m.fyd AS `费用单ID`,
@@ -216,12 +256,21 @@ FROM uf_xtyynbsz m
 JOIN uf_xtyynbsz_dt10 d ON d.mainid = m.id
 LEFT JOIN view_costlist_ys v
     ON v.id = COALESCE(NULLIF(d.stzjid, ''), NULLIF(d.mxid, ''))
+LEFT JOIN uf_cbzx zrcc ON zrcc.id = m.zrcbzx
+LEFT JOIN uf_cbzx zccc ON zccc.id = m.zccbzx
 WHERE m.ly IN (5, 2)
   AND (
       m.zrxmbh IN %(project_ids)s
       OR m.zcxmbh IN %(project_ids)s
       OR m.zrxmbhmcnss IN %(project_ids)s
       OR m.zcxmbhmcnss IN %(project_ids)s
+      OR (
+          m.sqrq >= %(date_from)s
+          AND (
+              ((m.zrxmbh IS NULL OR CAST(m.zrxmbh AS CHAR) = '') AND (m.zrxmbhmcnss IS NULL OR CAST(m.zrxmbhmcnss AS CHAR) = '') AND zrcc.bh IN %(project_codes)s)
+              OR ((m.zcxmbh IS NULL OR CAST(m.zcxmbh AS CHAR) = '') AND (m.zcxmbhmcnss IS NULL OR CAST(m.zcxmbhmcnss AS CHAR) = '') AND zccc.bh IN %(project_codes)s)
+          )
+      )
   )
 ORDER BY m.sqrq, m.id, d.id
 """
@@ -234,12 +283,21 @@ SELECT
     SUM(COALESCE(zrzcjehz, 0)) AS in_amount_total,
     SUM(COALESCE(zczcjehz, 0)) AS out_amount_total
 FROM uf_xtyynbsz
+LEFT JOIN uf_cbzx zrcc ON zrcc.id = zrcbzx
+LEFT JOIN uf_cbzx zccc ON zccc.id = zccbzx
 WHERE ly IN (5, 2)
   AND (
       zrxmbh IN %(project_ids)s
       OR zcxmbh IN %(project_ids)s
       OR zrxmbhmcnss IN %(project_ids)s
       OR zcxmbhmcnss IN %(project_ids)s
+      OR (
+          sqrq >= %(date_from)s
+          AND (
+              ((zrxmbh IS NULL OR CAST(zrxmbh AS CHAR) = '') AND (zrxmbhmcnss IS NULL OR CAST(zrxmbhmcnss AS CHAR) = '') AND zrcc.bh IN %(project_codes)s)
+              OR ((zcxmbh IS NULL OR CAST(zcxmbh AS CHAR) = '') AND (zcxmbhmcnss IS NULL OR CAST(zcxmbhmcnss AS CHAR) = '') AND zccc.bh IN %(project_codes)s)
+          )
+      )
   )
 """
 
@@ -255,6 +313,7 @@ SELECT
     m.sqr AS `申请人ID`,
     m.szgs AS `公司主体ID`,
     m.cbzx2 AS `成本中心ID`,
+    cc.bh AS `成本中心编号`,
     m.dfgsmc AS `供应商ID`,
     m.yhzh AS `银行账号ID`,
     m.fkht AS `主表合同ID`,
@@ -270,8 +329,16 @@ SELECT
 FROM formtable_main_33 m
 JOIN formtable_main_33_dt1 d ON d.mainid = m.id
 LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestId
+LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx2
 WHERE m.fkpt = %(direct_payment_code)s
-  AND d.szxm IN %(project_ids)s
+  AND (
+      d.szxm IN %(project_ids)s
+      OR (
+          (d.szxm IS NULL OR CAST(d.szxm AS CHAR) = '')
+          AND m.sqrq >= %(date_from)s
+          AND cc.bh IN %(project_codes)s
+      )
+  )
 ORDER BY m.id, d.id
 """
 
@@ -288,6 +355,7 @@ SELECT * FROM (
         m.sqr AS `申请人ID`,
         m.szgs AS `公司主体ID`,
         m.cbzx AS `成本中心ID`,
+        cc.bh AS `成本中心编号`,
         m.dfgsmc AS `供应商ID`,
         m.yhzh AS `银行账号ID`,
         m.fkht AS `主表合同ID`,
@@ -303,6 +371,7 @@ SELECT * FROM (
     FROM formtable_main_66 m
     JOIN formtable_main_66_dt3 d ON d.mainid = m.id
     LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
+    LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx
     WHERE m.fkpt = %(direct_payment_code)s
     UNION ALL
     SELECT
@@ -316,6 +385,7 @@ SELECT * FROM (
         m.sqr AS `申请人ID`,
         m.szgs AS `公司主体ID`,
         m.cbzx AS `成本中心ID`,
+        cc.bh AS `成本中心编号`,
         m.dfgsmc AS `供应商ID`,
         m.yhzh AS `银行账号ID`,
         m.fkht AS `主表合同ID`,
@@ -331,6 +401,7 @@ SELECT * FROM (
     FROM formtable_main_66 m
     JOIN formtable_main_66_dt4 d ON d.mainid = m.id
     LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
+    LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx
     WHERE m.fkpt = %(direct_payment_code)s
     UNION ALL
     SELECT
@@ -344,6 +415,7 @@ SELECT * FROM (
         m.sqr AS `申请人ID`,
         m.szgs AS `公司主体ID`,
         m.cbzx AS `成本中心ID`,
+        cc.bh AS `成本中心编号`,
         m.dfgsmc AS `供应商ID`,
         m.yhzh AS `银行账号ID`,
         m.fkht AS `主表合同ID`,
@@ -359,6 +431,7 @@ SELECT * FROM (
     FROM formtable_main_66 m
     JOIN formtable_main_66_dt5 d ON d.mainid = m.id
     LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
+    LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx
     WHERE m.fkpt = %(direct_payment_code)s
     UNION ALL
     SELECT
@@ -372,6 +445,7 @@ SELECT * FROM (
         m.sqr AS `申请人ID`,
         m.szgs AS `公司主体ID`,
         m.cbzx AS `成本中心ID`,
+        cc.bh AS `成本中心编号`,
         m.dfgsmc AS `供应商ID`,
         m.yhzh AS `银行账号ID`,
         m.fkht AS `主表合同ID`,
@@ -387,9 +461,17 @@ SELECT * FROM (
     FROM formtable_main_66 m
     JOIN formtable_main_66_dt6 d ON d.mainid = m.id
     LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
+    LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx
     WHERE m.fkpt = %(direct_payment_code)s
 ) x
-WHERE x.`项目编号ID` IN %(project_ids)s
+WHERE (
+      x.`项目编号ID` IN %(project_ids)s
+      OR (
+          (x.`项目编号ID` IS NULL OR CAST(x.`项目编号ID` AS CHAR) = '')
+          AND x.`申请日期` >= %(date_from)s
+          AND x.`成本中心编号` IN %(project_codes)s
+      )
+  )
 ORDER BY x.`ID`, x.`明细ID`
 """
 
@@ -405,6 +487,7 @@ SELECT
     m.sqr AS `申请人ID`,
     m.szgs AS `公司主体ID`,
     COALESCE(d.cbzx, m.cbzx1, m.cbzxjs) AS `成本中心ID`,
+    cc.bh AS `成本中心编号`,
     m.dfgsmc AS `供应商ID`,
     COALESCE(m.gysyhzh, m.yhzh) AS `银行账号ID`,
     m.szht AS `主表合同ID`,
@@ -420,8 +503,16 @@ SELECT
 FROM formtable_main_38 m
 JOIN formtable_main_38_dt4 d ON d.mainid = m.id
 LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestId
+LEFT JOIN uf_cbzx cc ON cc.id = COALESCE(d.cbzx, m.cbzx1, m.cbzxjs)
 WHERE m.sfyfk = %(not_prepayment_code)s
-  AND d.xmbh IN %(project_ids)s
+  AND (
+      d.xmbh IN %(project_ids)s
+      OR (
+          (d.xmbh IS NULL OR CAST(d.xmbh AS CHAR) = '')
+          AND m.sqrq >= %(date_from)s
+          AND cc.bh IN %(project_codes)s
+      )
+  )
 ORDER BY m.id, d.id
 """
 
@@ -536,6 +627,7 @@ def load_mcn_fee_names():
         name = _text(row[2] if 2 < len(row) else '')
         if code and name:
             result[code] = name
+    result.setdefault('JG', '外包费用')
     _MCN_FEE_NAME_CACHE = result
     return result
 
@@ -554,6 +646,7 @@ def load_mcn_fee_subjects():
         subject_name = _text(row[6] if 6 < len(row) else '')
         if old_code and subject_code:
             result[old_code] = (subject_code, subject_name)
+    result.setdefault('JG', ('AB0103', '其他周边搭建'))
     _MCN_FEE_SUBJECT_CACHE = result
     return result
 
@@ -676,7 +769,16 @@ def _with_resolved_project_fields(source_df, project_column='项目编号', tabl
         for project_id, info in project_info_map.items()
     }
 
-    df['项目编号'] = _resolve_project_codes(df[project_column], project_code_map)
+    mapped_project_codes = _resolve_project_codes(df[project_column], project_code_map)
+    cost_center_codes = (
+        df['成本中心编号'].map(_text)
+        if '成本中心编号' in df.columns
+        else pd.Series('', index=df.index)
+    )
+    df['项目编号'] = [
+        project_code or cost_center_code
+        for project_code, cost_center_code in zip(mapped_project_codes, cost_center_codes)
+    ]
     mapped_project_names = _resolve_project_names(df[project_column], project_name_map)
     existing_project_names = df['项目名称'] if '项目名称' in df.columns else pd.Series('', index=df.index)
     df['项目名称'] = [
@@ -1046,6 +1148,8 @@ def read_base_source():
     params = {
         'source_codes': base_payment.SOURCE_CODES,
         'project_ids': event_project_ids,
+        'project_codes': tuple(sorted(project_filter_codes(EVENT_PROJECT_SHEET))),
+        'date_from': DATE_FROM,
     }
     stats = _query_fw(BASE_EVENT_STATS_SQL, params).iloc[0]
     print('[应付期初-供应商付款-DB] SQL过滤: 仅保留赛事项目白名单; 不再过滤申请日期/流程状态/作废状态')
@@ -1056,6 +1160,7 @@ def read_base_source():
         source_df, '项目编号', EVENT_PROJECT_SHEET, EVENT_PROJECT_TABLES,
         '应付期初-供应商付款-DB',
     )
+    source_df = _with_resolved_project_fields(source_df, '项目编号', EVENT_PROJECT_TABLES)
     print('[应付期初-供应商付款-DB] SQL主子合并明细行数:', len(source_df))
     return source_df
 
@@ -1064,7 +1169,12 @@ def read_batch_source():
     event_project_ids = project_filter_ids(EVENT_PROJECT_SHEET, EVENT_PROJECT_TABLES)
     if not event_project_ids:
         return pd.DataFrame()
-    params = {'project_ids': event_project_ids}
+    params = {
+        'project_ids': event_project_ids,
+        'project_codes': tuple(sorted(project_filter_codes(EVENT_PROJECT_SHEET))),
+        'date_from': DATE_FROM,
+        'department_module_code': DEPARTMENT_MODULE_CODE,
+    }
     stats = _query_fw(BATCH_STATS_SQL, params).iloc[0]
     print('[应付期初-批量费用流程] SQL过滤: 仅保留赛事项目白名单; 不再过滤确认/作废/记录日期')
     print(f"  保留批量费用 {int(stats['document_count'] or 0)} 单 / 明细 {int(stats['kept_count'] or 0)} 行; "
@@ -1148,6 +1258,8 @@ def read_mcn_payment_source():
         return pd.DataFrame()
     params = {
         'project_ids': mcn_project_ids,
+        'project_codes': tuple(sorted(project_filter_codes(MCN_PROJECT_SHEET))),
+        'date_from': DATE_FROM,
         'direct_payment_code': DIRECT_PAYMENT_PLATFORM_CODE,
         'not_prepayment_code': NOT_PREPAYMENT_CODE,
     }
@@ -1263,7 +1375,11 @@ def read_external_cost_source():
     ))
     if not project_ids:
         return pd.DataFrame()
-    params = {'project_ids': project_ids}
+    params = {
+        'project_ids': project_ids,
+        'project_codes': tuple(sorted(project_filter_codes(EVENT_PROJECT_SHEET) | project_filter_codes(MCN_PROJECT_SHEET))),
+        'date_from': DATE_FROM,
+    }
     stats = _query_fw(EXTERNAL_COST_STATS_SQL, params).iloc[0]
     print('[应付期初-只转入外部成本] SQL过滤: 仅保留赛事/MCN项目白名单; 不再过滤流程状态/作废/申请日期')
     print(f"  保留内部收支 {int(stats['document_count'] or 0)} 单; "
@@ -1314,13 +1430,14 @@ def resolve_external_cost_values(source_df):
             else (event_project_code_map, event_project_name_map)
         )
 
-    def project_code(source_type, project_value, mcn_project_value):
+    def project_code(source_type, project_value, mcn_project_value, cost_center_code):
         code_map, _ = project_maps(source_type)
         return _first_non_blank(
             _first_browser_value(code_map, mcn_project_value),
             _first_browser_value(code_map, project_value),
             _text(mcn_project_value),
             _text(project_value),
+            _text(cost_center_code),
         )
 
     def project_name(source_type, existing_name, project_value, mcn_project_value):
@@ -1338,14 +1455,14 @@ def resolve_external_cost_values(source_df):
     df['转入成本中心'] = df['转入成本中心ID'].map(lambda value: _first_browser_value(cost_center_map, value))
     df['转出成本中心'] = df['转出成本中心ID'].map(lambda value: _first_browser_value(cost_center_map, value))
     df['转入项目编号'] = [
-        project_code(source_type, in_project, in_mcn_project)
-        for source_type, in_project, in_mcn_project
-        in zip(df['来源类型'], df['转入项目编号ID'], df['转入MCN赛事项目编号ID'])
+        project_code(source_type, in_project, in_mcn_project, cost_center_code)
+        for source_type, in_project, in_mcn_project, cost_center_code
+        in zip(df['来源类型'], df['转入项目编号ID'], df['转入MCN赛事项目编号ID'], df['转入成本中心编号'])
     ]
     df['转出项目编号'] = [
-        project_code(source_type, out_project, out_mcn_project)
-        for source_type, out_project, out_mcn_project
-        in zip(df['来源类型'], df['转出项目编号ID'], df['转出MCN赛事项目编号ID'])
+        project_code(source_type, out_project, out_mcn_project, cost_center_code)
+        for source_type, out_project, out_mcn_project, cost_center_code
+        in zip(df['来源类型'], df['转出项目编号ID'], df['转出MCN赛事项目编号ID'], df['转出成本中心编号'])
     ]
     df['转入项目名称'] = [
         project_name(source_type, in_project_name, in_project, in_mcn_project)

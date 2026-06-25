@@ -724,12 +724,12 @@ def build_fw_budget_subject_path_map_for_ids(subject_ids):
     return subject_map
 
 
-def build_fw_cost_center_map_for_ids(cost_center_values):
-    """泛微成本中心(browser.cbzx01)ID -> 成本中心名称。
+def build_fw_cost_center_info_map_for_ids(cost_center_values):
+    """泛微成本中心(browser.cbzx01)ID -> 成本中心名称/编号。
 
     各表单成本中心字段(uf_dgfktz.rzdw / uf_yfkxx.cbzx / uf_xtyykp.cbzx /
     uf_plfy.cbzx / uf_xtyynbsz.zrcbzx,zccbzx / uf_lgptfk.cbzx)都指向成本中心
-    建模表 uf_cbzx,取 uf_cbzx.mc(成本中心名称)。
+    建模表 uf_cbzx,取 uf_cbzx.mc(成本中心名称)、uf_cbzx.bh(成本中心编号)。
     """
     cost_center_ids = clean_codes(
         cost_center_id
@@ -741,13 +741,34 @@ def build_fw_cost_center_map_for_ids(cost_center_values):
     cost_center_df = query_db(
         'FW',
         'vspn_xtyy',
-        f'SELECT id, mc FROM uf_cbzx WHERE id IN ({in_placeholders(cost_center_ids)})',
+        f'SELECT id, bh, mc FROM uf_cbzx WHERE id IN ({in_placeholders(cost_center_ids)})',
         cost_center_ids,
     )
     return {
-        format_code(row['id']): _cell_text(row['mc'])
+        format_code(row['id']): {
+            'code': _cell_text(row['bh']),
+            'name': _cell_text(row['mc']),
+        }
         for _, row in cost_center_df.iterrows()
-        if _cell_text(row['mc'])
+        if _cell_text(row['mc']) or _cell_text(row['bh'])
+    }
+
+
+def build_fw_cost_center_map_for_ids(cost_center_values):
+    """泛微成本中心(browser.cbzx01)ID -> 成本中心名称。"""
+    return {
+        cost_center_id: info.get('name', '')
+        for cost_center_id, info in build_fw_cost_center_info_map_for_ids(cost_center_values).items()
+        if info.get('name', '')
+    }
+
+
+def build_fw_cost_center_code_map_for_ids(cost_center_values):
+    """泛微成本中心(browser.cbzx01)ID -> 成本中心编号。"""
+    return {
+        cost_center_id: info.get('code', '')
+        for cost_center_id, info in build_fw_cost_center_info_map_for_ids(cost_center_values).items()
+        if info.get('code', '')
     }
 
 
