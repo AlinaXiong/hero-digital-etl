@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
 """应付期初 —— 对公付款单 / 批量费用流程 / 只转入外部成本(DB 直连版)。
 
-按《业财项目_数据映射规则.xlsx》-「应付期初」生成期初对公付款单导入模板的三个 sheet:
+按《业财项目_数据映射规则.xlsx》-「应付期初」生成期初对公付款单导入模板:
+    0. 汇总
     1. 期初对公付款单导入
     2. 批量费用流程
     3. 只转入外部成本
 
 跑法:在项目根执行  python run.py ap_payment_opening_extra_db
 """
+import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -27,7 +30,9 @@ TEMPLATE_DIR = c.TPL_DIR / 'ap_payment_opening'
 OUTPUT_DIR = c.OUT_DIR / TASK_NAME
 DATE_SUFFIX = c.today_suffix()
 
-PROJECT_FILTER_FILE = Path.home() / 'Downloads' / '数据清洗涉及泛微项目编码_0624_分类.xlsx'
+PROJECT_FILTER_ENV = 'PROJECT_FILTER_XLSX'
+PROJECT_FILTER_DEFAULT_FILE = c.RULES_DIR / '数据清洗涉及泛微项目编码_0624_分类.xlsx'
+PROJECT_FILTER_FILE = Path(os.getenv(PROJECT_FILTER_ENV, '').strip() or PROJECT_FILTER_DEFAULT_FILE)
 
 TEMPLATE_FILE = TEMPLATE_DIR / '英雄期初对公付款单导入模版.xlsx'
 OUTPUT_FILE = OUTPUT_DIR / f'英雄期初对公付款单导入_应付期初_补充_{DATE_SUFFIX}.xlsx'
@@ -37,6 +42,7 @@ MCN_SUPPLIER_VENDOR_MISSING_FILE = OUTPUT_DIR / f'Hand按ID查不到的供应商
 BATCH_SUPPLIER_VENDOR_MISSING_FILE = OUTPUT_DIR / f'Hand按ID查不到的供应商_批量费用流程_{DATE_SUFFIX}.xlsx'
 
 BASE_TEMPLATE_SHEET = '期初对公付款单导入'
+SUMMARY_SHEET = '汇总'
 SHEET_BATCH = '批量费用流程'
 SHEET_EXTERNAL_COST = '只转入外部成本'
 SHEET_MCN_OUTBOUND = 'MCN对外付款流程'
@@ -755,8 +761,46 @@ def _move_sheets_to_front(workbook, sheet_names):
     workbook._sheets = ordered_sheets + remaining_sheets
 
 
+def _build_summary_df(sheet_to_df):
+    summary_frames = []
+    summary_columns = ['来源Sheet']
+    for output_df in sheet_to_df.values():
+        for column_name in output_df.columns:
+            if column_name not in summary_columns:
+                summary_columns.append(column_name)
+
+    for sheet_name, output_df in sheet_to_df.items():
+        summary_part = output_df.copy()
+        summary_part.insert(0, '来源Sheet', sheet_name)
+        summary_frames.append(summary_part.reindex(columns=summary_columns))
+
+    if not summary_frames:
+        return pd.DataFrame(columns=summary_columns)
+    return pd.concat(summary_frames, ignore_index=True)
+
+
+def _save_workbook(workbook, output_file):
+    try:
+        workbook.save(output_file)
+        return output_file
+    except PermissionError:
+        fallback_file = output_file.with_name(
+            f'{output_file.stem}_{datetime.now().strftime("%H%M%S")}{output_file.suffix}'
+        )
+        print(f'[应付期初] 输出文件被占用，已改写到: {fallback_file}')
+        workbook.save(fallback_file)
+        return fallback_file
+
+
 def write_output_workbook(base_output_df, batch_output_df, external_output_df, mcn_output_dfs=None):
     wb = load_workbook(TEMPLATE_FILE)
+    sheet_to_df = {
+        BASE_TEMPLATE_SHEET: base_output_df,
+        SHEET_BATCH: batch_output_df,
+        SHEET_EXTERNAL_COST: external_output_df,
+        **(mcn_output_dfs or {}),
+    }
+    _fill_sheet(_copy_template_sheet(wb, SUMMARY_SHEET), _build_summary_df(sheet_to_df))
     _fill_sheet(wb[BASE_TEMPLATE_SHEET], base_output_df)
     _fill_sheet(_copy_template_sheet(wb, SHEET_BATCH), batch_output_df)
     _fill_sheet(_copy_template_sheet(wb, SHEET_EXTERNAL_COST), external_output_df)
@@ -764,11 +808,10 @@ def write_output_workbook(base_output_df, batch_output_df, external_output_df, m
         _fill_sheet(_copy_template_sheet(wb, sheet_name), output_df)
     _move_sheets_to_front(
         wb,
-        [BASE_TEMPLATE_SHEET, SHEET_BATCH, SHEET_EXTERNAL_COST, *(mcn_output_dfs or {}).keys()],
+        [SUMMARY_SHEET, BASE_TEMPLATE_SHEET, SHEET_BATCH, SHEET_EXTERNAL_COST, *(mcn_output_dfs or {}).keys()],
     )
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(OUTPUT_FILE)
-    return OUTPUT_FILE
+    return _save_workbook(wb, OUTPUT_FILE)
 
 
 def _allocate_group_amounts(group, total_col):
@@ -1356,8 +1399,8 @@ def run():
         c.report_fill(output_df, required_cols)
 
     # 4. 写入模板:同一个 Excel 内写入六个数据 sheet,lov 页保留。
-    write_output_workbook(base_output_df, batch_output_df, external_output_df, mcn_output_dfs)
-    print('已写出:', OUTPUT_FILE)
+    output_file = write_output_workbook(base_output_df, batch_output_df, external_output_df, mcn_output_dfs)
+    print('已写出:', output_file)
 
     # 5. 问题清单
     exception_sheets = {}

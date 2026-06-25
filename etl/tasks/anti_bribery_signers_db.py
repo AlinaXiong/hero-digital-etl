@@ -5,6 +5,9 @@
     合同编号含 'H-P' 且 合同名称含 '贿赂'(兼容「反商业贿赂」「反贿赂」)的合同,
     视为反商业贿赂协议;把对应供应商补登到第一个 sheet 末尾。
 
+同时会按第一个 sheet 已有的合同编号批量查询并刷新「合同状态」列,
+用于补齐底稿里前序合同缺失/过期的状态。
+
 不改动模板 data/templates/contract_anchor_db/反商业贿赂协议签署情况.xlsx,
 而是以它为底稿,另存为带日期后缀的新文件
     output/anti_bribery_signers_db/反商业贿赂协议签署情况_<YYYYMMDD>.xlsx。
@@ -33,7 +36,11 @@ from etl.tasks import contract_general_db as cg
 # ============================ 文件 / 过滤口径 ============================
 TASK_NAME = 'anti_bribery_signers_db'
 # 底稿(只读):已有的签署情况台账,提供已记录的去重基准与表头结构。
-TEMPLATE_FILE = cg.TEMPLATE_DIR / '反商业贿赂协议签署情况.xlsx'
+TEMPLATE_FILE_CANDIDATES = (
+    cg.TEMPLATE_DIR / '【可查】反商业贿赂协议签署情况.xlsx',
+    cg.TEMPLATE_DIR / '反商业贿赂协议签署情况.xlsx',
+)
+TEMPLATE_FILE = next((path for path in TEMPLATE_FILE_CANDIDATES if path.exists()), TEMPLATE_FILE_CANDIDATES[0])
 # 产出(带日期后缀):底稿内容 + 本次新增,模板本身不改动。
 OUTPUT_DIR = c.OUT_DIR / TASK_NAME
 OUTPUT_FILE = OUTPUT_DIR / f'反商业贿赂协议签署情况_{c.today_suffix()}.xlsx'
@@ -82,6 +89,29 @@ WHERE UPPER(h.htbh) LIKE %s AND h.htmc LIKE %s
 ORDER BY h.htbh, h.id
 """
 
+# 按文档已有合同编号刷新状态。编号有时从表格复制会带空白/换行,用同一规则归一后匹配。
+CONTRACT_NO_KEY_EXPR = (
+    "UPPER(REPLACE(REPLACE(REPLACE(htbh, ' ', ''), CHAR(13), ''), CHAR(10), ''))"
+)
+
+SQL_HTK_STATUS_BY_NO = f"""
+SELECT
+    {CONTRACT_NO_KEY_EXPR} AS `合同编号键`,
+    htzt AS `合同签署状态ID`
+FROM uf_htk
+WHERE {CONTRACT_NO_KEY_EXPR} IN %(contract_no_keys)s
+ORDER BY htbh, id
+"""
+
+SQL_HTSP_STATUS_BY_NO = f"""
+SELECT
+    {CONTRACT_NO_KEY_EXPR} AS `合同编号键`,
+    htzt AS `合同签署状态ID`
+FROM uf_htsp
+WHERE {CONTRACT_NO_KEY_EXPR} IN %(contract_no_keys)s
+ORDER BY htbh, id
+"""
+
 
 # ============================ 小工具 ============================
 def _text(value):
@@ -115,7 +145,48 @@ def _join(parts):
     return '; '.join(result)
 
 
+def _chunks(values, size=500):
+    for index in range(0, len(values), size):
+        yield values[index:index + size]
+
+
 # ============================ 取数 / 解析 ============================
+def _fetch_contract_status_map(contract_numbers):
+    """按合同编号查状态名称。若同编号两表都存在,MCN(uf_htk)优先。"""
+    contract_no_keys = []
+    seen = set()
+    for contract_no in contract_numbers:
+        key = _norm_no(contract_no)
+        if key and key not in seen:
+            seen.add(key)
+            contract_no_keys.append(key)
+    if not contract_no_keys:
+        return {}
+
+    htk_status = c.build_fw_select_option_maps(cg.FW_TABLE, ['htzt']).get('htzt', {})
+    htsp_status = c.build_fw_select_option_maps(cg.FW_TABLE_HTSP, ['htzt']).get('htzt', {})
+    status_by_contract_no = {}
+
+    for batch in _chunks(contract_no_keys):
+        params = {'contract_no_keys': tuple(batch)}
+        htk_df = c.query_db('FW', 'vspn_xtyy', SQL_HTK_STATUS_BY_NO, params)
+        for row in htk_df.to_dict('records'):
+            key = _text(row['合同编号键'])
+            status = htk_status.get(c.format_code(row['合同签署状态ID']), '')
+            if key and status and key not in status_by_contract_no:
+                status_by_contract_no[key] = status
+
+        htsp_df = c.query_db('FW', 'vspn_xtyy', SQL_HTSP_STATUS_BY_NO, params)
+        for row in htsp_df.to_dict('records'):
+            key = _text(row['合同编号键'])
+            status = htsp_status.get(c.format_code(row['合同签署状态ID']), '')
+            if key and status and key not in status_by_contract_no:
+                status_by_contract_no[key] = status
+
+    print(f'[反商业贿赂] 文档已有合同状态命中: {len(status_by_contract_no)} / {len(contract_no_keys)}')
+    return status_by_contract_no
+
+
 def _fetch_anti_bribery_contracts():
     """查两套合同台账,返回带「合同状态」「供应商各字段」的候选行列表。"""
     htk_df = c.query_db('FW', 'vspn_xtyy', SQL_HTK, [CONTRACT_NUMBER_LIKE, CONTRACT_NAME_LIKE])
@@ -203,13 +274,56 @@ def _existing_keys_and_last_row(worksheet, columns):
     return keys, last_row
 
 
+def _existing_contract_numbers(worksheet, columns):
+    """读取第一个 sheet 已有合同编号,用于刷新状态。"""
+    no_col = columns.get(HEADER_CONTRACT_NO)
+    if not no_col:
+        return []
+    contract_numbers = []
+    for row in range(2, worksheet.max_row + 1):
+        contract_no = _text(worksheet.cell(row, no_col).value)
+        if contract_no:
+            contract_numbers.append(contract_no)
+    return contract_numbers
+
+
+def _refresh_existing_contract_statuses(worksheet, columns):
+    """刷新底稿已有行的合同状态,不新增/删除行。"""
+    no_col = columns.get(HEADER_CONTRACT_NO)
+    status_col = columns.get(HEADER_CONTRACT_STATUS)
+    if not no_col or not status_col:
+        print(f'[反商业贿赂] 未找到「{HEADER_CONTRACT_NO}」或「{HEADER_CONTRACT_STATUS}」列,跳过已有状态刷新')
+        return 0, 0, 0
+
+    status_by_contract_no = _fetch_contract_status_map(_existing_contract_numbers(worksheet, columns))
+    updated = unchanged = missing = 0
+    for row in range(2, worksheet.max_row + 1):
+        contract_no = _text(worksheet.cell(row, no_col).value)
+        if not contract_no:
+            continue
+        new_status = status_by_contract_no.get(_norm_no(contract_no), '')
+        if not new_status:
+            missing += 1
+            continue
+        old_status = _text(worksheet.cell(row, status_col).value)
+        if old_status == new_status:
+            unchanged += 1
+            continue
+        worksheet.cell(row, status_col, new_status)
+        updated += 1
+
+    print(f'[反商业贿赂] 已有合同状态刷新: 更新 {updated} 条; 不变 {unchanged} 条; 未查到 {missing} 条')
+    return updated, unchanged, missing
+
+
 def _timestamped_path(path):
     return path.with_name(f'{path.stem}_{datetime.now().strftime("%H%M%S")}{path.suffix}')
 
 
 def append_anti_bribery_signers(template_file=TEMPLATE_FILE, output_file=OUTPUT_FILE):
     """以模板为底稿,把命中的反商业贿赂协议供应商补登到第一个 sheet 末尾,
-    按 (供应商名称, 合同编号) 去重,另存为带日期后缀的新文件;模板本身不改动。"""
+    按 (供应商名称, 合同编号) 去重,并刷新已有行合同状态,
+    另存为带日期后缀的新文件;模板本身不改动。"""
     contracts = _fetch_anti_bribery_contracts()
     print(f'[反商业贿赂] 去重后候选合同(MCN 优先): {len(contracts)} 条')
 
@@ -219,6 +333,8 @@ def append_anti_bribery_signers(template_file=TEMPLATE_FILE, output_file=OUTPUT_
     if HEADER_SUPPLIER_NAME not in columns and HEADER_CONTRACT_NO not in columns:
         raise RuntimeError(
             f'第一个 sheet「{worksheet.title}」未找到「{HEADER_SUPPLIER_NAME}」或「{HEADER_CONTRACT_NO}」列,无法写入')
+
+    _refresh_existing_contract_statuses(worksheet, columns)
 
     existing_keys, last_row = _existing_keys_and_last_row(worksheet, columns)
     next_row = last_row + 1
