@@ -92,6 +92,7 @@ DEFAULT_SIGN_FORM = '纸质签约'
 DEFAULT_SEAL_NUMBER = 2
 DEFAULT_PREPAID = '否'
 DEFAULT_PAYMENT_NATURE = '一般付款'
+DEFAULT_CONTRACT_CREATOR_NAME = '黄劭文'
 
 ATTACHMENT_COOKIE_ENV = 'WEAVER_CONTRACT_ATTACHMENT_COOKIE'
 ATTACHMENT_BASE_URL_ENV = 'WEAVER_CONTRACT_ATTACHMENT_BASE_URL'
@@ -167,10 +168,13 @@ SELECT
     h.modedatacreater AS `合同创建人ID`,
     h.modedatacreater AS `申请人ID`,
     rb.workflowid AS `流程类型ID`,
-    wb.workflowname AS `流程名称`
+    wb.workflowname AS `流程名称`,
+    nb.nodename AS `合同审批状态`
 FROM uf_htk h
 LEFT JOIN workflow_requestbase rb ON rb.requestid = h.htlc
 LEFT JOIN workflow_base wb ON wb.id = rb.workflowid
+LEFT JOIN workflow_nownode nn ON nn.requestid = h.htlc
+LEFT JOIN workflow_nodebase nb ON nb.id = COALESCE(rb.currentnodeid, nn.nownodeid, rb.lastnodeid)
 WHERE (h.htlx <> %(anchor_contract_type_code)s OR h.htlx IS NULL)
   AND h.htzt IN %(migration_status_codes)s
 ORDER BY h.htbh, h.id
@@ -244,10 +248,13 @@ SELECT
     h.modedatacreater AS `合同创建人ID`,
     h.sqr AS `申请人ID`,
     rb.workflowid AS `流程类型ID`,
-    wb.workflowname AS `流程名称`
+    wb.workflowname AS `流程名称`,
+    nb.nodename AS `合同审批状态`
 FROM uf_htsp h
 LEFT JOIN workflow_requestbase rb ON rb.requestid = h.lcqqid
 LEFT JOIN workflow_base wb ON wb.id = rb.workflowid
+LEFT JOIN workflow_nownode nn ON nn.requestid = h.lcqqid
+LEFT JOIN workflow_nodebase nb ON nb.id = COALESCE(rb.currentnodeid, nn.nownodeid, rb.lastnodeid)
 WHERE h.htzt IN %(htsp_status_codes)s
 ORDER BY h.htbh, h.id
 """
@@ -585,6 +592,32 @@ def _classify_attachment_type(doc_row, image_info, doc_info, explicit_type=''):
     return ATTACHMENT_TYPE_DRAFT
 
 
+def _preferred_attachment_type(source):
+    status_text = _text(source.get('合同签署状态'))
+    status_id = c.format_code(source.get('合同签署状态ID'))
+    if '归档' in status_text or status_id == '2':
+        return ATTACHMENT_TYPE_SIGNED
+    return ATTACHMENT_TYPE_EFFECTIVE
+
+
+def _attachment_name_startswith_contract(attachment_name, contract_number):
+    normalized_name = _normalize_field_name(attachment_name).upper()
+    normalized_contract = _normalize_field_name(contract_number).upper()
+    return bool(normalized_contract and normalized_name.startswith(normalized_contract))
+
+
+def _attachment_target_sheet(source, attachment_type, attachment_name):
+    preferred_type = _preferred_attachment_type(source)
+    if attachment_type != preferred_type:
+        return '', f'跳过非目标稿件:{attachment_type or "未分类"},目标:{preferred_type}'
+    contract_number = _text(source.get('合同编号'))
+    if _is_supplement_contract_number(contract_number):
+        return SHEET_OTHER_ATTACHMENT, '补充协议附件统一归其他附件'
+    if _attachment_name_startswith_contract(attachment_name, contract_number):
+        return SHEET_CONTRACT_ATTACHMENT, '目标稿件且文件名以合同编号开头'
+    return SHEET_OTHER_ATTACHMENT, '目标稿件但文件名未以合同编号开头'
+
+
 def _resolve_request_form_tables(request_ids):
     """requestid -> 审批流程表单数据表名(formtable_main_*)。"""
     mapping = {}
@@ -780,6 +813,9 @@ def build_contract_attachment_manifest(source_df):
                 ))
                 attachment_type = _classify_attachment_type(
                     doc_row, image_info, doc_info, docref.get('attachment_type', ''))
+                attachment_sheet, attachment_rule = _attachment_target_sheet(source, attachment_type, attachment_name)
+                if not attachment_sheet:
+                    continue
                 target_dir = download_root / contract_dir / _sanitize_path_part(attachment_type, attachment_type)
                 target_name = _build_target_filename(attachment_name, imagefileid)
                 target_path = target_dir / target_name
@@ -795,6 +831,8 @@ def build_contract_attachment_manifest(source_df):
                     'docid': docid,
                     'imagefileid': imagefileid,
                     'attachment_name': attachment_name,
+                    'attachment_sheet': attachment_sheet,
+                    'attachment_rule': attachment_rule,
                     'imagefiletype': image_info.get('imagefiletype', ''),
                     'filesize': image_info.get('filesize', ''),
                     'target_path': str(target_path),
@@ -928,6 +966,14 @@ def _collect_missing_details(output_df, source_df, required_cols, source_field_m
     total = len(output_df)
     if total == 0 or doc_col not in output_df.columns:
         return sheets
+    source_by_doc = pd.DataFrame()
+    source_doc_col = '合同编号'
+    if source_doc_col in source_df.columns:
+        source_by_doc = (
+            source_df.assign(_doc_key=source_df[source_doc_col].map(_text))
+            .drop_duplicates('_doc_key')
+            .set_index('_doc_key')
+        )
     for column in required_cols:
         if column not in output_df.columns:
             continue
@@ -935,10 +981,13 @@ def _collect_missing_details(output_df, source_df, required_cols, source_field_m
         missing_count = int(blank_mask.sum())
         if not (0 < missing_count < total):
             continue
-        data = {doc_col: output_df.loc[blank_mask, doc_col].astype(str)}
+        missing_docs = output_df.loc[blank_mask, doc_col].map(_text)
+        data = {doc_col: missing_docs}
         source_field = source_field_map.get(column)
-        if source_field and source_field in source_df.columns:
-            data[f'泛微原表-{source_field}'] = source_df.loc[blank_mask, source_field].astype(str)
+        if source_field and source_field in source_df.columns and not source_by_doc.empty:
+            data[f'泛微原表-{source_field}'] = missing_docs.map(
+                lambda value: _text(source_by_doc.at[value, source_field]) if value in source_by_doc.index else ''
+            )
         sheets[f'缺失_{column[:22]}'] = pd.DataFrame(data).drop_duplicates().reset_index(drop=True)
     return sheets
 
@@ -1162,6 +1211,112 @@ def build_feishu_employee_id_map(code_values):
             if code and feishu_id:
                 result[code] = feishu_id
     return result
+
+
+def _employee_status_label(name, code, status_by_number, status_by_name):
+    code = _text(code)
+    name = _text(name)
+    if code and code in status_by_number:
+        return '在职' if status_by_number[code] == 'hired' else '离职'
+    if name and name in status_by_name:
+        return '在职' if status_by_name[name] == 'hired' else '离职'
+    return ''
+
+
+def _build_employee_info_by_name(names, status_by_number, status_by_name):
+    unique_names = []
+    for name in names:
+        for item in c.split_person_names(name):
+            if item and item not in unique_names:
+                unique_names.append(item)
+    if DEFAULT_CONTRACT_CREATOR_NAME not in unique_names:
+        unique_names.append(DEFAULT_CONTRACT_CREATOR_NAME)
+    if not unique_names:
+        return {}
+    employee_code_map = c.build_employee_code_map()
+    name_to_code = {
+        name: employee_code_map.get(c.normalize_name(name), '')
+        for name in unique_names
+    }
+    feishu_id_map = build_feishu_employee_id_map(name_to_code.values())
+    return {
+        name: {
+            'name': name,
+            'code': code,
+            'user_id': feishu_id_map.get(_text(code), ''),
+            'status': _employee_status_label(name, code, status_by_number, status_by_name),
+        }
+        for name, code in name_to_code.items()
+    }
+
+
+def _cleanable_order_infos_for_source(row):
+    order_code = _text(row.get('订单编号'))
+    if order_code:
+        info = c.cleanable_order_info_for_order(order_code)
+        if info:
+            return [info]
+    infos = []
+    seen_orders = set()
+    for project_code in (row.get('项目编号'), row.get('泛微项目编号'), row.get('清洗后项目编号')):
+        for info in c.cleanable_order_infos_for_project(project_code):
+            order = _text(info.get('订单编号'))
+            if order and order not in seen_orders:
+                seen_orders.add(order)
+                infos.append(info)
+    return infos
+
+
+def _order_manager_names_for_source(row):
+    names = []
+    for info in _cleanable_order_infos_for_source(row):
+        for name in info.get('项目经理候选', []):
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def _apply_contract_creator_rules(df, status_by_number, status_by_name):
+    df['原合同创建人'] = df['合同创建人']
+    df['原合同创建人工号'] = df['合同创建人工号']
+    df['原合同创建人user_id'] = df['合同创建人user_id']
+    df['原合同创建人状态'] = df['合同创建人状态']
+    df['订单项目经理候选'] = ''
+    df['合同创建人调整方式'] = '创建人在职/无需调整'
+    left_mask = df['合同创建人状态'].map(_text) == '离职'
+    if not bool(left_mask.any()):
+        return df
+
+    manager_names = []
+    for _, row in df.loc[left_mask].iterrows():
+        manager_names.extend(_order_manager_names_for_source(row))
+    employee_info_by_name = _build_employee_info_by_name(manager_names, status_by_number, status_by_name)
+    default_info = employee_info_by_name.get(DEFAULT_CONTRACT_CREATOR_NAME, {
+        'name': DEFAULT_CONTRACT_CREATOR_NAME,
+        'code': '',
+        'user_id': '',
+        'status': _employee_status_label(DEFAULT_CONTRACT_CREATOR_NAME, '', status_by_number, status_by_name),
+    })
+
+    for index, row in df.loc[left_mask].iterrows():
+        manager_names = _order_manager_names_for_source(row)
+        df.at[index, '订单项目经理候选'] = '、'.join(manager_names)
+        selected = None
+        for manager_name in manager_names:
+            info = employee_info_by_name.get(manager_name)
+            if info and info.get('status') == '在职' and info.get('user_id'):
+                selected = info
+                break
+        if selected:
+            df.at[index, '合同创建人调整方式'] = '原创建人离职,更新为订单项目经理'
+        else:
+            selected = default_info
+            df.at[index, '合同创建人调整方式'] = '原创建人离职,项目经理离职/缺失,更新为黄劭文'
+        df.at[index, '合同创建人'] = selected.get('name', '')
+        df.at[index, '合同创建人工号'] = selected.get('code', '')
+        df.at[index, '合同创建人user_id'] = selected.get('user_id', '')
+        df.at[index, '合同创建人状态'] = selected.get('status', '')
+    return df
 
 
 def build_purchase_request_code_map(values):
@@ -1420,6 +1575,79 @@ def resolve_amounts(row):
     return round(amount, 2), round(in_amount, 2), round(out_amount, 2)
 
 
+def resolve_signed_amounts(row):
+    pay_type = _text(row.get('收支类型'))
+    contract_amount = _number(row.get('合同金额'))
+    in_amount = _number(row.get('合同预计收入'))
+    out_amount = _number(row.get('合同预计支出'))
+    if pay_type == '收入类' and (not in_amount or contract_amount < 0):
+        in_amount = contract_amount
+    if pay_type == '支出类' and (not out_amount or contract_amount < 0):
+        out_amount = contract_amount
+    if pay_type == '既收又支' and not (in_amount or out_amount) and contract_amount:
+        in_amount = contract_amount
+    if pay_type == '收入类':
+        amount = in_amount
+    elif pay_type == '支出类':
+        amount = out_amount
+    elif pay_type == '既收又支':
+        amount = contract_amount or in_amount + out_amount
+    else:
+        amount = 0
+    return round(amount, 2), round(in_amount, 2), round(out_amount, 2)
+
+
+def _main_contract_code_candidates(contract_number):
+    code = _text(contract_number)
+    candidates = []
+    while code:
+        next_code = re.sub(r'-(?:S\d+|N)$', '', code, flags=re.IGNORECASE)
+        if next_code == code:
+            break
+        if next_code and next_code not in candidates:
+            candidates.append(next_code)
+        code = next_code
+    return list(reversed(candidates))
+
+
+def _is_supplement_contract_number(contract_number):
+    return bool(re.search(r'-(?:S\d+|N)$', _text(contract_number), flags=re.IGNORECASE))
+
+
+def _apply_supplement_amount_rollup(df):
+    contract_numbers = {_text(value) for value in df['合同编号']}
+    df['主合同编号'] = ''
+    df['是否补充协议'] = ''
+    df['金额汇总目标合同编号'] = df['合同编号'].map(_text)
+    for index, row in df.iterrows():
+        contract_number = _text(row.get('合同编号'))
+        for main_code in _main_contract_code_candidates(contract_number):
+            if main_code in contract_numbers:
+                df.at[index, '主合同编号'] = main_code
+                df.at[index, '是否补充协议'] = 'Y'
+                df.at[index, '金额汇总目标合同编号'] = main_code
+                break
+
+    payment_sum = {}
+    collection_sum = {}
+    child_count = {}
+    child_codes = {}
+    for _, row in df.iterrows():
+        target = _text(row.get('金额汇总目标合同编号')) or _text(row.get('合同编号'))
+        contract_number = _text(row.get('合同编号'))
+        payment_sum[target] = payment_sum.get(target, 0.0) + _number(row.get('支出总额_签名'))
+        collection_sum[target] = collection_sum.get(target, 0.0) + _number(row.get('收入总额_签名'))
+        if target != contract_number:
+            child_count[target] = child_count.get(target, 0) + 1
+            child_codes.setdefault(target, []).append(contract_number)
+
+    df['付款计划汇总金额'] = df['合同编号'].map(lambda value: round(payment_sum.get(_text(value), 0.0), 2))
+    df['收款计划汇总金额'] = df['合同编号'].map(lambda value: round(collection_sum.get(_text(value), 0.0), 2))
+    df['补充协议数量'] = df['合同编号'].map(lambda value: child_count.get(_text(value), 0))
+    df['补充协议编号'] = df['合同编号'].map(lambda value: '、'.join(child_codes.get(_text(value), [])))
+    return df
+
+
 # ============================ 专项品类映射 ============================
 _SPECIAL_CATEGORY_CACHE = None
 
@@ -1546,6 +1774,7 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
     df['合同签署状态'] = df['合同签署状态ID'].map(lambda value: option_maps.get('htzt', {}).get(c.format_code(value), ''))
     df['变更类型'] = df['变更类型ID'].map(lambda value: option_maps.get('bglx', {}).get(c.format_code(value), ''))
     df['流程名称'] = df['流程名称'].map(c.clean_fw_select_name)
+    df['合同审批状态'] = df.get('合同审批状态', pd.Series('', index=df.index)).map(c.clean_fw_select_name)
     df['合同执行人员'] = df['合同执行人员ID'].map(
         lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
     df['合同执行人员工号'] = df['合同执行人员ID'].map(
@@ -1556,7 +1785,9 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
         lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
     status_by_number, status_by_name = _employment_status_map()
     applicant_status = c.build_applicant_status_map(df['申请人ID'], status_by_number, status_by_name)
+    creator_status = c.build_applicant_status_map(df['合同创建人ID'], status_by_number, status_by_name)
     df['申请人状态'] = df['申请人ID'].map(lambda value: applicant_status.get(c.format_code(value), ''))
+    df['合同创建人状态'] = df['合同创建人ID'].map(lambda value: creator_status.get(c.format_code(value), ''))
     feishu_id_map = _timed('  ├─合同执行人/创建人飞书ID映射(汉得)',
                            lambda: build_feishu_employee_id_map(
                                pd.concat([df['合同执行人员工号'], df['合同创建人工号']], ignore_index=True)))
@@ -1595,6 +1826,7 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
     df['清洗后项目编号'] = df['项目编号']
     df['清洗后项目名称'] = df['项目名称']
     df['订单映射来源'] = df['项目编号'].map(lambda value: c.project_order_mapping_value(value, '映射来源'))
+    df = _apply_contract_creator_rules(df, status_by_number, status_by_name)
     print(f'[计时] ✓   项目/订单映射(逐行apply): {time.perf_counter() - _t0:.1f}s', flush=True)
 
     def supplier_names(value):
@@ -1614,6 +1846,10 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
     df['合同总额_解析'] = amount_tuples.map(lambda item: item[0])
     df['收入总额_解析'] = amount_tuples.map(lambda item: item[1])
     df['支出总额_解析'] = amount_tuples.map(lambda item: item[2])
+    signed_amount_tuples = df.apply(resolve_signed_amounts, axis=1)
+    df['合同总额_签名'] = signed_amount_tuples.map(lambda item: item[0])
+    df['收入总额_签名'] = signed_amount_tuples.map(lambda item: item[1])
+    df['支出总额_签名'] = signed_amount_tuples.map(lambda item: item[2])
     print(f'[计时] ✓   分类/金额(逐行apply): {time.perf_counter() - _t0:.1f}s', flush=True)
 
     def relation_codes(value):
@@ -1640,6 +1876,24 @@ def _merge_attrs(target_df, source_dfs):
             merged.update(df.attrs.get(key, {}))
         target_df.attrs[key] = merged
     return target_df
+
+
+def filter_cleanable_contract_scope(source_df):
+    _, _, mapping_file = c.load_cleanable_order_info()
+    if mapping_file is None:
+        source_df.attrs['clean_scope_excluded'] = pd.DataFrame()
+        return source_df
+    keep_mask = source_df.apply(lambda row: bool(_cleanable_order_infos_for_source(row)), axis=1)
+    excluded = source_df.loc[~keep_mask].copy()
+    filtered = source_df.loc[keep_mask].copy()
+    filtered.attrs.update(source_df.attrs)
+    filtered.attrs['clean_scope_excluded'] = excluded
+    print(
+        '[合同迁移-一般流程] 清洗范围筛选:',
+        f'保留 {len(filtered)}/{len(source_df)} 条;',
+        f'排除 {len(excluded)} 条(无Y标记订单)',
+    )
+    return filtered
 
 
 def read_source():
@@ -1674,6 +1928,8 @@ def read_source():
 
     merged = pd.concat([resolved_mcn, resolved_htsp], ignore_index=True)
     _merge_attrs(merged, [resolved_mcn, resolved_htsp])
+    merged = filter_cleanable_contract_scope(merged)
+    merged = _apply_supplement_amount_rollup(merged)
     # 赛事收支计划明细(uf_htsp_dt4): 供付款/收款计划按 dt4 真实多期展开。
     plan_map = (
         _timed('read_source/赛事收支计划dt4', lambda: load_htsp_plan_detail_map(resolved_htsp['ID']))
@@ -1697,6 +1953,7 @@ def build_main_output(source_df, headers):
         contract_name = _text(source['合同标题'])
         _set(row, 'contract_number（合同编码）', _text(source['合同编号']))
         _set(row, 'contract_name（合同名称）', contract_name)
+        _set(row, '合同审批状态', _text(source.get('合同审批状态')))
         _set(row, 'contractCategory(智书框架合同类型)',
              '其他-保密协议' if '保密协议' in contract_name else source['合同分类'])
         _set(row, 'pay_type_code（收支类型）', source['收支类型'])
@@ -1716,7 +1973,7 @@ def build_main_output(source_df, headers):
         _set(row, '合同执行人', _text(source['合同执行人员']))
         _set(row, '合同创建人', _text(source['合同创建人']))
         _set(row, '合同创建人user_id', _text(source['合同创建人user_id']))
-        _set(row, '申请人状态', _text(source.get('申请人状态')))
+        _set(row, '合同创建人状态', _text(source.get('合同创建人状态')))
         _set(row, 'custom_15_78cf503c57194e4fb8ad03ded1c4ad60（打印模式）', DEFAULT_PRINT_MODE)
         _set(row, 'custom_10_9a2a0e99771346c98bfb6cfb893e1bee（签署日期）', c.format_date(source['合同签订日期']))
         _set(row, 'custom_15_de8944334b104d52b28d9472ab0584ef（专项品类）', _text(source.get('专项品类')))
@@ -1980,6 +2237,8 @@ def build_payment_plan_output(source_df, headers):
         rows.append(row)
 
     for source in source_df.to_dict('records'):
+        if _text(source.get('是否补充协议')) == 'Y' and _text(source.get('主合同编号')):
+            continue
         # 押金/保证金: 合同若有押金或保证金, 额外补一行付款计划, 金额为两者之和。
         deposit_amount = (_round_amount(source.get('押金')) or 0) + (_round_amount(source.get('保证金')) or 0)
         if deposit_amount:
@@ -1998,6 +2257,16 @@ def build_payment_plan_output(source_df, headers):
                     _first_non_blank(detail['date'], source['合同有效期截止时间'], source['合同签订日期']),
                     _first_non_blank(detail['desc'], _text(source['合同标题'])),
                     _plan_row_id(source, 'P', index),
+                )
+            continue
+        if _number(source.get('补充协议数量')):
+            amount = _round_amount(source.get('付款计划汇总金额'))
+            if amount:
+                add_row(
+                    source, amount,
+                    _first_non_blank(source['合同有效期截止时间'], source['合同签订日期']),
+                    _first_non_blank(f"主合同及补充协议汇总:{_text(source.get('补充协议编号'))}", _text(source['合同标题'])),
+                    _plan_row_id(source, 'P', 'SUM'),
                 )
             continue
         # 兜底(无明细的赛事 / MCN): 按支出总额合成单行。
@@ -2032,6 +2301,8 @@ def build_collection_plan_output(source_df, headers):
         rows.append(row)
 
     for source in source_df.to_dict('records'):
+        if _text(source.get('是否补充协议')) == 'Y' and _text(source.get('主合同编号')):
+            continue
         details = _htsp_plan_details(source, plan_map, PLAN_TYPE_COLLECTION)
         if details:
             for index, detail in enumerate(details, 1):
@@ -2040,6 +2311,16 @@ def build_collection_plan_output(source_df, headers):
                     _first_non_blank(detail['date'], source['合同有效期截止时间'], source['合同签订日期']),
                     _first_non_blank(detail['desc'], _text(source['合同标题'])),
                     _plan_row_id(source, 'C', index),
+                )
+            continue
+        if _number(source.get('补充协议数量')):
+            amount = _round_amount(source.get('收款计划汇总金额'))
+            if amount:
+                add_row(
+                    source, amount,
+                    _first_non_blank(source['合同有效期截止时间'], source['合同签订日期']),
+                    _first_non_blank(f"主合同及补充协议汇总:{_text(source.get('补充协议编号'))}", _text(source['合同标题'])),
+                    _plan_row_id(source, 'C', 'SUM'),
                 )
             continue
         amount = _round_amount(source['收入总额_解析'])
@@ -2054,23 +2335,41 @@ def build_collection_plan_output(source_df, headers):
     return pd.DataFrame(rows, columns=headers)
 
 
-def build_contract_attachment_output(source_df, headers):
-    manifest_df, missing_df = build_contract_attachment_manifest(source_df)
-    # 导入侧是「按合同的扁平附件名单」: 修订稿/签署版常是同一份文件(同名),按
-    # (合同编码, 附件名) 去重, 避免同一文件重复计入。下载侧仍按稿件类型分文件夹保留。
+def _build_attachment_sheet_output(manifest_df, headers, target_sheet, field_name):
     output_rows = []
     seen_names = set()
     for meta in manifest_df.to_dict('records'):
+        if _text(meta.get('attachment_sheet')) != target_sheet:
+            continue
         contract_number = _text(meta.get('contract_number（合同编码）'))
         attachment_name = _text(meta.get('attachment_name'))
-        dedupe_key = (contract_number, attachment_name)
+        dedupe_key = (target_sheet, contract_number, attachment_name)
         if dedupe_key in seen_names:
             continue
         seen_names.add(dedupe_key)
         row = _new_row(headers)
         _set(row, 'contract_number（合同编码）', contract_number)
-        _set(row, 'contract_files.contract_causes（合同附件）', attachment_name)
+        _set(row, field_name, attachment_name)
         output_rows.append(row)
+    return pd.DataFrame(output_rows, columns=headers)
+
+
+def build_contract_attachment_output(source_df, contract_headers, other_headers):
+    manifest_df, missing_df = build_contract_attachment_manifest(source_df)
+    # 导入侧是「按合同的扁平附件名单」: 同一稿件可能重复出现,按
+    # (目标sheet, 合同编码, 附件名) 去重。下载侧仍按稿件类型分文件夹保留。
+    contract_output_df = _build_attachment_sheet_output(
+        manifest_df,
+        contract_headers,
+        SHEET_CONTRACT_ATTACHMENT,
+        'contract_files.contract_causes（合同附件）',
+    )
+    other_output_df = _build_attachment_sheet_output(
+        manifest_df,
+        other_headers,
+        SHEET_OTHER_ATTACHMENT,
+        'contract_files.contract_attachments（其他附件）',
+    )
     if len(manifest_df) > 0:
         manifest_df = manifest_df.copy()
         manifest_df['status'] = 'listed_only'
@@ -2078,7 +2377,8 @@ def build_contract_attachment_output(source_df, headers):
         print(f'[合同迁移-一般流程] 合同附件名称清单行数: {len(manifest_df)}; 未执行下载')
 
     return (
-        pd.DataFrame(output_rows, columns=headers),
+        contract_output_df,
+        other_output_df,
         manifest_df,
         missing_df,
     )
@@ -2162,6 +2462,44 @@ def build_order_audit_df(source_df):
     ])
 
 
+def build_clean_scope_excluded_df(source_df):
+    excluded = source_df.attrs.get('clean_scope_excluded')
+    if excluded is None or excluded.empty:
+        return pd.DataFrame(columns=[
+            '数据来源', '合同编号', '合同标题', '泛微项目编号', '清洗后项目编号', '订单编号', '排除原因',
+        ])
+    result = _audit_df(excluded, [
+        '数据来源', '合同编号', '合同标题', '泛微项目编号', '清洗后项目编号', '订单编号', '订单名称',
+    ])
+    result['排除原因'] = f'{c.PROJECT_ORDER_MAPPING_XLSX_NAME} 未找到标注Y的对应订单'
+    return result
+
+
+def build_supplement_amount_backtest_df(source_df):
+    backtest_codes = ['H-DF2026060027-S01', 'H-DF2026050137-S01']
+    rows = []
+    by_contract = {
+        _text(row.get('合同编号')): row
+        for row in source_df.to_dict('records')
+    }
+    for child_code in backtest_codes:
+        child = by_contract.get(child_code, {})
+        main_code = _text(child.get('主合同编号')) if child else ''
+        main = by_contract.get(main_code, {})
+        rows.append({
+            '回测补充协议编号': child_code,
+            '补充协议是否在本次范围': 'Y' if child else 'N',
+            '主合同编号': main_code,
+            '主合同是否在本次范围': 'Y' if main else 'N',
+            '主合同原支出金额(签名)': _number(main.get('支出总额_签名')) if main else '',
+            '补充协议支出金额(签名)': _number(child.get('支出总额_签名')) if child else '',
+            '主合同付款计划汇总金额': _number(main.get('付款计划汇总金额')) if main else '',
+            '主合同补充协议数量': _number(main.get('补充协议数量')) if main else '',
+            '主合同补充协议编号': _text(main.get('补充协议编号')) if main else '',
+        })
+    return pd.DataFrame(rows)
+
+
 def run():
     headers_by_sheet = _template_headers()
     required_by_sheet, remarks_by_sheet = _read_general_required_rules(headers_by_sheet)
@@ -2186,9 +2524,19 @@ def run():
         'build 付款计划', lambda: build_payment_plan_output(source_df, headers_by_sheet[SHEET_PAYMENT_PLAN]))
     collection_plan_output_df = _timed(
         'build 收款计划', lambda: build_collection_plan_output(source_df, headers_by_sheet[SHEET_COLLECTION_PLAN]))
-    contract_attachment_output_df, contract_attachment_meta_df, contract_attachment_missing_df = _timed(
-        'build 合同附件(含清单)', lambda: build_contract_attachment_output(source_df, headers_by_sheet[SHEET_CONTRACT_ATTACHMENT]))
-    other_attachment_output_df = build_attachment_output(headers_by_sheet[SHEET_OTHER_ATTACHMENT])
+    (
+        contract_attachment_output_df,
+        other_attachment_output_df,
+        contract_attachment_meta_df,
+        contract_attachment_missing_df,
+    ) = _timed(
+        'build 合同附件/其他附件(含清单)',
+        lambda: build_contract_attachment_output(
+            source_df,
+            headers_by_sheet[SHEET_CONTRACT_ATTACHMENT],
+            headers_by_sheet[SHEET_OTHER_ATTACHMENT],
+        ),
+    )
 
     print('[合同迁移-一般流程] 字段模板行数:', len(main_output_df))
     print('[合同迁移-一般流程] 关联合同行数:', len(relation_output_df))
@@ -2199,6 +2547,7 @@ def run():
     print('[合同迁移-一般流程] 付款计划行数:', len(payment_plan_output_df))
     print('[合同迁移-一般流程] 收款计划行数:', len(collection_plan_output_df))
     print('[合同迁移-一般流程] 合同附件行数:', len(contract_attachment_output_df))
+    print('[合同迁移-一般流程] 其他附件行数:', len(other_attachment_output_df))
 
     print('[计时] === 阶段3: 写出 Excel ===', flush=True)
     cat_audit = _timed('build 合同分类核对', lambda: build_category_audit_df(source_df))
@@ -2280,6 +2629,8 @@ def run():
         '关联合同编号_未匹配': collect_missing_relation(relation_source_df),
         '合同附件下载清单': contract_attachment_meta_df,
         '合同附件DOCID_缺失映射': contract_attachment_missing_df,
+        '清洗范围_无Y订单排除': build_clean_scope_excluded_df(source_df),
+        '补充协议金额回测': build_supplement_amount_backtest_df(source_df),
     }
     exception_sheets.update({
         f'字段模板_{name}': df

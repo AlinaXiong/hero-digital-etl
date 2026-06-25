@@ -110,6 +110,16 @@
     "handTaxpayerName": "Company Falcon Sport"
   },
   {
+    "供应商泛微Id": "1724",
+    "供应商名称": "广州虎牙信息科技有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "881",
+    "handVendorCode": "V-C-CN-OT-OTH-0150",
+    "handVendorName": "广州虎牙信息科技有限公司",
+    "handTaxpayerName": "广州虎牙信息科技有限公司"
+  },
+  {
     "供应商泛微Id": "1851",
     "供应商名称": "海南新竞界网络服务有限公司",
     "泛微状态": "1",

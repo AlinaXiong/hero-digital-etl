@@ -72,6 +72,7 @@ DEFAULT_FIRST_SEAL_PARTY = '我方'
 DEFAULT_SIGN_FORM = '纸质签约-不限制我方/对方先签约'
 DEFAULT_SEAL_NUMBER = 2
 DEFAULT_PAYBACK_PERIOD_MONTHS = 0
+DEFAULT_CONTRACT_CREATOR_NAME = '黄劭文'
 
 
 # ============================ 泛微源 SQL ============================
@@ -110,10 +111,13 @@ SELECT
     h.modedatacreater AS `合同创建人ID`,
     h.modedatacreater AS `申请人ID`,
     rb.workflowid AS `流程类型ID`,
-    wb.workflowname AS `流程名称`
+    wb.workflowname AS `流程名称`,
+    nb.nodename AS `合同审批状态`
 FROM uf_htk h
 LEFT JOIN workflow_requestbase rb ON rb.requestid = h.htlc
 LEFT JOIN workflow_base wb ON wb.id = rb.workflowid
+LEFT JOIN workflow_nownode nn ON nn.requestid = h.htlc
+LEFT JOIN workflow_nodebase nb ON nb.id = COALESCE(rb.currentnodeid, nn.nownodeid, rb.lastnodeid)
 WHERE h.htlx = %(anchor_contract_type_code)s
   AND h.htzt IN %(migration_status_codes)s
 ORDER BY h.htbh, h.id
@@ -456,6 +460,112 @@ def build_feishu_employee_id_map(code_values):
     return result
 
 
+def _employee_status_label(name, code, status_by_number, status_by_name):
+    code = _text(code)
+    name = _text(name)
+    if code and code in status_by_number:
+        return '在职' if status_by_number[code] == 'hired' else '离职'
+    if name and name in status_by_name:
+        return '在职' if status_by_name[name] == 'hired' else '离职'
+    return ''
+
+
+def _build_employee_info_by_name(names, status_by_number, status_by_name):
+    unique_names = []
+    for name in names:
+        for item in c.split_person_names(name):
+            if item and item not in unique_names:
+                unique_names.append(item)
+    if DEFAULT_CONTRACT_CREATOR_NAME not in unique_names:
+        unique_names.append(DEFAULT_CONTRACT_CREATOR_NAME)
+    if not unique_names:
+        return {}
+    employee_code_map = c.build_employee_code_map()
+    name_to_code = {
+        name: employee_code_map.get(c.normalize_name(name), '')
+        for name in unique_names
+    }
+    feishu_id_map = build_feishu_employee_id_map(name_to_code.values())
+    return {
+        name: {
+            'name': name,
+            'code': code,
+            'user_id': feishu_id_map.get(_text(code), ''),
+            'status': _employee_status_label(name, code, status_by_number, status_by_name),
+        }
+        for name, code in name_to_code.items()
+    }
+
+
+def _cleanable_order_infos_for_source(row):
+    order_code = _text(row.get('订单编号'))
+    if order_code:
+        info = c.cleanable_order_info_for_order(order_code)
+        if info:
+            return [info]
+    infos = []
+    seen_orders = set()
+    for project_code in (row.get('合同所属项目编号'), row.get('合同所属项目编号ID')):
+        for info in c.cleanable_order_infos_for_project(project_code):
+            order = _text(info.get('订单编号'))
+            if order and order not in seen_orders:
+                seen_orders.add(order)
+                infos.append(info)
+    return infos
+
+
+def _order_manager_names_for_source(row):
+    names = []
+    for info in _cleanable_order_infos_for_source(row):
+        for name in info.get('项目经理候选', []):
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def _apply_contract_creator_rules(df, status_by_number, status_by_name):
+    df['原合同创建人'] = df['合同创建人']
+    df['原合同创建人工号'] = df['合同创建人工号']
+    df['原合同创建人user_id'] = df['合同创建人user_id']
+    df['原合同创建人状态'] = df['合同创建人状态']
+    df['订单项目经理候选'] = ''
+    df['合同创建人调整方式'] = '创建人在职/无需调整'
+    left_mask = df['合同创建人状态'].map(_text) == '离职'
+    if not bool(left_mask.any()):
+        return df
+
+    manager_names = []
+    for _, row in df.loc[left_mask].iterrows():
+        manager_names.extend(_order_manager_names_for_source(row))
+    employee_info_by_name = _build_employee_info_by_name(manager_names, status_by_number, status_by_name)
+    default_info = employee_info_by_name.get(DEFAULT_CONTRACT_CREATOR_NAME, {
+        'name': DEFAULT_CONTRACT_CREATOR_NAME,
+        'code': '',
+        'user_id': '',
+        'status': _employee_status_label(DEFAULT_CONTRACT_CREATOR_NAME, '', status_by_number, status_by_name),
+    })
+
+    for index, row in df.loc[left_mask].iterrows():
+        manager_names = _order_manager_names_for_source(row)
+        df.at[index, '订单项目经理候选'] = '、'.join(manager_names)
+        selected = None
+        for manager_name in manager_names:
+            info = employee_info_by_name.get(manager_name)
+            if info and info.get('status') == '在职' and info.get('user_id'):
+                selected = info
+                break
+        if selected:
+            df.at[index, '合同创建人调整方式'] = '原创建人离职,更新为订单项目经理'
+        else:
+            selected = default_info
+            df.at[index, '合同创建人调整方式'] = '原创建人离职,项目经理离职/缺失,更新为黄劭文'
+        df.at[index, '合同创建人'] = selected.get('name', '')
+        df.at[index, '合同创建人工号'] = selected.get('code', '')
+        df.at[index, '合同创建人user_id'] = selected.get('user_id', '')
+        df.at[index, '合同创建人状态'] = selected.get('status', '')
+    return df
+
+
 _EMPLOYMENT_STATUS_CACHE = None
 
 
@@ -720,6 +830,14 @@ def _collect_missing_details(output_df, source_df, required_cols, source_field_m
     total = len(output_df)
     if total == 0 or doc_col not in output_df.columns:
         return sheets
+    source_by_doc = pd.DataFrame()
+    source_doc_col = '合同编号'
+    if source_doc_col in source_df.columns:
+        source_by_doc = (
+            source_df.assign(_doc_key=source_df[source_doc_col].map(_text))
+            .drop_duplicates('_doc_key')
+            .set_index('_doc_key')
+        )
     for column in required_cols:
         if column not in output_df.columns:
             continue
@@ -727,10 +845,13 @@ def _collect_missing_details(output_df, source_df, required_cols, source_field_m
         missing_count = int(blank_mask.sum())
         if not (0 < missing_count < total):
             continue
-        data = {doc_col: output_df.loc[blank_mask, doc_col].astype(str)}
+        missing_docs = output_df.loc[blank_mask, doc_col].map(_text)
+        data = {doc_col: missing_docs}
         source_field = source_field_map.get(column)
-        if source_field and source_field in source_df.columns:
-            data[f'泛微原表-{source_field}'] = source_df.loc[blank_mask, source_field].astype(str)
+        if source_field and source_field in source_df.columns and not source_by_doc.empty:
+            data[f'泛微原表-{source_field}'] = missing_docs.map(
+                lambda value: _text(source_by_doc.at[value, source_field]) if value in source_by_doc.index else ''
+            )
         sheets[f'缺失_{column[:22]}'] = pd.DataFrame(data).drop_duplicates().reset_index(drop=True)
     return sheets
 
@@ -1514,6 +1635,7 @@ def resolve_source_values(source_df):
     df['所属平台'] = df['合同主表所属平台']
     df['变更类型'] = df['变更类型ID'].map(lambda value: option_maps['bglx'].get(c.format_code(value), ''))
     df['流程名称'] = df['流程名称'].map(c.clean_fw_select_name)
+    df['合同审批状态'] = df.get('合同审批状态', pd.Series('', index=df.index)).map(c.clean_fw_select_name)
     cleaned_project_info = [
         choose_cleaned_project_info(project_id, project_name, cleaned_project_candidates)
         for project_id, project_name in zip(df['合同所属项目编号ID'], df['合同所属项目'])
@@ -1541,11 +1663,14 @@ def resolve_source_values(source_df):
         lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
     status_by_number, status_by_name = _employment_status_map()
     applicant_status = c.build_applicant_status_map(df['申请人ID'], status_by_number, status_by_name)
+    creator_status = c.build_applicant_status_map(df['合同创建人ID'], status_by_number, status_by_name)
     df['申请人状态'] = df['申请人ID'].map(lambda value: applicant_status.get(c.format_code(value), ''))
+    df['合同创建人状态'] = df['合同创建人ID'].map(lambda value: creator_status.get(c.format_code(value), ''))
     feishu_id_map = build_feishu_employee_id_map(
         pd.concat([df['合同执行人员工号'], df['合同创建人工号']], ignore_index=True))
     df['合同执行人飞书ID'] = df['合同执行人员工号'].map(lambda code: feishu_id_map.get(_text(code), ''))
     df['合同创建人user_id'] = df['合同创建人工号'].map(lambda code: feishu_id_map.get(_text(code), ''))
+    df = _apply_contract_creator_rules(df, status_by_number, status_by_name)
     df['合同一级类型判定'] = df.apply(
         lambda row: _contract_type_label(row['合同类型'], row['合同二级类型']),
         axis=1,
@@ -1661,6 +1786,7 @@ def build_main_output(source_df, headers):
 
         _set(row, 'contract_number（合同编码）', _text(source['合同编号']))
         _set(row, 'contract_name（合同名称）', _text(source['合同标题']))
+        _set(row, '合同审批状态', _text(source.get('合同审批状态')))
         _set(row, '合同状态', resolve_contract_status_label(source['合同签署状态ID']))
         _set(row, '订单编号', '')  # 暂留空,待项目/订单映射口径确认后再回填
         _set(row, 'contractCategory(智书框架合同类型)', source['合同分类'])
@@ -1683,7 +1809,7 @@ def build_main_output(source_df, headers):
              _text(source['合同执行人飞书ID']))
         _set(row, '合同创建人', _text(source['合同创建人']))
         _set(row, '合同创建人user_id', _text(source['合同创建人user_id']))
-        _set(row, '申请人状态', _text(source.get('申请人状态')))
+        _set(row, '合同创建人状态', _text(source.get('合同创建人状态')))
         _set(row, 'custom_1024_61820798c0f348658d8daa64f8b2aef9（主播卡片）',
              source['主播卡片导入ID'])
         _set(row, 'custom_1_ab6f99ee02e549469ec5b2d4a5a98452（主播姓名）',
