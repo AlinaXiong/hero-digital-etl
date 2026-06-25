@@ -35,6 +35,7 @@ DATE_SUFFIX = c.today_suffix()
 
 TEMPLATE_FILE = TEMPLATE_DIR / '智书合同字段-主播流程.xlsx'
 RULE_CSV = c.RULES_DIR / '业财项目_数据映射规则 - 合同数据映射规则-for法务.csv'
+LEGAL_RECEIVE_CSV = TEMPLATE_DIR / '待接收主播合同流程（2025-2026年度合同）.csv'
 OUTPUT_FILE = OUTPUT_DIR / f'智书合同字段_主播流程_{DATE_SUFFIX}.xlsx'
 EXCEPTION_FILE = OUTPUT_DIR / f'未匹配清单_主播流程_{DATE_SUFFIX}.xlsx'
 MANIFEST_FILE = OUTPUT_DIR / f'主播流程合同附件下载清单_{DATE_SUFFIX}.xlsx'
@@ -437,6 +438,12 @@ def _new_row(headers):
 
 _HEADER_LOOKUP_CACHE = {}
 _CLEANED_PROJECT_CANDIDATES_CACHE = None
+_LEGAL_RECEIVE_OVERRIDES_CACHE = None
+_LEGAL_RECEIVER_EMPLOYEE_CACHE = None
+
+LEGAL_RECEIVE_CONTRACT_COL = 'contract_number（合同编码）'
+LEGAL_RECEIVE_PLATFORM_COL = '修改后平台'
+LEGAL_RECEIVE_RECEIVER_COL = '合同流程接收人'
 
 
 def _set(row, field_name, value):
@@ -465,6 +472,73 @@ def _chunked(items, size=5000):
             batch = []
     if batch:
         yield batch
+
+
+def _contract_number_key(value):
+    return re.sub(r'\s+', '', _text(value)).upper()
+
+
+def _csv_column(df, expected):
+    if expected in df.columns:
+        return expected
+    expected_key = _normalize_field_name(expected)
+    lookup = {
+        _normalize_field_name(column): column
+        for column in df.columns
+    }
+    return lookup.get(expected_key, '')
+
+
+def _read_csv_with_fallback(path):
+    last_error = None
+    for encoding in ('utf-8-sig', 'utf-8', 'gb18030'):
+        try:
+            return pd.read_csv(path, dtype=object, keep_default_na=False, encoding=encoding)
+        except UnicodeDecodeError as error:
+            last_error = error
+    if last_error:
+        raise last_error
+    return pd.read_csv(path, dtype=object, keep_default_na=False)
+
+
+def _load_legal_receive_overrides():
+    """读取法务标注的待接收主播合同流程覆盖项,仅供本任务内覆盖创建人/平台。"""
+    global _LEGAL_RECEIVE_OVERRIDES_CACHE
+    if _LEGAL_RECEIVE_OVERRIDES_CACHE is not None:
+        return _LEGAL_RECEIVE_OVERRIDES_CACHE
+    if not LEGAL_RECEIVE_CSV.exists():
+        print(f'[合同迁移-主播流程] 法务待接收CSV不存在,跳过覆盖: {LEGAL_RECEIVE_CSV}')
+        _LEGAL_RECEIVE_OVERRIDES_CACHE = {}
+        return _LEGAL_RECEIVE_OVERRIDES_CACHE
+
+    df = _read_csv_with_fallback(LEGAL_RECEIVE_CSV)
+    contract_col = _csv_column(df, LEGAL_RECEIVE_CONTRACT_COL)
+    platform_col = _csv_column(df, LEGAL_RECEIVE_PLATFORM_COL)
+    receiver_col = _csv_column(df, LEGAL_RECEIVE_RECEIVER_COL)
+    if not contract_col:
+        print(f'[合同迁移-主播流程] 法务待接收CSV缺少合同编码列,跳过覆盖: {LEGAL_RECEIVE_CSV}')
+        _LEGAL_RECEIVE_OVERRIDES_CACHE = {}
+        return _LEGAL_RECEIVE_OVERRIDES_CACHE
+
+    result = {}
+    for _, row in df.iterrows():
+        contract_key = _contract_number_key(row.get(contract_col))
+        if not contract_key:
+            continue
+        item = result.setdefault(contract_key, {'receiver': '', 'platform': ''})
+        receiver = _text(row.get(receiver_col)) if receiver_col else ''
+        platform = _text(row.get(platform_col)) if platform_col else ''
+        if receiver and not item['receiver']:
+            item['receiver'] = receiver
+        if platform and not item['platform']:
+            item['platform'] = platform
+    _LEGAL_RECEIVE_OVERRIDES_CACHE = {
+        key: value
+        for key, value in result.items()
+        if value.get('receiver') or value.get('platform')
+    }
+    print(f'[合同迁移-主播流程] 法务待接收CSV覆盖项: {_LEGAL_RECEIVE_OVERRIDES_CACHE and len(_LEGAL_RECEIVE_OVERRIDES_CACHE) or 0} 条')
+    return _LEGAL_RECEIVE_OVERRIDES_CACHE
 
 
 def build_feishu_employee_id_map(code_values):
@@ -530,6 +604,129 @@ def _build_employee_info_by_name(names, status_by_number, status_by_name):
     }
 
 
+def _label_employee_status(status_enum):
+    return '在职' if status_enum == 'hired' else ('离职' if status_enum else '')
+
+
+def _first_person_name(value):
+    names = c.split_person_names(value)
+    return names[0] if names else _text(value)
+
+
+def _employee_user_id_from_feishu_item(item):
+    return _text(item.get('user_id'))
+
+
+def _feishu_names_from_item(item):
+    person = item.get('person_info') or {}
+    names = set()
+    legal = _text(person.get('legal_name'))
+    if legal:
+        names.add(legal)
+    for name in person.get('name_list') or []:
+        local = _text(name.get('display_name_local_script'))
+        if local:
+            names.add(local)
+    return names
+
+
+def _build_legal_receiver_employee_info(names):
+    """法务CSV接收人专用: 同名时只选飞书在职员工,不复用普通姓名唯一匹配规则。"""
+    global _LEGAL_RECEIVER_EMPLOYEE_CACHE
+    unique_names = c.clean_text_values(_first_person_name(name) for name in names if _first_person_name(name))
+    if not unique_names:
+        return {}
+    if _LEGAL_RECEIVER_EMPLOYEE_CACHE is None:
+        _LEGAL_RECEIVER_EMPLOYEE_CACHE = {}
+    missing_names = [name for name in unique_names if name not in _LEGAL_RECEIVER_EMPLOYEE_CACHE]
+    if not missing_names:
+        return {
+            name: _LEGAL_RECEIVER_EMPLOYEE_CACHE.get(name, {})
+            for name in unique_names
+        }
+
+    missing_by_key = {c.normalize_name(name): name for name in missing_names}
+    grouped = {name: [] for name in missing_names}
+    try:
+        employees = feishu.fetch_all_employees(
+            fields=[
+                'employee_number',
+                'employment_status',
+                'person_info.legal_name',
+                'person_info.name_list',
+            ],
+            user_id_type='user_id',
+        )
+    except Exception as error:
+        print(f'[合同迁移-主播流程] 法务CSV接收人飞书员工查询失败,保留原创建人规则: {error}')
+        for name in missing_names:
+            _LEGAL_RECEIVER_EMPLOYEE_CACHE[name] = {
+                'name': name,
+                'code': '',
+                'user_id': '',
+                'status': '',
+                'match_status': '飞书查询失败',
+            }
+        return {
+            name: _LEGAL_RECEIVER_EMPLOYEE_CACHE.get(name, {})
+            for name in unique_names
+        }
+
+    for item in employees:
+        item_keys = {c.normalize_name(name) for name in _feishu_names_from_item(item)}
+        matched_keys = item_keys.intersection(missing_by_key)
+        if not matched_keys:
+            continue
+        employee_number = _text(item.get('employee_number'))
+        status_enum = _text((item.get('employment_status') or {}).get('enum_name'))
+        record = {
+            'code': employee_number,
+            'user_id': _employee_user_id_from_feishu_item(item),
+            'status_enum': status_enum,
+            'status': _label_employee_status(status_enum),
+        }
+        for key in matched_keys:
+            grouped[missing_by_key[key]].append(record.copy())
+
+    code_to_user_id = build_feishu_employee_id_map(
+        record.get('code')
+        for records in grouped.values()
+        for record in records
+    )
+    for name, records in grouped.items():
+        for record in records:
+            if record.get('code') and code_to_user_id.get(record['code']):
+                record['user_id'] = code_to_user_id.get(record['code'], '')
+        hired_records = [record for record in records if record.get('status_enum') == 'hired']
+        selected = next((record for record in hired_records if record.get('user_id')), None)
+        selected = selected or (hired_records[0] if hired_records else None)
+        if selected:
+            _LEGAL_RECEIVER_EMPLOYEE_CACHE[name] = {
+                'name': name,
+                'code': selected.get('code', ''),
+                'user_id': selected.get('user_id', ''),
+                'status': selected.get('status', ''),
+                'match_status': '飞书在职员工',
+            }
+        else:
+            _LEGAL_RECEIVER_EMPLOYEE_CACHE[name] = {
+                'name': name,
+                'code': '',
+                'user_id': '',
+                'status': '',
+                'match_status': '未找到飞书在职员工',
+            }
+
+    return {
+        name: _LEGAL_RECEIVER_EMPLOYEE_CACHE.get(name, {})
+        for name in unique_names
+    }
+
+
+def _legal_override_for_contract(contract_number, field):
+    return _load_legal_receive_overrides().get(_contract_number_key(contract_number), {}).get(field, '')
+
+
 def _apply_contract_creator_rules(df, status_by_number, status_by_name):
     df['原合同申请人'] = df['申请人']
     df['原合同申请人工号'] = df['申请人工号']
@@ -561,35 +758,54 @@ def _apply_contract_creator_rules(df, status_by_number, status_by_name):
     )
     df['合同创建人调整方式'] = '申请人/创建人在职或未确认离职,无需调整'
     left_mask = df['合同创建人状态'].map(_text) == '离职'
-    if not bool(left_mask.any()):
-        return df
+    if bool(left_mask.any()):
+        employee_info_by_name = _build_employee_info_by_name(
+            [DEFAULT_CONTRACT_CREATOR_NAME],
+            status_by_number,
+            status_by_name,
+        )
+        default_info = employee_info_by_name.get(DEFAULT_CONTRACT_CREATOR_NAME, {
+            'name': DEFAULT_CONTRACT_CREATOR_NAME,
+            'code': '',
+            'user_id': '',
+            'status': _employee_status_label(DEFAULT_CONTRACT_CREATOR_NAME, '', status_by_number, status_by_name),
+        })
 
-    employee_info_by_name = _build_employee_info_by_name([DEFAULT_CONTRACT_CREATOR_NAME], status_by_number, status_by_name)
-    default_info = employee_info_by_name.get(DEFAULT_CONTRACT_CREATOR_NAME, {
-        'name': DEFAULT_CONTRACT_CREATOR_NAME,
-        'code': '',
-        'user_id': '',
-        'status': _employee_status_label(DEFAULT_CONTRACT_CREATOR_NAME, '', status_by_number, status_by_name),
-    })
+        for index, _ in df.loc[left_mask].iterrows():
+            row = df.loc[index]
+            executor_info = {
+                'name': _text(row.get('合同执行人员')),
+                'code': _text(row.get('合同执行人员工号')),
+                'user_id': _text(row.get('合同执行人飞书ID')),
+                'status': _text(row.get('合同执行人状态')),
+            }
+            if executor_info['name'] and executor_info['status'] != '离职':
+                selected = executor_info
+                df.at[index, '合同创建人调整方式'] = '申请人离职,更新为合同执行人'
+            else:
+                selected = default_info
+                df.at[index, '合同创建人调整方式'] = '申请人离职,合同执行人离职/缺失,更新为黄劭文'
+            df.at[index, '合同创建人'] = selected.get('name', '')
+            df.at[index, '合同创建人工号'] = selected.get('code', '')
+            df.at[index, '合同创建人user_id'] = selected.get('user_id', '')
+            df.at[index, '合同创建人状态'] = selected.get('status', '')
 
-    for index, _ in df.loc[left_mask].iterrows():
-        row = df.loc[index]
-        executor_info = {
-            'name': _text(row.get('合同执行人员')),
-            'code': _text(row.get('合同执行人员工号')),
-            'user_id': _text(row.get('合同执行人飞书ID')),
-            'status': _text(row.get('合同执行人状态')),
-        }
-        if executor_info['name'] and executor_info['status'] != '离职':
-            selected = executor_info
-            df.at[index, '合同创建人调整方式'] = '申请人离职,更新为合同执行人'
-        else:
-            selected = default_info
-            df.at[index, '合同创建人调整方式'] = '申请人离职,合同执行人离职/缺失,更新为黄劭文'
-        df.at[index, '合同创建人'] = selected.get('name', '')
-        df.at[index, '合同创建人工号'] = selected.get('code', '')
-        df.at[index, '合同创建人user_id'] = selected.get('user_id', '')
-        df.at[index, '合同创建人状态'] = selected.get('status', '')
+    legal_receiver = df['合同编号'].map(lambda value: _legal_override_for_contract(value, 'receiver'))
+    receiver_mask = legal_receiver.map(_text) != ''
+    if bool(receiver_mask.any()):
+        receiver_info_by_name = _build_legal_receiver_employee_info(legal_receiver.loc[receiver_mask])
+        applied_count = 0
+        unresolved_count = 0
+        for index, receiver in legal_receiver.loc[receiver_mask].items():
+            receiver_name = _first_person_name(receiver)
+            selected = receiver_info_by_name.get(receiver_name, {})
+            if selected.get('match_status') == '飞书在职员工' and selected.get('user_id'):
+                df.at[index, '合同创建人'] = selected.get('name', receiver_name)
+                df.at[index, '合同创建人user_id'] = selected.get('user_id', '')
+                applied_count += 1
+            else:
+                unresolved_count += 1
+        print(f'[合同迁移-主播流程] 法务CSV接收人覆盖创建人: {applied_count} 条; 未覆盖 {unresolved_count} 条')
     return df
 
 
@@ -1650,6 +1866,17 @@ def resolve_anchor_platform(row, card_info, platform_map):
     return '', '', '未识别平台'
 
 
+def _apply_legal_receive_platform_overrides(df):
+    legal_platform = df['合同编号'].map(lambda value: _legal_override_for_contract(value, 'platform'))
+    platform_mask = legal_platform.map(_text) != ''
+    if not bool(platform_mask.any()):
+        return df
+    for index, platform in legal_platform.loc[platform_mask].items():
+        df.at[index, '所属平台'] = _text(platform)
+    print(f'[合同迁移-主播流程] 法务CSV覆盖所属平台: {int(platform_mask.sum())} 条')
+    return df
+
+
 def _is_supplement_or_termination_flow(row):
     flow_id = c.format_code(row.get('流程类型ID'))
     flow_name = c.clean_fw_select_name(row.get('流程名称'))
@@ -2078,6 +2305,7 @@ def resolve_source_values(source_df):
     df['所属平台ID_解析'] = platform_results.map(lambda item: item[0])
     df['所属平台'] = platform_results.map(lambda item: item[1])
     df['所属平台解析依据'] = platform_results.map(lambda item: item[2])
+    df = _apply_legal_receive_platform_overrides(df)
     df['房间号/主播ID'] = df.apply(
         lambda row: choose_anchor_room_id(
             card_info(row),
