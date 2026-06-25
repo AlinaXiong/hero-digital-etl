@@ -48,13 +48,7 @@ def run():
         print(f'[一般流程合同附件] 未下载: {status}; 下载清单 {len(manifest_df)} 条 -> {download_root}')
     else:
         print(f'[一般流程合同附件] 开始下载 {len(manifest_df)} 个文件 -> {download_root}')
-        for index, meta in manifest_df.iterrows():
-            status, error = base._download_attachment_file(meta, cookie)
-            manifest_df.at[index, 'status'] = status
-            manifest_df.at[index, 'error'] = error
-            done_count = manifest_df.index.get_loc(index) + 1
-            if done_count % 50 == 0 or done_count == len(manifest_df):
-                print(f'[一般流程合同附件] 下载进度: {done_count}/{len(manifest_df)}')
+        manifest_df = base.download_attachment_manifest(manifest_df, cookie, log_prefix='一般流程合同附件')
 
     output_file = base._write_exceptions_with_fallback(MANIFEST_FILE, {
         '合同附件下载清单': manifest_df,

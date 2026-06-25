@@ -16,6 +16,7 @@ import re
 import sys
 import time
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 import urllib.parse
 import urllib.request
@@ -101,6 +102,7 @@ ATTACHMENT_AUTHORIZEMODE_ID_ENV = 'WEAVER_CONTRACT_ATTACHMENT_AUTHORIZEMODE_ID'
 ATTACHMENT_AUTHORIZEFIELD_ID_ENV = 'WEAVER_CONTRACT_ATTACHMENT_AUTHORIZEFIELD_ID'
 ATTACHMENT_DOWNLOAD_ROOT_ENV = 'WEAVER_CONTRACT_ATTACHMENT_DOWNLOAD_ROOT'
 ATTACHMENT_DOWNLOAD_ENABLED_ENV = 'WEAVER_CONTRACT_ATTACHMENT_DOWNLOAD_ENABLED'
+ATTACHMENT_DOWNLOAD_WORKERS_ENV = 'WEAVER_CONTRACT_ATTACHMENT_DOWNLOAD_WORKERS'
 DEFAULT_ATTACHMENT_BASE_URL = 'http://oaportal.heroesports.com'
 DEFAULT_ATTACHMENT_LOGIN_USERID = '3837'
 DEFAULT_ATTACHMENT_AUTHORIZEMODE_ID = '5'
@@ -128,6 +130,7 @@ SAISHI_DOC_FIELD_TYPES = (
 )
 INVALID_PATH_CHARS = re.compile(r'[<>:"/\\|?*]+')
 DOC_ID_SPLITTER = re.compile(r'[,\uff0c]+')
+SIGNED_APPROVAL_NODE_KEYWORDS = ('用印', '申请人性质', '上传电子版', '法务确认')
 
 
 # ============================ 泛微源 SQL ============================
@@ -433,6 +436,17 @@ def _attachment_download_enabled(cookie):
     return bool(_text(cookie))
 
 
+def _attachment_download_workers(default=8):
+    raw = os.getenv(ATTACHMENT_DOWNLOAD_WORKERS_ENV, '').strip()
+    if not raw:
+        return default
+    try:
+        workers = int(raw)
+    except ValueError:
+        return default
+    return max(1, min(workers, 32))
+
+
 def _build_attachment_referer(base_url, imagefileid, docid):
     query = urllib.parse.urlencode({
         'pdfimagefileid': imagefileid,
@@ -488,6 +502,32 @@ def _download_attachment_file(meta, cookie):
         if temp_path.exists():
             temp_path.unlink(missing_ok=True)
         return 'failed', str(exc)
+
+
+def download_attachment_manifest(manifest_df, cookie, log_prefix='附件下载'):
+    """多线程下载附件,并把 status/error 写回 manifest_df 副本。"""
+    if manifest_df.empty:
+        return manifest_df.copy()
+    result_df = manifest_df.copy()
+    workers = _attachment_download_workers()
+    print(f'[{log_prefix}] 使用 {workers} 个下载线程')
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_download_attachment_file, meta, cookie): index
+            for index, meta in result_df.iterrows()
+        }
+        total = len(futures)
+        for done_count, future in enumerate(as_completed(futures), 1):
+            index = futures[future]
+            try:
+                status, error = future.result()
+            except Exception as exc:  # 防御单个任务异常,不让整体下载中断。
+                status, error = 'failed', str(exc)
+            result_df.at[index, 'status'] = status
+            result_df.at[index, 'error'] = error
+            if done_count % 50 == 0 or done_count == total:
+                print(f'[{log_prefix}] 下载进度: {done_count}/{total}')
+    return result_df
 
 
 def _load_attachment_maps(docids):
@@ -593,11 +633,14 @@ def _classify_attachment_type(doc_row, image_info, doc_info, explicit_type=''):
 
 
 def _preferred_attachment_type(source):
+    approval_status = _text(source.get('合同审批状态'))
+    if any(keyword in approval_status for keyword in SIGNED_APPROVAL_NODE_KEYWORDS):
+        return ATTACHMENT_TYPE_SIGNED
     status_text = _text(source.get('合同签署状态'))
     status_id = c.format_code(source.get('合同签署状态ID'))
     if '归档' in status_text or status_id == '2':
-        return ATTACHMENT_TYPE_SIGNED
-    return ATTACHMENT_TYPE_EFFECTIVE
+        return ATTACHMENT_TYPE_EFFECTIVE
+    return ATTACHMENT_TYPE_SIGNED
 
 
 def _attachment_name_startswith_contract(attachment_name, contract_number):
@@ -606,16 +649,48 @@ def _attachment_name_startswith_contract(attachment_name, contract_number):
     return bool(normalized_contract and normalized_name.startswith(normalized_contract))
 
 
-def _attachment_target_sheet(source, attachment_type, attachment_name):
+def _attachment_skip_reason(source, attachment_type):
     preferred_type = _preferred_attachment_type(source)
     if attachment_type != preferred_type:
-        return '', f'跳过非目标稿件:{attachment_type or "未分类"},目标:{preferred_type}'
-    contract_number = _text(source.get('合同编号'))
-    if _is_supplement_contract_number(contract_number):
-        return SHEET_OTHER_ATTACHMENT, '补充协议附件统一归其他附件'
-    if _attachment_name_startswith_contract(attachment_name, contract_number):
-        return SHEET_CONTRACT_ATTACHMENT, '目标稿件且文件名以合同编号开头'
-    return SHEET_OTHER_ATTACHMENT, '目标稿件但文件名未以合同编号开头'
+        return f'跳过非目标稿件:{attachment_type or "未分类"},目标:{preferred_type}'
+    return ''
+
+
+def _assign_attachment_targets(candidate_rows):
+    """按合同维度分配目标附件类型。
+
+    规则:
+      - 文件名以合同编号开头 -> 合同附件
+      - 若目标稿件只有一个文件,即便不以合同编号开头,也作为合同附件
+      - 若目标稿件多个文件且都不以合同编号开头,第一个作为合同附件,其余作为其他附件
+      - 其余不以合同编号开头的文件作为其他附件
+    """
+    grouped = {}
+    for row in candidate_rows:
+        grouped.setdefault(_text(row.get('contract_number（合同编码）')), []).append(row)
+
+    assigned = []
+    for contract_number, items in grouped.items():
+        starts = [
+            _attachment_name_startswith_contract(item.get('attachment_name'), contract_number)
+            for item in items
+        ]
+        any_starts = any(starts)
+        for index, item in enumerate(items):
+            if starts[index]:
+                item['attachment_sheet'] = SHEET_CONTRACT_ATTACHMENT
+                item['attachment_rule'] = '目标稿件且文件名以合同编号开头'
+            elif len(items) == 1:
+                item['attachment_sheet'] = SHEET_CONTRACT_ATTACHMENT
+                item['attachment_rule'] = '目标稿件仅1个文件,虽未以合同编号开头仍作为合同附件'
+            elif not any_starts and index == 0:
+                item['attachment_sheet'] = SHEET_CONTRACT_ATTACHMENT
+                item['attachment_rule'] = '目标稿件多个文件均未以合同编号开头,取第一个作为合同附件'
+            else:
+                item['attachment_sheet'] = SHEET_OTHER_ATTACHMENT
+                item['attachment_rule'] = '目标稿件但文件名未以合同编号开头'
+            assigned.append(item)
+    return assigned
 
 
 def _resolve_request_form_tables(request_ids):
@@ -770,7 +845,7 @@ def build_contract_attachment_manifest(source_df):
     docimage_map, imagefile_map, docdetail_map = _timed(
         '  ├─附件三表JOIN取数(_load_attachment_maps)', lambda: _load_attachment_maps(all_docids))
 
-    rows = []
+    candidate_rows = []
     missing_rows = []
     seen = set()
     used_paths = set()
@@ -813,16 +888,10 @@ def build_contract_attachment_manifest(source_df):
                 ))
                 attachment_type = _classify_attachment_type(
                     doc_row, image_info, doc_info, docref.get('attachment_type', ''))
-                attachment_sheet, attachment_rule = _attachment_target_sheet(source, attachment_type, attachment_name)
-                if not attachment_sheet:
+                skip_reason = _attachment_skip_reason(source, attachment_type)
+                if skip_reason:
                     continue
-                target_dir = download_root / contract_dir / _sanitize_path_part(attachment_type, attachment_type)
-                target_name = _build_target_filename(attachment_name, imagefileid)
-                target_path = target_dir / target_name
-                if target_path in used_paths:
-                    target_path = target_dir / f'{target_path.stem}_{imagefileid}{target_path.suffix}'
-                used_paths.add(target_path)
-                rows.append({
+                candidate_rows.append({
                     'contract_number（合同编码）': contract_number,
                     '合同ID': _text(source.get('ID')),
                     '合同名称': _text(source.get('合同标题')),
@@ -831,11 +900,11 @@ def build_contract_attachment_manifest(source_df):
                     'docid': docid,
                     'imagefileid': imagefileid,
                     'attachment_name': attachment_name,
-                    'attachment_sheet': attachment_sheet,
-                    'attachment_rule': attachment_rule,
+                    'attachment_sheet': '',
+                    'attachment_rule': '',
                     'imagefiletype': image_info.get('imagefiletype', ''),
                     'filesize': image_info.get('filesize', ''),
-                    'target_path': str(target_path),
+                    'target_path': '',
                     'source': docref.get('source', ''),
                     'nodeid': docref.get('nodeid', ''),
                     'share_id': docref.get('share_id', ''),
@@ -845,6 +914,18 @@ def build_contract_attachment_manifest(source_df):
                     'status': 'pending',
                     'error': '',
                 })
+
+    rows = _assign_attachment_targets(candidate_rows)
+    for row in rows:
+        contract_number = _text(row.get('contract_number（合同编码）'))
+        contract_dir = _sanitize_path_part(contract_number, f'contract_{_text(row.get("合同ID"))}')
+        target_dir = download_root / contract_dir / _sanitize_path_part(row.get('attachment_type'), row.get('attachment_type'))
+        target_name = _build_target_filename(row.get('attachment_name'), row.get('imagefileid'))
+        target_path = target_dir / target_name
+        if target_path in used_paths:
+            target_path = target_dir / f'{target_path.stem}_{row.get("imagefileid")}{target_path.suffix}'
+        used_paths.add(target_path)
+        row['target_path'] = str(target_path)
 
     print(f'[计时]   └─附件清单逐行构建({len(rows)}行): {time.perf_counter() - _t0:.1f}s', flush=True)
     return pd.DataFrame(rows), pd.DataFrame(missing_rows)
@@ -1211,6 +1292,72 @@ def build_feishu_employee_id_map(code_values):
             if code and feishu_id:
                 result[code] = feishu_id
     return result
+
+
+def build_feishu_employee_id_map_by_name(name_values):
+    """员工姓名 -> 飞书 user_id。
+
+    仅姓名唯一且 feishu_employee_id 唯一时返回,避免重名员工误配。
+    """
+    names = c.clean_text_values(_text(name) for name in name_values if _text(name))
+    if not names:
+        return {}
+    rows = []
+    for batch in _chunked(sorted(set(names))):
+        df = c.query_db(
+            'ZT',
+            'hfins_base',
+            'SELECT name, feishu_employee_id FROM hfbs_employee '
+            f'WHERE name IN ({c.in_placeholders(batch)})',
+            batch,
+        )
+        rows.extend(df.to_dict('records'))
+    grouped = {}
+    for row in rows:
+        name = _text(row.get('name'))
+        feishu_id = _text(row.get('feishu_employee_id'))
+        if name and feishu_id:
+            grouped.setdefault(name, set()).add(feishu_id)
+    return {
+        name: next(iter(ids))
+        for name, ids in grouped.items()
+        if len(ids) == 1
+    }
+
+
+def build_feishu_employee_id_map_by_contact(contact_values):
+    """泛微登录名/手机号/邮箱 -> 飞书 user_id。仅唯一命中时返回。"""
+    contacts = c.clean_text_values(_text(value) for value in contact_values if _text(value) and _text(value) != 'Default')
+    if not contacts:
+        return {}
+    rows = []
+    for batch in _chunked(sorted(set(contacts))):
+        placeholders = c.in_placeholders(batch)
+        df = c.query_db(
+            'ZT',
+            'hfins_base',
+            'SELECT email, phone, login_identity, taxpayers_phone, feishu_employee_id FROM hfbs_employee '
+            f'WHERE email IN ({placeholders}) '
+            f'   OR phone IN ({placeholders}) '
+            f'   OR login_identity IN ({placeholders}) '
+            f'   OR taxpayers_phone IN ({placeholders})',
+            [*batch, *batch, *batch, *batch],
+        )
+        rows.extend(df.to_dict('records'))
+    grouped = {}
+    for row in rows:
+        feishu_id = _text(row.get('feishu_employee_id'))
+        if not feishu_id:
+            continue
+        for field in ('email', 'phone', 'login_identity', 'taxpayers_phone'):
+            contact = _text(row.get(field))
+            if contact:
+                grouped.setdefault(contact, set()).add(feishu_id)
+    return {
+        contact: next(iter(ids))
+        for contact, ids in grouped.items()
+        if len(ids) == 1
+    }
 
 
 def _employee_status_label(name, code, status_by_number, status_by_name):
@@ -1783,6 +1930,20 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
         lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
     df['合同创建人工号'] = df['合同创建人ID'].map(
         lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
+    df['合同创建人联系方式'] = df['合同创建人ID'].map(
+        lambda value: ';'.join(c.clean_text_values(
+            employee_map.get(c.format_code(value), {}).get(field, '')
+            for field in ('workcode', 'loginid', 'mobile', 'telephone', 'email')
+        )))
+    df['申请人'] = df['申请人ID'].map(
+        lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
+    df['申请人工号'] = df['申请人ID'].map(
+        lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
+    df['申请人联系方式'] = df['申请人ID'].map(
+        lambda value: ';'.join(c.clean_text_values(
+            employee_map.get(c.format_code(value), {}).get(field, '')
+            for field in ('workcode', 'loginid', 'mobile', 'telephone', 'email')
+        )))
     status_by_number, status_by_name = _employment_status_map()
     applicant_status = c.build_applicant_status_map(df['申请人ID'], status_by_number, status_by_name)
     creator_status = c.build_applicant_status_map(df['合同创建人ID'], status_by_number, status_by_name)
@@ -1790,9 +1951,35 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
     df['合同创建人状态'] = df['合同创建人ID'].map(lambda value: creator_status.get(c.format_code(value), ''))
     feishu_id_map = _timed('  ├─合同执行人/创建人飞书ID映射(汉得)',
                            lambda: build_feishu_employee_id_map(
-                               pd.concat([df['合同执行人员工号'], df['合同创建人工号']], ignore_index=True)))
+                               pd.concat([df['合同执行人员工号'], df['合同创建人工号'], df['申请人工号']],
+                                         ignore_index=True)))
+    feishu_id_by_name = _timed('  ├─申请人飞书ID姓名兜底(汉得)',
+                               lambda: build_feishu_employee_id_map_by_name(df['申请人']))
+    contact_values = []
+    for value in pd.concat([df['合同创建人联系方式'], df['申请人联系方式']], ignore_index=True):
+        contact_values.extend(c.clean_text_values(_text(value).split(';')))
+    feishu_id_by_contact = _timed('  ├─申请人/创建人飞书ID联系方式兜底(汉得)',
+                                  lambda: build_feishu_employee_id_map_by_contact(contact_values))
     df['合同执行人飞书ID'] = df['合同执行人员工号'].map(lambda code: feishu_id_map.get(_text(code), ''))
-    df['合同创建人user_id'] = df['合同创建人工号'].map(lambda code: feishu_id_map.get(_text(code), ''))
+    df['合同创建人user_id'] = df.apply(
+        lambda row: feishu_id_map.get(_text(row.get('合同创建人工号')), '')
+        or next((
+            feishu_id_by_contact.get(contact)
+            for contact in c.clean_text_values(_text(row.get('合同创建人联系方式')).split(';'))
+            if feishu_id_by_contact.get(contact)
+        ), ''),
+        axis=1,
+    )
+    df['申请人user_id'] = df.apply(
+        lambda row: feishu_id_map.get(_text(row.get('申请人工号')), '')
+        or next((
+            feishu_id_by_contact.get(contact)
+            for contact in c.clean_text_values(_text(row.get('申请人联系方式')).split(';'))
+            if feishu_id_by_contact.get(contact)
+        ), '')
+        or feishu_id_by_name.get(_text(row.get('申请人')), ''),
+        axis=1,
+    )
     purchase_request_map = _timed('  ├─采购申请单编号映射',
                                   lambda: build_purchase_request_code_map(df.get('采购申请单ID', pd.Series(dtype=object))))
     df['采购申请单编号'] = df.get('采购申请单ID', pd.Series('', index=df.index)).map(

@@ -368,16 +368,46 @@ def clean_fw_select_name(value, language_id=7):
     if not text:
         return ''
     marker = '~`~`'
-    if marker not in text:
+    legacy_marker = '`~`'
+
+    def repair_legacy_mojibake(label):
+        """部分泛微节点名的中文被按 Big5 解码,需按 Big5->GBK 还原。"""
+        try:
+            repaired = label.encode('big5').decode('gbk')
+        except UnicodeError:
+            return label
+        # 只接受明显还原成常见简体审批节点/动作的结果,避免误伤正常文本。
+        if any(token in repaired for token in (
+            '归档', '审批', '审核', '法务', '财务', '用印', '上传', '确认', '提交', '查看',
+        )):
+            return repaired
+        return label
+
+    if marker not in text and legacy_marker not in text:
         return text
 
-    for part in text.split(marker):
-        part = part.strip('`~ ')
-        if part.startswith(str(language_id)):
-            return part[len(str(language_id)):].strip()
-    cleaned = re.sub(r'~`~`\d+\s*', '', text)
-    cleaned = cleaned.replace('`~`~', '').replace(marker, '').strip('`~ ')
-    return cleaned
+    def first_legacy_label(label):
+        parts = [part.strip('`~ ') for part in label.split(legacy_marker)]
+        for part in parts:
+            if part.startswith(str(language_id)):
+                return part[len(str(language_id)):].strip()
+        for part in parts:
+            if part and not re.match(r'^\d+\s+', part):
+                return part
+        return re.sub(r'`~`\d+\s*', '', label).strip('`~ ')
+
+    if marker in text:
+        for part in text.split(marker):
+            part = part.strip('`~ ')
+            if part.startswith(str(language_id)):
+                return repair_legacy_mojibake(first_legacy_label(part[len(str(language_id)):].strip()))
+        cleaned = re.sub(r'~`~`\d+\s*', '', text)
+        cleaned = cleaned.replace('`~`~', '').replace(marker, '').strip('`~ ')
+        return repair_legacy_mojibake(first_legacy_label(cleaned))
+
+    # 旧节点名常见格式: 中文`~`8 English`~`9 繁体。language 7 没有显式编号,
+    # 因此优先取第一个无编号片段。
+    return repair_legacy_mojibake(first_legacy_label(text))
 
 
 def build_fw_select_option_map(table_name, field_name, language_id=7):
@@ -493,7 +523,8 @@ def build_fw_employee_info_map_for_ids(user_ids):
     employee_df = query_db(
         'FW',
         'vspn_xtyy',
-        'SELECT r.id, r.LASTNAME employee_name, j.JOBTITLENAME employee_code '
+        'SELECT r.id, r.LASTNAME employee_name, j.JOBTITLENAME employee_code, '
+        'r.LOGINID loginid, r.WORKCODE workcode, r.EMAIL email, r.MOBILE mobile, r.TELEPHONE telephone '
         'FROM hrmresource r LEFT JOIN hrmjobtitles j ON r.JOBTITLE = j.id '
         f'WHERE r.id IN ({in_placeholders(user_ids)})',
         user_ids,
@@ -507,6 +538,11 @@ def build_fw_employee_info_map_for_ids(user_ids):
             employee_map[employee_id] = {
                 'name': employee_name,
                 'code': employee_code,
+                'loginid': _cell_text(row.get('loginid')),
+                'workcode': _cell_text(row.get('workcode')),
+                'email': _cell_text(row.get('email')),
+                'mobile': _cell_text(row.get('mobile')),
+                'telephone': _cell_text(row.get('telephone')),
             }
     return employee_map
 
