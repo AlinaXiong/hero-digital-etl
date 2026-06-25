@@ -2286,8 +2286,8 @@ def write_output_workbook(supplier_output_df, gig_output_df, mcn_supplier_output
             SUPPLIER_SUMMARY_SHEET,
             GIG_SUMMARY_SHEET,
             TEMPLATE_SHEET_SUPPLIER,
-            TEMPLATE_SHEET_GIG,
             *mcn_supplier_outputs.keys(),
+            TEMPLATE_SHEET_GIG,
             *mcn_gig_outputs.keys(),
         ],
     )
