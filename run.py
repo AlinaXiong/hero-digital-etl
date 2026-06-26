@@ -1,45 +1,41 @@
 # -*- coding: utf-8 -*-
 """任务入口。用法:
-    python run.py            # 默认跑 ap_payment_opening
-    python run.py ap_payment_opening # 跑指定任务
+    python run.py            # 默认跑 ap_payment_opening_db
+    python run.py ap_payment_opening_db # 跑指定任务
     python run.py --list     # 列出所有任务
 
-新增任务:在 etl/tasks 下加一个 <任务名>.py,再在下面 TASKS 登记。
+新增任务:在 etl/<分组> 下加一个 <任务名>.py,再在下面 TASKS 登记。
 """
 import shutil
 import sys
 from datetime import datetime
 
-from etl import common as c
-from etl import export_feishu_employees
+from etl.util import common as c
+from etl.lark import export_feishu_employees
 
-from etl.tasks import (
+from etl.contract import (
     anti_bribery_signers_db,
-    ap_payment_opening,
-    ap_payment_opening_db,
-    ap_payment_opening_extra_db,
-    ap_prepayment_opening,
-    ap_prepayment_opening_db,
-    ar_invoice_opening,
-    ar_invoice_opening_db,
-    contract_anti_bribery_attachments_db,
-    contract_anti_bribery_db,
     contract_anchor_attachments_db,
     contract_anchor_db,
+    contract_anti_bribery_attachments_db,
+    contract_anti_bribery_db,
     contract_general_attachments_db,
     contract_general_db,
-    invoice_info_db,
 )
+from etl.process import (
+    ap_payment_opening_db,
+    ap_payment_opening_extra_db,
+    ap_prepayment_opening_db,
+    ar_invoice_opening_db,
+)
+from etl.invoice import invoice_info_db
 
 # 登记任务:任务名 -> run 函数。新增任务在这里加一行。
 TASKS = {
     'anti_bribery_signers_db': anti_bribery_signers_db.run,  # 反商业贿赂协议签署情况补登(DB直连版)
-    'ap_payment_opening': ap_payment_opening.run,         # 应付期初 对公付款单
     'ap_payment_opening_db': ap_payment_opening_db.run,   # 应付期初 对公付款单(DB直连版)
     'ap_payment_opening_extra_db': ap_payment_opening_extra_db.run,  # 应付期初 批量费用流程/只转入外部成本(DB直连版)
-    'ap_prepayment_opening': ap_prepayment_opening.run,   # 预付期初 供应商预付款单
     'ap_prepayment_opening_db': ap_prepayment_opening_db.run,  # 预付期初 供应商预付款单/零工预付款单(DB直连版)
-    'ar_invoice_opening': ar_invoice_opening.run,         # 应收期初 应收报账单
     'ar_invoice_opening_db': ar_invoice_opening_db.run,   # 应收期初 应收报账单(DB直连版)
     'contract_anti_bribery_db': contract_anti_bribery_db.run,  # 合同迁移 反商业贿赂协议(DB直连版)
     'contract_anti_bribery_attachments_db': contract_anti_bribery_attachments_db.run,  # 反商业贿赂协议附件下载(DB直连版)
@@ -63,6 +59,20 @@ ALL_SUMMARY_GROUPS = (
     ('预付期初', 'ap_prepayment_opening_db'),
     ('应收期初', 'ar_invoice_opening_db'),
     ('发票信息', 'invoice_info_db'),
+)
+
+# 合同类任务:数据/导入 Excel(不含附件下载)
+CONTRACT_ALL_TASKS = (
+    'contract_general_db',       # 一般流程 Excel
+    'contract_anchor_db',        # 主播流程 Excel
+    'contract_anti_bribery_db',  # 反商业贿赂协议 Excel
+)
+
+# 合同类任务:附件下载(每个流程一个;依赖 cookie,放在数据任务之后跑)
+CONTRACT_ATTACHMENT_TASKS = (
+    'contract_general_attachments_db',
+    'contract_anchor_attachments_db',
+    'contract_anti_bribery_attachments_db',
 )
 
 
@@ -106,19 +116,35 @@ def create_all_summary(started_at):
     return summary_dir
 
 
+def _run_task_sequence(task_names, label):
+    for index, task_name in enumerate(task_names, start=1):
+        print(f'\n=== 运行 {label} 子任务 {index}/{len(task_names)}: {task_name} ===')
+        TASKS[task_name]()
+
+
 def run_all():
     started_at = datetime.now()
-    for index, task_name in enumerate(ALL_TASK_NAMES, start=1):
-        print(f'\n=== 运行 all 子任务 {index}/{len(ALL_TASK_NAMES)}: {task_name} ===')
-        TASKS[task_name]()
+    _run_task_sequence(ALL_TASK_NAMES, 'all')
     create_all_summary(started_at)
 
 
+def run_contract_all():
+    """一次跑所有合同任务,不含附件下载。"""
+    _run_task_sequence(CONTRACT_ALL_TASKS, 'contract_all')
+
+
+def run_contract_all_with_attachments():
+    """一次跑所有合同任务,含附件下载(先出全部导入 Excel,再下载附件)。"""
+    _run_task_sequence(CONTRACT_ALL_TASKS + CONTRACT_ATTACHMENT_TASKS, 'contract_all_with_attachments')
+
+
 TASKS['all'] = run_all
+TASKS['contract_all'] = run_contract_all
+TASKS['contract_all_with_attachments'] = run_contract_all_with_attachments
 
 
 def main():
-    arg = sys.argv[1] if len(sys.argv) > 1 else 'ap_payment_opening'
+    arg = sys.argv[1] if len(sys.argv) > 1 else 'ap_payment_opening_db'
     if arg in ('--list', '-l'):
         print('可用任务:', ', '.join(TASKS))
         return
