@@ -445,6 +445,7 @@ SELECT * FROM (
         d.fjxh AS `费用项编码`,
         d.fyx AS `费用项名称`,
         COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
+        COALESCE(od.ddbh, d.ddbh) AS `泛微订单编号`,
         d.zbid AS `主播房间号`,
         d.zbnc AS `主播昵称`,
         d.sfzh AS `身份证号`,
@@ -453,6 +454,7 @@ SELECT * FROM (
         d.yhzh AS `明细银行账号`
     FROM formtable_main_83 m
     JOIN formtable_main_83_dt3 d ON d.mainid = m.id
+    LEFT JOIN uf_ddk od ON od.id = d.ddbh
     LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
     LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx
     UNION ALL
@@ -477,6 +479,7 @@ SELECT * FROM (
         d.fjxh AS `费用项编码`,
         d.fyx AS `费用项名称`,
         COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
+        COALESCE(od.ddbh, d.ptpqh) AS `泛微订单编号`,
         d.zbid AS `主播房间号`,
         d.zbnc AS `主播昵称`,
         d.sfzh AS `身份证号`,
@@ -485,6 +488,7 @@ SELECT * FROM (
         d.yhzh AS `明细银行账号`
     FROM formtable_main_83 m
     JOIN formtable_main_83_dt4 d ON d.mainid = m.id
+    LEFT JOIN formtable_main_76_dt2 od ON od.id = d.ptpqh
     LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
     LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx
     UNION ALL
@@ -509,6 +513,7 @@ SELECT * FROM (
         d.fjxh AS `费用项编码`,
         d.fyx AS `费用项名称`,
         COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
+        COALESCE(od.ddbh, d.ptpqh) AS `泛微订单编号`,
         d.zbid AS `主播房间号`,
         d.zbnc AS `主播昵称`,
         d.sfzh AS `身份证号`,
@@ -517,6 +522,7 @@ SELECT * FROM (
         d.yhzh AS `明细银行账号`
     FROM formtable_main_83 m
     JOIN formtable_main_83_dt5 d ON d.mainid = m.id
+    LEFT JOIN formtable_main_79_dt2 od ON od.id = d.ptpqh
     LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
     LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx
     UNION ALL
@@ -541,6 +547,7 @@ SELECT * FROM (
         d.fjxh AS `费用项编码`,
         d.fyx AS `费用项名称`,
         COALESCE(d.dkje, d.zcje, d.jsje) AS `金额`,
+        COALESCE(od.ddbh, d.ddh) AS `泛微订单编号`,
         NULL AS `主播房间号`,
         NULL AS `主播昵称`,
         NULL AS `身份证号`,
@@ -549,6 +556,7 @@ SELECT * FROM (
         NULL AS `明细银行账号`
     FROM formtable_main_83 m
     JOIN formtable_main_83_dt6 d ON d.mainid = m.id
+    LEFT JOIN formtable_main_76_dt2 od ON od.id = d.ddh
     LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
     LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx
 ) x
@@ -713,10 +721,12 @@ SELECT * FROM (
         d.fjxh AS `费用项编码`,
         d.fyx AS `费用项名称`,
         COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
+        COALESCE(od.ddbh, d.ddh) AS `泛微订单编号`,
         d.zbid AS `主播房间号`,
         d.zbnc AS `主播昵称`
     FROM formtable_main_66 m
     JOIN formtable_main_66_dt3 d ON d.mainid = m.id
+    LEFT JOIN uf_ddk od ON od.id = d.ddh
     LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
     LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx
     WHERE (m.fkpt IS NULL OR CAST(m.fkpt AS CHAR) <> %(direct_payment_code)s)
@@ -742,10 +752,12 @@ SELECT * FROM (
         d.fjxh AS `费用项编码`,
         d.fyx AS `费用项名称`,
         COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
+        COALESCE(od.ddbh, d.ptpqh) AS `泛微订单编号`,
         d.zbid AS `主播房间号`,
         d.zbnc AS `主播昵称`
     FROM formtable_main_66 m
     JOIN formtable_main_66_dt4 d ON d.mainid = m.id
+    LEFT JOIN formtable_main_76_dt2 od ON od.id = d.ptpqh
     LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
     LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx
     WHERE (m.fkpt IS NULL OR CAST(m.fkpt AS CHAR) <> %(direct_payment_code)s)
@@ -771,10 +783,12 @@ SELECT * FROM (
         d.fjxh AS `费用项编码`,
         d.fyx AS `费用项名称`,
         COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
+        COALESCE(od.ddbh, d.ptpqh) AS `泛微订单编号`,
         d.zbid AS `主播房间号`,
         d.zbmc AS `主播昵称`
     FROM formtable_main_66 m
     JOIN formtable_main_66_dt5 d ON d.mainid = m.id
+    LEFT JOIN formtable_main_79_dt2 od ON od.id = d.ptpqh
     LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
     LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx
     WHERE (m.fkpt IS NULL OR CAST(m.fkpt AS CHAR) <> %(direct_payment_code)s)
@@ -800,10 +814,12 @@ SELECT * FROM (
         d.fjxh AS `费用项编码`,
         d.fyx AS `费用项名称`,
         COALESCE(d.fkje, d.zcje, d.jsje) AS `金额`,
+        COALESCE(od.ddbh, d.ddh) AS `泛微订单编号`,
         NULL AS `主播房间号`,
         NULL AS `主播昵称`
     FROM formtable_main_66 m
     JOIN formtable_main_66_dt6 d ON d.mainid = m.id
+    LEFT JOIN formtable_main_76_dt2 od ON od.id = d.ddh
     LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
     LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx
     WHERE (m.fkpt IS NULL OR CAST(m.fkpt AS CHAR) <> %(direct_payment_code)s)
@@ -2195,6 +2211,18 @@ def build_mcn_gig_output(source_df, anchor_payee_category=False):
     return output_df[GIG_OUTPUT_COLUMNS]
 
 
+def _add_fanwei_order_code_column(output_df, source_df):
+    df = output_df.copy()
+    order_codes = source_df.get('泛微订单编号', pd.Series('', index=df.index)).map(_text)
+    order_codes = order_codes.reindex(df.index).fillna('')
+    insert_at = df.columns.get_loc('泛微项目编号') + 1 if '泛微项目编号' in df.columns else len(df.columns)
+    if '泛微订单编号' in df.columns:
+        df['泛微订单编号'] = order_codes
+    else:
+        df.insert(insert_at, '泛微订单编号', order_codes)
+    return df
+
+
 def _fill_sheet(worksheet, output_df):
     for col_idx, column_name in enumerate(output_df.columns, start=1):
         worksheet.cell(row=1, column=col_idx).value = column_name
@@ -2504,6 +2532,10 @@ def run():
         )
         for sheet_name, source_df in mcn_supplier_sources.items()
     }
+    mcn_supplier_outputs[SHEET_MCN_PREPAYMENT_ORDER] = _add_fanwei_order_code_column(
+        mcn_supplier_outputs[SHEET_MCN_PREPAYMENT_ORDER],
+        mcn_supplier_sources[SHEET_MCN_PREPAYMENT_ORDER],
+    )
     mcn_gig_outputs = {
         SHEET_MCN_OUTBOUND_PREPAYMENT: build_mcn_gig_output(
             mcn_gig_sources[SHEET_MCN_OUTBOUND_PREPAYMENT],
@@ -2518,6 +2550,10 @@ def run():
             anchor_payee_category=True,
         ),
     }
+    mcn_gig_outputs[SHEET_MCN_OUTBOUND_ORDER_PREPAYMENT] = _add_fanwei_order_code_column(
+        mcn_gig_outputs[SHEET_MCN_OUTBOUND_ORDER_PREPAYMENT],
+        mcn_gig_sources[SHEET_MCN_OUTBOUND_ORDER_PREPAYMENT],
+    )
     for sheet_name, output_df in {**mcn_supplier_outputs, **mcn_gig_outputs}.items():
         print(f'[预付期初-{sheet_name}] 输出明细行数:', len(output_df))
 
