@@ -365,11 +365,13 @@ SELECT * FROM (
         d.fjxh AS `费用项编码`,
         d.fyx AS `费用项名称`,
         COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
+        COALESCE(od.ddbh, d.ddh) AS `泛微订单编号`,
         d.zbid AS `主播房间号`,
         d.sfzh AS `身份证号`,
         d.zbnc AS `主播昵称`
     FROM formtable_main_66 m
     JOIN formtable_main_66_dt3 d ON d.mainid = m.id
+    LEFT JOIN uf_ddk od ON od.id = d.ddh
     LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
     LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx
     WHERE m.fkpt = %(direct_payment_code)s
@@ -395,11 +397,13 @@ SELECT * FROM (
         d.fjxh AS `费用项编码`,
         d.fyx AS `费用项名称`,
         COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
+        COALESCE(od.ddbh, d.ptpqh) AS `泛微订单编号`,
         d.zbid AS `主播房间号`,
         d.sfzh AS `身份证号`,
         d.zbnc AS `主播昵称`
     FROM formtable_main_66 m
     JOIN formtable_main_66_dt4 d ON d.mainid = m.id
+    LEFT JOIN formtable_main_76_dt2 od ON od.id = d.ptpqh
     LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
     LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx
     WHERE m.fkpt = %(direct_payment_code)s
@@ -425,11 +429,13 @@ SELECT * FROM (
         d.fjxh AS `费用项编码`,
         d.fyx AS `费用项名称`,
         COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
+        COALESCE(od.ddbh, d.ptpqh) AS `泛微订单编号`,
         d.zbid AS `主播房间号`,
         d.sfzh AS `身份证号`,
         d.zbmc AS `主播昵称`
     FROM formtable_main_66 m
     JOIN formtable_main_66_dt5 d ON d.mainid = m.id
+    LEFT JOIN formtable_main_79_dt2 od ON od.id = d.ptpqh
     LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
     LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx
     WHERE m.fkpt = %(direct_payment_code)s
@@ -455,11 +461,13 @@ SELECT * FROM (
         d.fjxh AS `费用项编码`,
         d.fyx AS `费用项名称`,
         COALESCE(d.fkje, d.zcje, d.jsje) AS `金额`,
+        COALESCE(od.ddbh, d.ddh) AS `泛微订单编号`,
         NULL AS `主播房间号`,
         NULL AS `身份证号`,
         NULL AS `主播昵称`
     FROM formtable_main_66 m
     JOIN formtable_main_66_dt6 d ON d.mainid = m.id
+    LEFT JOIN formtable_main_76_dt2 od ON od.id = d.ddh
     LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
     LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx
     WHERE m.fkpt = %(direct_payment_code)s
@@ -820,6 +828,17 @@ def _apply_order_project_columns(output_df, source_df, table_order=EVENT_PROJECT
     elif '预算科目' in source_df.columns:
         df['泛微费用项目编码'] = source_df['预算科目'].where(source_df['预算科目'].notna(), '')
     return df[OUTPUT_COLUMNS]
+
+
+def _add_fanwei_order_code_column(output_df, source_df):
+    df = output_df.copy()
+    order_codes = source_df.get('泛微订单编号', pd.Series('', index=df.index)).map(_text)
+    insert_at = df.columns.get_loc('泛微项目编号') + 1 if '泛微项目编号' in df.columns else len(df.columns)
+    if '泛微订单编号' in df.columns:
+        df['泛微订单编号'] = order_codes.reindex(df.index).fillna('')
+    else:
+        df.insert(insert_at, '泛微订单编号', order_codes.reindex(df.index).fillna(''))
+    return df
 
 
 def _enrich_missing_order_issue(sheets, output_df, source_df):
@@ -1680,6 +1699,8 @@ def run():
             mcn_payment_source_df['来源流程'].map(_text) == source_label
         ].copy() if not mcn_payment_source_df.empty else pd.DataFrame()
         output_part, issue_part = build_mcn_payment_output(source_part)
+        if sheet_name == SHEET_MCN_ORDER:
+            output_part = _add_fanwei_order_code_column(output_part, issue_part)
         mcn_output_dfs[sheet_name] = output_part
         mcn_issue_source_dfs[sheet_name] = issue_part
 
