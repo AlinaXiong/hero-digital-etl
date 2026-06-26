@@ -314,7 +314,10 @@ def build_contract_attachment_manifest(contract_df):
     old_output_dir = base.OUTPUT_DIR
     try:
         base.OUTPUT_DIR = OUTPUT_DIR
-        manifest_df, missing_df = base.build_contract_attachment_manifest(contract_df)
+        manifest_df, missing_df = base.build_contract_attachment_manifest(
+            contract_df,
+            retention_mode='main_archive',
+        )
     finally:
         base.OUTPUT_DIR = old_output_dir
 

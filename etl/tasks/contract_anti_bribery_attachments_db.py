@@ -16,6 +16,14 @@ def _download_enabled(cookie):
     return bool(base._text(cookie))
 
 
+def _download_attachment_manifest_16_workers(manifest_df, cookie):
+    return base.download_attachment_manifest_16_workers(
+        manifest_df,
+        cookie,
+        log_prefix='反商业贿赂协议附件',
+    )
+
+
 def run():
     template_rows, contract_df, main_output_df, manifest_df, missing_df = anti.build_outputs()
     anti.write_outputs(main_output_df, contract_df, template_rows)
@@ -37,7 +45,7 @@ def run():
         print(f'[反商业贿赂协议附件] 未下载: {status}; 仅生成下载清单')
     else:
         print(f'[反商业贿赂协议附件] 开始下载 {len(manifest_df)} 个文件 -> {anti._anti_attachment_download_root()}')
-        manifest_df = base.download_attachment_manifest(manifest_df, cookie, log_prefix='反商业贿赂协议附件')
+        manifest_df = _download_attachment_manifest_16_workers(manifest_df, cookie)
 
     anti.write_exception_outputs(template_rows, contract_df, main_output_df, manifest_df, missing_df)
 

@@ -2535,7 +2535,10 @@ def build_contract_attachment_manifest(source_df):
     old_output_dir = base.OUTPUT_DIR
     try:
         base.OUTPUT_DIR = OUTPUT_DIR
-        manifest_df, missing_df = base.build_contract_attachment_manifest(source_df)
+        manifest_df, missing_df = base.build_contract_attachment_manifest(
+            source_df,
+            retention_mode='main_archive',
+        )
     finally:
         base.OUTPUT_DIR = old_output_dir
 
@@ -2605,15 +2608,11 @@ def _download_enabled(cookie):
 
 
 def _download_attachment_manifest_16_workers(manifest_df, cookie):
-    old_workers = os.environ.get(base.ATTACHMENT_DOWNLOAD_WORKERS_ENV)
-    os.environ[base.ATTACHMENT_DOWNLOAD_WORKERS_ENV] = '16'
-    try:
-        return base.download_attachment_manifest(manifest_df, cookie, log_prefix='主播流程合同附件')
-    finally:
-        if old_workers is None:
-            os.environ.pop(base.ATTACHMENT_DOWNLOAD_WORKERS_ENV, None)
-        else:
-            os.environ[base.ATTACHMENT_DOWNLOAD_WORKERS_ENV] = old_workers
+    return base.download_attachment_manifest_16_workers(
+        manifest_df,
+        cookie,
+        log_prefix='主播流程合同附件',
+    )
 
 
 def build_status_breakdown():

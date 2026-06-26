@@ -15,11 +15,7 @@ import os
 import re
 import sys
 import time
-import urllib.error
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
-import urllib.parse
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -60,6 +56,8 @@ SHEET_PAYMENT_PLAN = '付款计划'
 SHEET_COLLECTION_PLAN = '收款计划'
 SHEET_CONTRACT_ATTACHMENT = '合同附件'
 SHEET_OTHER_ATTACHMENT = '其他附件'
+ATTACHMENT_FOLDER_MAIN = '主文件'
+ATTACHMENT_FOLDER_ARCHIVE_SCAN = '归档扫描件'
 
 OUTPUT_SHEETS = (
     SHEET_MAIN,
@@ -95,18 +93,17 @@ DEFAULT_PREPAID = '否'
 DEFAULT_PAYMENT_NATURE = '一般付款'
 DEFAULT_CONTRACT_CREATOR_NAME = '黄劭文'
 
-ATTACHMENT_COOKIE_ENV = 'WEAVER_CONTRACT_ATTACHMENT_COOKIE'
-ATTACHMENT_BASE_URL_ENV = 'WEAVER_CONTRACT_ATTACHMENT_BASE_URL'
-ATTACHMENT_LOGIN_USERID_ENV = 'WEAVER_CONTRACT_ATTACHMENT_LOGIN_USERID'
-ATTACHMENT_AUTHORIZEMODE_ID_ENV = 'WEAVER_CONTRACT_ATTACHMENT_AUTHORIZEMODE_ID'
-ATTACHMENT_AUTHORIZEFIELD_ID_ENV = 'WEAVER_CONTRACT_ATTACHMENT_AUTHORIZEFIELD_ID'
-ATTACHMENT_DOWNLOAD_ROOT_ENV = 'WEAVER_CONTRACT_ATTACHMENT_DOWNLOAD_ROOT'
-ATTACHMENT_DOWNLOAD_ENABLED_ENV = 'WEAVER_CONTRACT_ATTACHMENT_DOWNLOAD_ENABLED'
-ATTACHMENT_DOWNLOAD_WORKERS_ENV = 'WEAVER_CONTRACT_ATTACHMENT_DOWNLOAD_WORKERS'
-DEFAULT_ATTACHMENT_BASE_URL = 'http://oaportal.heroesports.com'
-DEFAULT_ATTACHMENT_LOGIN_USERID = '3837'
-DEFAULT_ATTACHMENT_AUTHORIZEMODE_ID = '5'
-DEFAULT_ATTACHMENT_AUTHORIZEFIELD_ID = '6461'
+ATTACHMENT_COOKIE_ENV = c.ATTACHMENT_COOKIE_ENV
+ATTACHMENT_BASE_URL_ENV = c.ATTACHMENT_BASE_URL_ENV
+ATTACHMENT_LOGIN_USERID_ENV = c.ATTACHMENT_LOGIN_USERID_ENV
+ATTACHMENT_AUTHORIZEMODE_ID_ENV = c.ATTACHMENT_AUTHORIZEMODE_ID_ENV
+ATTACHMENT_AUTHORIZEFIELD_ID_ENV = c.ATTACHMENT_AUTHORIZEFIELD_ID_ENV
+ATTACHMENT_DOWNLOAD_ROOT_ENV = c.ATTACHMENT_DOWNLOAD_ROOT_ENV
+ATTACHMENT_DOWNLOAD_ENABLED_ENV = c.ATTACHMENT_DOWNLOAD_ENABLED_ENV
+ATTACHMENT_DOWNLOAD_WORKERS_ENV = c.ATTACHMENT_DOWNLOAD_WORKERS_ENV
+ATTACHMENT_DOWNLOAD_RETRIES_ENV = c.ATTACHMENT_DOWNLOAD_RETRIES_ENV
+download_attachment_manifest = c.download_attachment_manifest
+download_attachment_manifest_16_workers = c.download_attachment_manifest_16_workers
 ATTACHMENT_TYPE_DRAFT = '合同初稿'
 ATTACHMENT_TYPE_REVISED = '合同修订稿'
 ATTACHMENT_TYPE_SIGNED = '合同签署稿'
@@ -429,107 +426,6 @@ def _attachment_download_root():
     return OUTPUT_DIR / f'一般流程合同附件_{DATE_SUFFIX}'
 
 
-def _attachment_download_enabled(cookie):
-    flag = os.getenv(ATTACHMENT_DOWNLOAD_ENABLED_ENV, '').strip().lower()
-    if flag in ('0', 'false', 'n', 'no', '否'):
-        return False
-    return bool(_text(cookie))
-
-
-def _attachment_download_workers(default=8):
-    raw = os.getenv(ATTACHMENT_DOWNLOAD_WORKERS_ENV, '').strip()
-    if not raw:
-        return default
-    try:
-        workers = int(raw)
-    except ValueError:
-        return default
-    return max(1, min(workers, 32))
-
-
-def _build_attachment_referer(base_url, imagefileid, docid):
-    query = urllib.parse.urlencode({
-        'pdfimagefileid': imagefileid,
-        'authorizemodeId': os.getenv(ATTACHMENT_AUTHORIZEMODE_ID_ENV, DEFAULT_ATTACHMENT_AUTHORIZEMODE_ID),
-        'authorizefieldid': os.getenv(ATTACHMENT_AUTHORIZEFIELD_ID_ENV, DEFAULT_ATTACHMENT_AUTHORIZEFIELD_ID),
-        'docisLock': 'false',
-        'formmode_authorize': 'formmode_authorize',
-        'authorizeformmodebillId': docid,
-        'f_weaver_belongto_usertype': '0',
-        'f_weaver_belongto_userid': os.getenv(ATTACHMENT_LOGIN_USERID_ENV, DEFAULT_ATTACHMENT_LOGIN_USERID),
-        'canDownload': 'true',
-        'canPrint': 'true',
-    })
-    return f'{base_url.rstrip("/")}/docs/pdfview3.x/web/pdfViewer.jsp?&{query}'
-
-
-def _download_attachment_file(meta, cookie):
-    target_path = Path(meta['target_path'])
-    if target_path.exists() and target_path.stat().st_size > 0:
-        return 'skipped_exists', ''
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    base_url = os.getenv(ATTACHMENT_BASE_URL_ENV, DEFAULT_ATTACHMENT_BASE_URL)
-    url = f'{base_url.rstrip("/")}/weaver/weaver.file.FileDownload?fileid={meta["imagefileid"]}'
-    headers = {
-        'Accept': '*/*',
-        'Accept-Language': 'zh-CN,zh;q=0.9',
-        'Connection': 'keep-alive',
-        'User-Agent': (
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) '
-            'Chrome/146.0.0.0 Safari/537.36'
-        ),
-        'Cookie': cookie,
-        'Referer': _build_attachment_referer(base_url, meta['imagefileid'], meta['docid']),
-    }
-    temp_path = target_path.with_suffix(target_path.suffix + '.part')
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            data = resp.read()
-            final_url = resp.geturl()
-            content_type = resp.headers.get('Content-Type', '')
-            if 'login' in final_url.lower():
-                raise RuntimeError(f'跳转到登录页: {final_url}')
-            if 'text/html' in content_type.lower() and not _text(meta['attachment_name']).lower().endswith(('.html', '.htm')):
-                snippet = data[:200].decode('utf-8', errors='ignore')
-                raise RuntimeError(f'返回 HTML,疑似无权限或会话失效: {snippet}')
-            with open(temp_path, 'wb') as file:
-                file.write(data)
-        os.replace(temp_path, target_path)
-        return 'downloaded', ''
-    except (OSError, urllib.error.URLError, RuntimeError) as exc:
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
-        return 'failed', str(exc)
-
-
-def download_attachment_manifest(manifest_df, cookie, log_prefix='附件下载'):
-    """多线程下载附件,并把 status/error 写回 manifest_df 副本。"""
-    if manifest_df.empty:
-        return manifest_df.copy()
-    result_df = manifest_df.copy()
-    workers = _attachment_download_workers()
-    print(f'[{log_prefix}] 使用 {workers} 个下载线程')
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(_download_attachment_file, meta, cookie): index
-            for index, meta in result_df.iterrows()
-        }
-        total = len(futures)
-        for done_count, future in enumerate(as_completed(futures), 1):
-            index = futures[future]
-            try:
-                status, error = future.result()
-            except Exception as exc:  # 防御单个任务异常,不让整体下载中断。
-                status, error = 'failed', str(exc)
-            result_df.at[index, 'status'] = status
-            result_df.at[index, 'error'] = error
-            if done_count % 50 == 0 or done_count == total:
-                print(f'[{log_prefix}] 下载进度: {done_count}/{total}')
-    return result_df
-
-
 def _load_attachment_maps(docids):
     """一次 JOIN 取齐附件三表, 返回 (docimage_map, imagefile_map, docdetail_map)。
 
@@ -656,18 +552,33 @@ def _attachment_skip_reason(source, attachment_type):
     return ''
 
 
-def _assign_attachment_targets(candidate_rows):
+def _is_archived_contract(source):
+    status_text = _text(source.get('合同签署状态'))
+    status_id = c.format_code(source.get('合同签署状态ID'))
+    return '归档' in status_text or status_id == '2'
+
+
+def _assign_attachment_targets(candidate_rows, retention_mode='legacy'):
     """按合同维度分配目标附件类型。
 
-    规则:
+    legacy 规则:
       - 文件名以合同编号开头 -> 合同附件
       - 若目标稿件只有一个文件,即便不以合同编号开头,也作为合同附件
       - 若目标稿件多个文件且都不以合同编号开头,第一个作为合同附件,其余作为其他附件
       - 其余不以合同编号开头的文件作为其他附件
+
+    main_archive 规则:
+      - 已归档合同取生效版;主文件落「主文件」,归档扫描件落「归档扫描件」。
+      - 非归档/用印等合同取签署版;只落主文件和其他附件,不落归档扫描件。
+      - 文件名以合同编号开头时只保留第一条作为主文件;未以合同编号开头的文件为其他附件。
+      - 没有合同编号开头文件时,单文件或多文件第一条作为主文件,多文件其余为其他附件。
     """
     grouped = {}
     for row in candidate_rows:
         grouped.setdefault(_text(row.get('contract_number（合同编码）')), []).append(row)
+
+    if retention_mode == 'main_archive':
+        return _assign_attachment_targets_main_archive(grouped)
 
     assigned = []
     for contract_number, items in grouped.items():
@@ -690,6 +601,48 @@ def _assign_attachment_targets(candidate_rows):
                 item['attachment_sheet'] = SHEET_OTHER_ATTACHMENT
                 item['attachment_rule'] = '目标稿件但文件名未以合同编号开头'
             assigned.append(item)
+    return assigned
+
+
+def _assign_attachment_targets_main_archive(grouped):
+    assigned = []
+    for contract_number, items in grouped.items():
+        if not items:
+            continue
+        starts = [
+            _attachment_name_startswith_contract(item.get('attachment_name'), contract_number)
+            for item in items
+        ]
+        start_indexes = [index for index, startswith_contract in enumerate(starts) if startswith_contract]
+        main_index = start_indexes[0] if start_indexes else 0
+        archived = _is_archived_contract(items[main_index].get('_source', {}))
+
+        for index, item in enumerate(items):
+            if index == main_index:
+                main_item = item.copy()
+                main_item['attachment_sheet'] = ATTACHMENT_FOLDER_MAIN
+                if starts[index]:
+                    main_item['attachment_rule'] = '目标稿件且文件名以合同编号开头,保留1条作为主文件'
+                elif len(items) == 1:
+                    main_item['attachment_rule'] = '目标稿件仅1个文件,虽未以合同编号开头仍作为主文件'
+                else:
+                    main_item['attachment_rule'] = '目标稿件多个文件均未以合同编号开头,取第一个作为主文件'
+                assigned.append(main_item)
+
+                if archived:
+                    archive_item = item.copy()
+                    archive_item['attachment_sheet'] = ATTACHMENT_FOLDER_ARCHIVE_SCAN
+                    archive_item['attachment_rule'] = '已归档合同归档扫描件与主文件相同,保留1条'
+                    assigned.append(archive_item)
+                continue
+
+            if starts[index]:
+                # 同一合同编号开头的目标稿件只保留第一条作为主文件/归档扫描件。
+                continue
+            other_item = item.copy()
+            other_item['attachment_sheet'] = SHEET_OTHER_ATTACHMENT
+            other_item['attachment_rule'] = '目标稿件但文件名未以合同编号开头,作为其他附件'
+            assigned.append(other_item)
     return assigned
 
 
@@ -838,7 +791,7 @@ def _collect_attachment_docrefs(source_df):
     return docrefs_by_contract, raw_effective_docids, all_docids
 
 
-def build_contract_attachment_manifest(source_df):
+def build_contract_attachment_manifest(source_df, retention_mode='legacy'):
     docrefs_by_contract, raw_effective_docids, all_docids = _timed(
         '  ├─附件docref收集(表单/赛事字段)', lambda: _collect_attachment_docrefs(source_df))
     print(f'[计时]   ├─附件 docid 总数: {len(all_docids)}', flush=True)
@@ -913,10 +866,12 @@ def build_contract_attachment_manifest(source_df):
                     ),
                     'status': 'pending',
                     'error': '',
+                    '_source': source,
                 })
 
-    rows = _assign_attachment_targets(candidate_rows)
+    rows = _assign_attachment_targets(candidate_rows, retention_mode=retention_mode)
     for row in rows:
+        row.pop('_source', None)
         contract_number = _text(row.get('contract_number（合同编码）'))
         contract_dir = _sanitize_path_part(contract_number, f'contract_{_text(row.get("合同ID"))}')
         target_dir = download_root / contract_dir / _sanitize_path_part(row.get('attachment_type'), row.get('attachment_type'))

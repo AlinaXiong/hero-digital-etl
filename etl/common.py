@@ -13,6 +13,12 @@ import json
 import atexit
 import unicodedata
 import html
+import http.client
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
 
@@ -44,6 +50,20 @@ PROJECT_ORDER_CLEANABLE_COLUMN = '是否可洗流程'
 _PROJECT_ORDER_MAPPING_CACHE = None
 _CLEANED_PROJECT_MAPPING_CACHE = None
 _CLEANABLE_ORDER_INFO_CACHE = None
+
+ATTACHMENT_COOKIE_ENV = 'WEAVER_CONTRACT_ATTACHMENT_COOKIE'
+ATTACHMENT_BASE_URL_ENV = 'WEAVER_CONTRACT_ATTACHMENT_BASE_URL'
+ATTACHMENT_LOGIN_USERID_ENV = 'WEAVER_CONTRACT_ATTACHMENT_LOGIN_USERID'
+ATTACHMENT_AUTHORIZEMODE_ID_ENV = 'WEAVER_CONTRACT_ATTACHMENT_AUTHORIZEMODE_ID'
+ATTACHMENT_AUTHORIZEFIELD_ID_ENV = 'WEAVER_CONTRACT_ATTACHMENT_AUTHORIZEFIELD_ID'
+ATTACHMENT_DOWNLOAD_ROOT_ENV = 'WEAVER_CONTRACT_ATTACHMENT_DOWNLOAD_ROOT'
+ATTACHMENT_DOWNLOAD_ENABLED_ENV = 'WEAVER_CONTRACT_ATTACHMENT_DOWNLOAD_ENABLED'
+ATTACHMENT_DOWNLOAD_WORKERS_ENV = 'WEAVER_CONTRACT_ATTACHMENT_DOWNLOAD_WORKERS'
+ATTACHMENT_DOWNLOAD_RETRIES_ENV = 'WEAVER_CONTRACT_ATTACHMENT_DOWNLOAD_RETRIES'
+DEFAULT_ATTACHMENT_BASE_URL = 'http://oaportal.heroesports.com'
+DEFAULT_ATTACHMENT_LOGIN_USERID = '3837'
+DEFAULT_ATTACHMENT_AUTHORIZEMODE_ID = '5'
+DEFAULT_ATTACHMENT_AUTHORIZEFIELD_ID = '6461'
 
 
 # ============================ 配置 / 数据库 ============================
@@ -1681,6 +1701,160 @@ def _cell_text(value):
         return ''
     text = str(value).strip()
     return '' if text in ('', 'nan', 'None', 'NaT') else text
+
+
+def attachment_download_enabled(cookie):
+    flag = os.getenv(ATTACHMENT_DOWNLOAD_ENABLED_ENV, '').strip().lower()
+    if flag in ('0', 'false', 'n', 'no', '否'):
+        return False
+    return bool(_cell_text(cookie))
+
+
+def attachment_download_workers(default=8):
+    raw = os.getenv(ATTACHMENT_DOWNLOAD_WORKERS_ENV, '').strip()
+    if not raw:
+        return default
+    try:
+        workers = int(raw)
+    except ValueError:
+        return default
+    return max(1, min(workers, 32))
+
+
+def attachment_download_retries(default=3):
+    raw = os.getenv(ATTACHMENT_DOWNLOAD_RETRIES_ENV, '').strip()
+    if not raw:
+        return default
+    try:
+        retries = int(raw)
+    except ValueError:
+        return default
+    return max(1, min(retries, 10))
+
+
+def build_attachment_referer(base_url, imagefileid, docid):
+    query = urllib.parse.urlencode({
+        'pdfimagefileid': imagefileid,
+        'authorizemodeId': os.getenv(ATTACHMENT_AUTHORIZEMODE_ID_ENV, DEFAULT_ATTACHMENT_AUTHORIZEMODE_ID),
+        'authorizefieldid': os.getenv(ATTACHMENT_AUTHORIZEFIELD_ID_ENV, DEFAULT_ATTACHMENT_AUTHORIZEFIELD_ID),
+        'docisLock': 'false',
+        'formmode_authorize': 'formmode_authorize',
+        'authorizeformmodebillId': docid,
+        'f_weaver_belongto_usertype': '0',
+        'f_weaver_belongto_userid': os.getenv(ATTACHMENT_LOGIN_USERID_ENV, DEFAULT_ATTACHMENT_LOGIN_USERID),
+        'canDownload': 'true',
+        'canPrint': 'true',
+    })
+    return f'{base_url.rstrip("/")}/docs/pdfview3.x/web/pdfViewer.jsp?&{query}'
+
+
+def _download_attachment_file(meta, cookie, log_prefix='附件下载'):
+    target_path = Path(meta['target_path'])
+    if target_path.exists() and target_path.stat().st_size > 0:
+        return 'skipped_exists', ''
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    base_url = os.getenv(ATTACHMENT_BASE_URL_ENV, DEFAULT_ATTACHMENT_BASE_URL)
+    url = f'{base_url.rstrip("/")}/weaver/weaver.file.FileDownload?fileid={meta["imagefileid"]}'
+    headers = {
+        'Accept': '*/*',
+        'Accept-Language': 'zh-CN,zh;q=0.9',
+        'Connection': 'keep-alive',
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/146.0.0.0 Safari/537.36'
+        ),
+        'Cookie': cookie,
+        'Referer': build_attachment_referer(base_url, meta['imagefileid'], meta['docid']),
+    }
+    temp_path = target_path.with_suffix(target_path.suffix + '.part')
+    max_attempts = attachment_download_retries()
+    last_error = ''
+    for attempt in range(1, max_attempts + 1):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = resp.read()
+                final_url = resp.geturl()
+                content_type = resp.headers.get('Content-Type', '')
+                if 'login' in final_url.lower():
+                    raise RuntimeError(f'跳转到登录页: {final_url}')
+                if 'text/html' in content_type.lower() and not _cell_text(meta.get('attachment_name')).lower().endswith(('.html', '.htm')):
+                    snippet = data[:200].decode('utf-8', errors='ignore')
+                    raise RuntimeError(f'返回 HTML,疑似无权限或会话失效: {snippet}')
+                with open(temp_path, 'wb') as file:
+                    file.write(data)
+            os.replace(temp_path, target_path)
+            return ('downloaded', '') if attempt == 1 else ('downloaded', f'重试成功: 第{attempt}次')
+        except urllib.error.HTTPError as exc:
+            last_error = str(exc)
+            retryable = exc.code in (429, 500, 502, 503, 504)
+        except (http.client.IncompleteRead, urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+            last_error = str(exc)
+            retryable = True
+        except RuntimeError as exc:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+            return 'failed', str(exc)
+
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        if not retryable or attempt >= max_attempts:
+            break
+        print(
+            f'[{log_prefix}] 下载失败将重试({attempt}/{max_attempts}): '
+            f'{_cell_text(meta.get("contract_number（合同编码）"))} '
+            f'{_cell_text(meta.get("attachment_name"))}; {last_error}',
+            flush=True,
+        )
+        time.sleep(min(2 * attempt, 10))
+    return 'failed', last_error
+
+
+def download_attachment_manifest(manifest_df, cookie, log_prefix='附件下载'):
+    """多线程下载附件,并把 status/error 写回 manifest_df 副本。"""
+    if manifest_df.empty:
+        return manifest_df.copy()
+    result_df = manifest_df.copy()
+    workers = attachment_download_workers()
+    print(f'[{log_prefix}] 使用 {workers} 个下载线程')
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_download_attachment_file, meta, cookie, log_prefix): index
+            for index, meta in result_df.iterrows()
+        }
+        total = len(futures)
+        for done_count, future in enumerate(as_completed(futures), 1):
+            index = futures[future]
+            try:
+                status, error = future.result()
+            except Exception as exc:  # 防御单个任务异常,不让整体下载中断。
+                status, error = 'failed', str(exc)
+            result_df.at[index, 'status'] = status
+            result_df.at[index, 'error'] = error
+            if error and (status == 'failed' or '重试成功' in error):
+                meta = result_df.loc[index]
+                print(
+                    f'[{log_prefix}] {status}: '
+                    f'{_cell_text(meta.get("contract_number（合同编码）"))} '
+                    f'{_cell_text(meta.get("attachment_name"))}; {error}',
+                    flush=True,
+                )
+            if done_count % 50 == 0 or done_count == total:
+                print(f'[{log_prefix}] 下载进度: {done_count}/{total}')
+    return result_df
+
+
+def download_attachment_manifest_16_workers(manifest_df, cookie, log_prefix='附件下载'):
+    old_workers = os.environ.get(ATTACHMENT_DOWNLOAD_WORKERS_ENV)
+    os.environ[ATTACHMENT_DOWNLOAD_WORKERS_ENV] = '16'
+    try:
+        return download_attachment_manifest(manifest_df, cookie, log_prefix=log_prefix)
+    finally:
+        if old_workers is None:
+            os.environ.pop(ATTACHMENT_DOWNLOAD_WORKERS_ENV, None)
+        else:
+            os.environ[ATTACHMENT_DOWNLOAD_WORKERS_ENV] = old_workers
 
 
 def split_fanwei_project_codes(value):
