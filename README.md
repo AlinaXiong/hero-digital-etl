@@ -12,9 +12,13 @@
 | `ap_payment_opening_extra_db` | 应付期初 - 对公付款单补充三 tab(DB直连版) | `ap_payment_opening_db` 口径 + 泛微 `uf_plfy` / `uf_plfy_dt1` + `uf_xtyynbsz` / `uf_xtyynbsz_dt10` / `view_costlist_ys` | 英雄期初对公付款单导入模版 |
 | `ap_prepayment_opening_db` | 预付期初 - 供应商预付款单 + 零工预付款单(DB直连版) | 泛微 `uf_yfkxx` + `uf_yfkxx_dt1` + `uf_dgfktz_dt2`；`uf_lgptfk` + `formtable_main_279` + `formtable_main_279_dt3` + `formtable_main_279_dt4` | 英雄期初预付款单导入模版 |
 | `ar_invoice_opening_db` | 应收期初 - 应收报账单(DB直连版) | 泛微 `uf_xtyykp` + `uf_skdj` | 应收报账单期初数据导入模板 |
-| `contract_anchor_db` | 合同迁移 - 智书主播流程(DB直连版) | 泛微 `uf_htk` + `uf_zbkp` / `uf_zbkp_dt1` | 智书合同字段-主播流程 |
-| `contract_general_db` | 合同迁移 - 智书一般流程(DB直连版) | 泛微 `uf_htk` + 项目&订单清洗表 | 智书合同字段-一般流程 |
-| `contract_general_attachments_db` | 合同迁移 - 一般流程附件下载(DB直连版) | 泛微 `uf_htk` + `workflow_docshareinfo` / `docimagefile` | 合同初稿/合同签署稿/合同生效稿 |
+| `contract_general_db` | 合同迁移 - 一般流程 Excel 导出 | 泛微 `uf_htk` + 项目&订单清洗表 | 智书合同字段-一般流程 |
+| `contract_general_attachments_db` | 合同迁移 - 一般流程附件下载 | 泛微合同稿件字段 + `workflow_docshareinfo` / `docimagefile` | 一般流程合同附件 + 下载清单 |
+| `contract_anchor_db` | 合同迁移 - 主播流程 Excel 导出 | 泛微 `uf_htk` + `uf_zbkp` / `uf_zbkp_dt1` + Hand 主播档案 | 智书合同字段-主播流程 |
+| `contract_anchor_attachments_db` | 合同迁移 - 主播流程附件下载 | 主播合同清洗口径 + 泛微合同稿件字段 | 主播流程合同附件 + 下载清单 |
+| `contract_anti_bribery_db` | 合同迁移 - 反商业贿赂协议 Excel 导出 | 泛微一般合同/赛事合同 + 反贿赂模板 | 反商业贿赂协议清洗结果 |
+| `contract_anti_bribery_attachments_db` | 合同迁移 - 反商业贿赂协议附件下载 | 反贿赂合同清洗口径 + 泛微合同稿件字段 | 反贿赂合同附件 + 下载清单 |
+| `export_feishu_employees` | 飞书全量员工信息导出（合同相关辅助任务） | 飞书 CoreHR 员工接口 | 飞书员工信息 Excel |
 | `invoice_info_db` | 发票信息(DB直连版) | 泛微 `fnainvoiceledger` + `fnainvoiceledgerdtl` | 发票信息清洗导入表 |
 | `all` | 一次跑核心 DB 导入任务 | 依次执行 `ap_payment_opening_extra_db`、`ap_prepayment_opening_db`、`ar_invoice_opening_db`、`invoice_info_db` | 多个模板/清洗表 |
 | `contract_all` | 一次跑所有合同任务(不含附件下载) | 依次执行 `contract_general_db`、`contract_anchor_db`、`contract_anti_bribery_db` | 智书合同各模板 |
@@ -39,13 +43,15 @@ python run.py all
 
 ### contract_all / contract_all_with_attachments（一键执行合同任务）
 
-`contract_all` 串行跑合同的三个数据/导入任务，**不下载附件**：
+合同迁移本体共有 **6 个任务**：一般流程、主播流程、反商业贿赂协议各包含一个 Excel 导出任务和一个附件下载任务。
+
+`contract_all` 串行执行其中 3 个 Excel 导出任务，**不下载附件**：
 
 1. `contract_general_db`（一般流程 Excel）
 2. `contract_anchor_db`（主播流程 Excel）
 3. `contract_anti_bribery_db`（反商业贿赂协议 Excel）
 
-`contract_all_with_attachments` 在上面三个之后，再依次下载三类合同附件：
+`contract_all_with_attachments` 在上面三个之后，再依次执行 3 个附件下载任务，因此会完整执行全部 6 个合同迁移任务：
 
 4. `contract_general_attachments_db`
 5. `contract_anchor_attachments_db`
@@ -53,11 +59,14 @@ python run.py all
 
 先出全部导入 Excel 再下载附件：即使附件下载因 cookie 失效中断，导入 Excel 也已生成。附件下载依赖 `.env` 的 `WEAVER_CONTRACT_ATTACHMENT_COOKIE`，为空时只生成下载清单。与 `all` 一致，任一子任务失败即报错退出。
 
+此外还有 1 个合同相关辅助任务 `export_feishu_employees`，用于将飞书 CoreHR 全量员工信息导出为 Excel，方便人工核对申请人、合同执行人及接收人的在职状态。它不计入上述 6 个合同迁移任务，也不会由 `contract_all` 或 `contract_all_with_attachments` 自动执行；合同清洗任务本身仍直接调用飞书接口获取在职状态。
+
 执行命令：
 
 ```bash
 python run.py contract_all                    # 不含附件下载
 python run.py contract_all_with_attachments   # 含附件下载
+python run.py export_feishu_employees          # 单独导出飞书全量员工信息
 ```
 
 ### ap_payment_opening_db（应付期初 - 对公付款单 DB 直连版）
