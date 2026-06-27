@@ -692,7 +692,8 @@ SELECT
     d.sfzh AS `身份证号`,
     d.yhzh AS `明细银行账号`,
     d.sjh AS `手机号`,
-    COALESCE(d.skje, d.dkje) AS `收款金额`
+    d.skje AS `收款金额`,
+    d.dkje AS `打款金额`
 FROM formtable_main_33 m
 JOIN formtable_main_33_dt2 d ON d.mainid = m.id
 WHERE (m.fkpt IS NULL OR CAST(m.fkpt AS CHAR) <> %(direct_payment_code)s)
@@ -720,7 +721,7 @@ SELECT * FROM (
         d.xmmc AS `项目名称`,
         d.fjxh AS `费用项编码`,
         d.fyx AS `费用项名称`,
-        COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
+        d.ddje AS `金额`,
         COALESCE(od.ddbh, d.ddh) AS `泛微订单编号`,
         d.zbid AS `主播房间号`,
         d.zbnc AS `主播昵称`
@@ -751,7 +752,7 @@ SELECT * FROM (
         d.xmmc AS `项目名称`,
         d.fjxh AS `费用项编码`,
         d.fyx AS `费用项名称`,
-        COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
+        d.ddje AS `金额`,
         COALESCE(od.ddbh, d.ptpqh) AS `泛微订单编号`,
         d.zbid AS `主播房间号`,
         d.zbnc AS `主播昵称`
@@ -782,7 +783,7 @@ SELECT * FROM (
         d.xmmc AS `项目名称`,
         d.fjxh AS `费用项编码`,
         d.fyx AS `费用项名称`,
-        COALESCE(d.ddje, d.zcje, d.sdzc, d.jsje) AS `金额`,
+        d.ddje AS `金额`,
         COALESCE(od.ddbh, d.ptpqh) AS `泛微订单编号`,
         d.zbid AS `主播房间号`,
         d.zbmc AS `主播昵称`
@@ -813,7 +814,7 @@ SELECT * FROM (
         d.xmmc AS `项目名称`,
         d.fjxh AS `费用项编码`,
         d.fyx AS `费用项名称`,
-        COALESCE(d.fkje, d.zcje, d.jsje) AS `金额`,
+        d.fkje AS `金额`,
         COALESCE(od.ddbh, d.ddh) AS `泛微订单编号`,
         NULL AS `主播房间号`,
         NULL AS `主播昵称`
@@ -2159,15 +2160,59 @@ def allocate_mcn_fee_to_recipients(fee_df, recipient_df):
     return pd.DataFrame(rows)
 
 
-def build_mcn_gig_output(source_df, anchor_payee_category=False):
+def _recipient_amount_text(value):
+    amount = pd.to_numeric(value, errors='coerce')
+    return '' if pd.isna(amount) else f'{c.round_amount(amount):.2f}'
+
+
+def attach_mcn_recipient_notes(
+        source_df, recipient_df, amount_column='收款金额', amount_label='收款金额'):
+    """源费用/订单明细保持一行一条，并把同流程全部收款人汇总到备注。"""
+    df = source_df.copy()
+    if df.empty:
+        return df
+
+    notes_by_doc = {}
+    if not recipient_df.empty:
+        for doc_id, recipient_group in recipient_df.groupby('ID', sort=False, dropna=False):
+            details = []
+            for _, recipient_row in recipient_group.iterrows():
+                payee = _text(recipient_row.get('实际收款方'))
+                amount = _recipient_amount_text(recipient_row.get(amount_column))
+                if payee or amount:
+                    details.append(f'收款人：{payee}，{amount_label}：{amount}')
+            notes_by_doc[doc_id] = '；'.join(details)
+    df['收款人明细备注'] = df['ID'].map(notes_by_doc).fillna('')
+    return df
+
+
+def build_mcn_gig_output(
+        source_df, anchor_payee_category=False, counterparty_company_payee=False):
     if source_df.empty:
         return pd.DataFrame(columns=GIG_OUTPUT_COLUMNS)
 
-    by_id_number, by_name = build_individual_vendor_maps(source_df)
     entity_map = c.build_accounting_entity_map_for_names(source_df['公司主体'])
     subject_lookup = c.build_subject_map()
-    vendor_infos = [resolve_individual_vendor_info(row, by_id_number, by_name) for _, row in source_df.iterrows()]
-    amount = pd.to_numeric(source_df['预付款金额分摊'] if '预付款金额分摊' in source_df.columns else source_df['金额'], errors='coerce')
+    if counterparty_company_payee:
+        counterparty_vendor_map = c.build_hand_vendor_info_by_names(source_df['供应商'])
+        payee_codes = source_df['供应商'].map(
+            lambda value: counterparty_vendor_map.get(c.normalize_name(value), {}).get('code', '')
+        )
+    else:
+        by_id_number, by_name = build_individual_vendor_maps(source_df)
+        vendor_infos = [
+            resolve_individual_vendor_info(row, by_id_number, by_name)
+            for _, row in source_df.iterrows()
+        ]
+        payee_codes = pd.Series([
+            info.get('code', '') or _text(payee)
+            for info, payee in zip(vendor_infos, source_df['实际收款方'])
+        ], index=source_df.index)
+    if counterparty_company_payee or '预付款金额分摊' not in source_df.columns:
+        amount_source = source_df['金额']
+    else:
+        amount_source = source_df['预付款金额分摊']
+    amount = pd.to_numeric(amount_source, errors='coerce')
 
     output_df = pd.DataFrame(index=source_df.index)
     output_df['来源系统'] = SOURCE_SYSTEM
@@ -2191,13 +2236,18 @@ def build_mcn_gig_output(source_df, anchor_payee_category=False):
     output_df['费用项目编码'] = source_df['费用项编码'].map(lambda value: _mcn_fee_subject_item(subject_lookup, value, 0))
     output_df['费用项目描述'] = source_df['费用项编码'].map(lambda value: _mcn_fee_subject_item(subject_lookup, value, 1))
     output_df['收款方类别'] = '主播' if anchor_payee_category else '供应商'
-    output_df['收款方编码'] = [
-        info.get('code', '') or _text(payee)
-        for info, payee in zip(vendor_infos, source_df['实际收款方'])
-    ]
-    output_df['备注'] = ''
+    output_df['收款方编码'] = payee_codes
+    output_df['备注'] = (
+        source_df.get('收款人明细备注', pd.Series('', index=source_df.index))
+        if counterparty_company_payee else ''
+    )
+    bank_account_source = (
+        source_df['银行账号']
+        if counterparty_company_payee
+        else source_df['明细银行账号']
+    )
     output_df['银行账号'] = c.resolve_hand_vendor_bank_accounts(
-        output_df['收款方编码'], source_df['明细银行账号'])
+        output_df['收款方编码'], bank_account_source)
     output_df['预付款支付币种'] = 'CNY'
     output_df['预付款金额（支付币种）'] = amount.map(c.round_amount)
     output_df['传送状态'] = '传送成功'
@@ -2437,7 +2487,9 @@ def read_mcn_supplier_sources():
     return source_by_sheet
 
 
-def _read_mcn_platform_gig_source(sheet_name, fee_sql, recipient_sql, params):
+def _read_mcn_platform_gig_source(
+        sheet_name, fee_sql, recipient_sql, params, keep_source_rows=False,
+        note_amount_column='收款金额', note_amount_label='收款金额'):
     fee_df = _prepare_mcn_platform_columns(_query_fw(fee_sql, params))
     fee_df = _filter_by_project_whitelist(
         fee_df, '项目编号ID', MCN_PROJECT_SHEET, MCN_PROJECT_TABLES,
@@ -2447,7 +2499,15 @@ def _read_mcn_platform_gig_source(sheet_name, fee_sql, recipient_sql, params):
     recipient_df = _query_fw(recipient_sql, params)
     if not fee_df.empty and not recipient_df.empty:
         recipient_df = recipient_df[recipient_df['ID'].isin(fee_df['ID'].dropna().unique())].copy()
-    merged_df = allocate_mcn_fee_to_recipients(fee_df, recipient_df)
+    merged_df = (
+        attach_mcn_recipient_notes(
+            fee_df, recipient_df,
+            amount_column=note_amount_column,
+            amount_label=note_amount_label,
+        )
+        if keep_source_rows
+        else allocate_mcn_fee_to_recipients(fee_df, recipient_df)
+    )
     print(f'[预付期初-{sheet_name}] SQL明细行数:', len(merged_df))
     return merged_df
 
@@ -2467,12 +2527,16 @@ def read_mcn_gig_sources():
             MCN_OUTBOUND_FEE_SOURCE_SQL,
             MCN_OUTBOUND_RECIPIENT_SOURCE_SQL,
             params,
+            keep_source_rows=True,
+            note_amount_column='打款金额',
+            note_amount_label='打款金额',
         ),
         SHEET_MCN_OUTBOUND_ORDER_PREPAYMENT: _read_mcn_platform_gig_source(
             SHEET_MCN_OUTBOUND_ORDER_PREPAYMENT,
             MCN_OUTBOUND_ORDER_FEE_SOURCE_SQL,
             MCN_OUTBOUND_ORDER_RECIPIENT_SOURCE_SQL,
             params,
+            keep_source_rows=True,
         ),
     }
 
@@ -2540,10 +2604,12 @@ def run():
         SHEET_MCN_OUTBOUND_PREPAYMENT: build_mcn_gig_output(
             mcn_gig_sources[SHEET_MCN_OUTBOUND_PREPAYMENT],
             anchor_payee_category=False,
+            counterparty_company_payee=True,
         ),
         SHEET_MCN_OUTBOUND_ORDER_PREPAYMENT: build_mcn_gig_output(
             mcn_gig_sources[SHEET_MCN_OUTBOUND_ORDER_PREPAYMENT],
             anchor_payee_category=False,
+            counterparty_company_payee=True,
         ),
         SHEET_MCN_ANCHOR_PLATFORM_PREPAYMENT: build_mcn_gig_output(
             mcn_gig_sources[SHEET_MCN_ANCHOR_PLATFORM_PREPAYMENT],
