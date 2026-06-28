@@ -32,7 +32,7 @@ from etl.process.ap_prepayment_opening_db import build_fw_project_code_map_for_i
 
 # ============================ 文件 / 模板 ============================
 TASK_NAME = 'contract_general_db'
-TEMPLATE_DIR = c.TPL_DIR / 'contract_anchor_db'
+TEMPLATE_DIR = c.TPL_DIR / 'contract'
 OUTPUT_DIR = c.OUT_DIR / TASK_NAME
 DATE_SUFFIX = c.today_suffix()
 

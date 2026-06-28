@@ -136,7 +136,7 @@ DB 直连版源数据不读 Excel；供应商预付从泛微 `uf_yfkxx` / `uf_yf
 
 ### 0619 项目/订单清洗映射
 
-项目和订单字段统一从 `data/source/other_cleaned_data/业财项目_项目&订单清洗_0619.xlsx` 读取；如文件放在其他位置，可通过环境变量 `PROJECT_ORDER_MAPPING_XLSX` 指定完整路径。
+项目和订单字段统一从 `resources/source/other_cleaned_data/业财项目_项目&订单清洗_0619.xlsx` 读取；如文件放在其他位置，可通过环境变量 `PROJECT_ORDER_MAPPING_XLSX` 指定完整路径。
 
 - **使用 sheet**：`全量项目_清洗后` + `全量订单主表_清洗后`。
 - **公共方法**：所有提取对应关系的逻辑都放在 `etl/util/common.py`，任务文件只调用 `c.project_order_mapping_value(...)` 和 `c.collect_order_mapping_issues(...)`。
@@ -220,14 +220,15 @@ hero-digital-etl/
 │   └── lark/
 │       ├── feishu.py                   #   飞书(Lark)客户端
 │       └── export_feishu_employees.py  #   全量员工信息导出Excel
-├── data/
+├── resources/
 │   ├── source/<任务名>/                # 各任务源表(文件名保持来源系统原名)
 │   ├── rules/业财项目_数据映射规则.xlsx
-│   └── templates/<任务名>/             # 各任务导入模板
+│   ├── templates/<任务名>/             # 各任务导入模板
+│   └── reference/                      # 字段字典等参考资料(ETL 不读)
 └── output/<任务名>/                    # 各任务产出(导入文件 + 未匹配清单)
 ```
 
-约定：每个任务用同一个任务名作为目录名，`data/source/`、`data/templates/`、`output/` 下都建同名文件夹。产出文件统一用运行当天日期后缀，如 `_20260614.xlsx`。
+约定：每个任务用同一个任务名作为目录名，`resources/source/`、`resources/templates/`、`output/` 下都建同名文件夹。产出文件统一用运行当天日期后缀，如 `_20260614.xlsx`。
 
 ## 快速开始
 
@@ -293,7 +294,7 @@ WHERE b.tablename = 'uf_dgfktz';
 ## 新增任务规范
 
 1. 在 `etl/<分组>/`（contract / process / invoice / lark）下新建任务文件，文件名用清晰英文名，不用拼音。
-2. 在 `data/source/<任务名>/`、`data/templates/<任务名>/` 放源表与模板。
+2. 在 `resources/source/<任务名>/`、`resources/templates/<任务名>/` 放源表与模板。
 3. 在 `run.py` 的 `TASKS` 字典登记任务名。
 4. 行过滤口径(`filter_main`)写在各任务文件内（各任务差异大）；公共能力复用 `etl/util/common.py`（数据库连接、工号/供应商/核算主体/科目映射、币种转换、归一化、必输字段识别、未匹配清单、模板写入）。
 
@@ -302,4 +303,4 @@ WHERE b.tablename = 'uf_dgfktz';
 - 代码注释与 docstring 用中文，方便业务核对口径。
 - 文件名、目录名、函数名、变量名、常量名必须用英文，不用中文也不用拼音。
 - 业务字段名、Excel 表头、sheet 名、展示用文件名可保留来源系统/模板里的中文。
-- `data/source/` 下的源数据文件保持来源系统原名，不重命名，便于溯源对账。
+- `resources/source/` 下的源数据文件保持来源系统原名，不重命名，便于溯源对账。

@@ -30,9 +30,9 @@ from sqlalchemy.engine import URL
 
 # ============================ 路径 ============================
 ROOT      = Path(__file__).resolve().parents[2]
-SRC_DIR   = ROOT / 'data' / 'source'       # 源表(泛微导出)
-RULES_DIR = ROOT / 'data' / 'rules'        # 映射规则
-TPL_DIR   = ROOT / 'data' / 'templates'    # 导入模版
+SRC_DIR   = ROOT / 'resources' / 'source'       # 源表(泛微导出)
+RULES_DIR = ROOT / 'resources' / 'rules'        # 映射规则
+TPL_DIR   = ROOT / 'resources' / 'templates'    # 导入模版
 OUT_DIR   = ROOT / 'output'                # 产出
 RULE_XLSX = RULES_DIR / '业财项目_数据映射规则.xlsx'
 SUPPLIER_VENDOR_MAPPING_JSON = SRC_DIR / 'supplier_vendor_aliases.json'

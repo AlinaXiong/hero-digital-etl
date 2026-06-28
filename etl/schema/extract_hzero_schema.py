@@ -29,7 +29,8 @@ DB_CONFIG = {
     'charset': 'utf8',
 }
 
-OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'resources', 'reference')
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # 业务数据库列表
 BIZ_DATABASES = [

@@ -29,7 +29,7 @@ from etl.contract import contract_general_db as base
 
 # ============================ 文件 / 模板 ============================
 TASK_NAME = 'contract_anchor_db'
-TEMPLATE_DIR = c.TPL_DIR / TASK_NAME
+TEMPLATE_DIR = c.TPL_DIR / 'contract'
 OUTPUT_DIR = c.OUT_DIR / TASK_NAME
 DATE_SUFFIX = c.today_suffix()
 

@@ -9,7 +9,7 @@
 「供应商ID」「供应商汉得编码」「供应商汉得名称」列,
 用于补齐底稿里前序合同缺失/过期的信息。
 
-不改动模板 data/templates/contract_anchor_db/反商业贿赂协议签署情况.xlsx,
+不改动模板 resources/templates/contract/反商业贿赂协议签署情况.xlsx,
 而是以它为底稿,另存为带日期后缀的新文件
     output/anti_bribery_signers_db/反商业贿赂协议签署情况_<YYYYMMDD>.xlsx。
 
