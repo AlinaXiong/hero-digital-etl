@@ -87,6 +87,13 @@ UNMATCHED_KEEP_NODE_NAMES = {
     '归档', '上传电子档', '法务确认', '用印',
     '申请人确认签约性质', '申请人确定签约性质',
 }
+EXCLUDED_OUR_PARTY_NAMES = {
+    '苏州厚音文化传媒有限公司',
+}
+EXCLUDED_OUR_PARTY_NAME_KEYS = {
+    c.normalize_name(name)
+    for name in EXCLUDED_OUR_PARTY_NAMES
+}
 
 # 法务确认: 以下主播收益/签约金/底薪类字段不参与“必输字段未达100%”校验。
 REQUIRED_CHECK_EXCLUDED_FIELDS = {
@@ -1304,6 +1311,44 @@ def build_supplier_info_map_for_values(supplier_values):
     return result
 
 
+def _excluded_our_party_infos(company_value, company_info_map):
+    """返回合同我方主体中命中排除名单的主体信息。"""
+    excluded_codes = {
+        _text(info.get('code'))
+        for info in company_info_map.values()
+        if c.normalize_name(info.get('name')) in EXCLUDED_OUR_PARTY_NAME_KEYS
+        and _text(info.get('code'))
+    }
+    matched = []
+    for company_id in c.parse_browser_ids(company_value):
+        info = company_info_map.get(company_id, {})
+        if (
+            c.normalize_name(info.get('name')) in EXCLUDED_OUR_PARTY_NAME_KEYS
+            or _text(info.get('code')) in excluded_codes
+        ):
+            matched.append((company_id, info))
+    return matched
+
+
+def _build_excluded_our_party_audit(source_df, company_info_map):
+    rows = []
+    for _, source in source_df.iterrows():
+        for company_id, info in _excluded_our_party_infos(
+                source.get('合同用印范围ID'), company_info_map):
+            rows.append({
+                '合同编号': _text(source.get('合同编号')),
+                '合同标题': _text(source.get('合同标题')),
+                '合同用印范围ID': company_id,
+                '我方主体名称': info.get('name', ''),
+                'our_party_code（我方主体编码）': info.get('code', ''),
+                '说明': '我方主体为苏州厚音文化传媒有限公司,不导入',
+            })
+    return pd.DataFrame(rows, columns=[
+        '合同编号', '合同标题', '合同用印范围ID', '我方主体名称',
+        'our_party_code（我方主体编码）', '说明',
+    ])
+
+
 def build_anchor_vendor_info_maps(source_df):
     """主播 -> Hand 个人供应商编码,使对方信息里的主播编码与供应商口径一致。
 
@@ -2256,9 +2301,10 @@ def resolve_source_values(source_df):
         FW_TABLE,
         ['htlx', 'htejlx', 'htzt', 'szpt', 'bglx'],
     )
+    company_info_map = build_fw_company_info_map_for_values(df['合同用印范围ID'])
+    excluded_our_party_df = _build_excluded_our_party_audit(df, company_info_map)
     employee_map = c.build_fw_employee_info_map_for_ids(
         pd.concat([df['合同执行人员ID'], df['合同创建人ID'], df['申请人ID']], ignore_index=True))
-    company_info_map = build_fw_company_info_map_for_values(df['合同用印范围ID'])
     customer_info_map = build_customer_info_map_for_values(df['合同客户ID'])
     supplier_info_map = build_supplier_info_map_for_values(df['合同供应商ID'])
     project_info_map = build_fw_project_info_map_for_ids(df['合同所属项目编号ID'])
@@ -2444,11 +2490,27 @@ def resolve_source_values(source_df):
     ]
     df['推导合同总额'] = df.apply(resolve_contract_amount, axis=1)
 
-    hand_matched_df = df.loc[~no_hand_anchor_mask].copy()
-    hand_unmatched_df = df.loc[no_hand_anchor_mask].copy()
+    excluded_our_party_mask = df['合同用印范围ID'].map(
+        lambda value: bool(_excluded_our_party_infos(value, company_info_map)))
+    eligible_mask = ~excluded_our_party_mask
+    hand_matched_df = df.loc[eligible_mask & ~no_hand_anchor_mask].copy()
+    hand_unmatched_df = df.loc[eligible_mask & no_hand_anchor_mask].copy()
     unmatched_keep_mask = hand_unmatched_df.apply(_is_unmatched_contract_kept, axis=1)
     retained_unmatched_df = hand_unmatched_df.loc[unmatched_keep_mask].copy()
     excluded_unmatched_df = hand_unmatched_df.loc[~unmatched_keep_mask].copy()
+    excluded_final_candidate_count = int((
+        excluded_our_party_mask
+        & (
+            ~no_hand_anchor_mask
+            | df.apply(_is_unmatched_contract_kept, axis=1)
+        )
+    ).sum())
+    print(
+        '[合同迁移-主播流程] 排除指定我方主体: '
+        f'源合同 {int(excluded_our_party_mask.sum())} 条; '
+        f'原最终候选 {excluded_final_candidate_count} 条; '
+        f'我方主体={"/".join(sorted(EXCLUDED_OUR_PARTY_NAMES))}'
+    )
 
     hand_matched_df['主播处理分组'] = 'Hand生产可查'
     retained_unmatched_df['主播处理分组'] = 'Hand生产不可查_条件保留'
@@ -2501,6 +2563,7 @@ def resolve_source_values(source_df):
     result_df.attrs['excluded_no_hand_anchor_df'] = excluded_summary
     result_df.attrs['retained_no_hand_anchor_df'] = retained_summary
     result_df.attrs['anchor_replacement_missing_df'] = replacement_missing
+    result_df.attrs['excluded_our_party_df'] = excluded_our_party_df
     print(
         '[合同迁移-主播流程] 最终保留口径: '
         f'Hand生产可查 {len(hand_matched_df)}; '
@@ -2883,6 +2946,10 @@ def collect_anchor_replacement_missing(source_df):
     return source_df.attrs.get('anchor_replacement_missing_df', pd.DataFrame()).drop_duplicates()
 
 
+def collect_excluded_our_party(source_df):
+    return source_df.attrs.get('excluded_our_party_df', pd.DataFrame()).drop_duplicates()
+
+
 def collect_contract_creator_audit(source_df):
     columns = [
         '主播处理分组', '合同编号', '合同标题', '合同有效期截止时间',
@@ -2976,6 +3043,7 @@ def run():
         'Hand主播档案未命中_不导入': collect_excluded_no_hand_anchor(source_df),
         'Hand未命中_条件保留': collect_retained_no_hand_anchor(source_df),
         '主播替换ID_未匹配': collect_anchor_replacement_missing(source_df),
+        '排除我方主体_不导入': collect_excluded_our_party(source_df),
         '申请人在职替换核对': collect_contract_creator_audit(source_df),
         '主播卡片补充信息_未匹配': collect_missing_anchor_card(source_df),
         '最终主播卡片_未匹配': collect_missing_final_anchor_card(source_df),
