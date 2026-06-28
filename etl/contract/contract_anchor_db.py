@@ -97,6 +97,15 @@ EXCLUDED_OUR_PARTY_NAME_KEYS = {
     c.normalize_name(name)
     for name in EXCLUDED_OUR_PARTY_NAMES
 }
+EXCLUDED_CONTRACT_NUMBERS = {
+    '-T-202202233',
+    '-B-202402005',
+    'CQ-J-202311001',
+}
+EXCLUDED_CONTRACT_NUMBER_KEYS = {
+    re.sub(r'\s+', '', number).upper()
+    for number in EXCLUDED_CONTRACT_NUMBERS
+}
 
 # 法务确认: 以下主播收益/签约金/底薪类字段不参与“必输字段未达100%”校验。
 REQUIRED_CHECK_EXCLUDED_FIELDS = {
@@ -2298,6 +2307,30 @@ def resolve_contract_amount(row):
     return round(in_amount + out_amount, 2)
 
 
+def _build_hand_exact_anchor_id_set(card_values):
+    """精确查询 Hand 生产主播档案两张表,返回存在的 header_id。"""
+    card_ids = c.clean_codes(card_values)
+    matched_ids = set()
+    for batch in _chunked(card_ids, 300):
+        placeholders = c.in_placeholders(batch)
+        list_df = c.query_db(
+            'HAND',
+            'hfins',
+            f'SELECT header_id FROM anchor_profile_list WHERE header_id IN ({placeholders})',
+            batch,
+        )
+        header_df = c.query_db(
+            'HAND',
+            'hfins',
+            f'SELECT header_id FROM anchor_profile_header WHERE header_id IN ({placeholders}) '
+            "AND (delete_flag IS NULL OR delete_flag <> 'Y')",
+            batch,
+        )
+        matched_ids.update(c.format_code(value) for value in list_df.get('header_id', []))
+        matched_ids.update(c.format_code(value) for value in header_df.get('header_id', []))
+    return matched_ids
+
+
 def resolve_source_values(source_df):
     df = source_df.copy()
     option_maps = c.build_fw_select_option_maps(
@@ -2495,7 +2528,14 @@ def resolve_source_values(source_df):
 
     excluded_our_party_mask = df['合同用印范围ID'].map(
         lambda value: bool(_excluded_our_party_infos(value, company_info_map)))
-    eligible_mask = ~excluded_our_party_mask
+    excluded_contract_mask = df['合同编号'].map(_contract_number_key).isin(
+        EXCLUDED_CONTRACT_NUMBER_KEYS)
+    excluded_contract_df = df.loc[excluded_contract_mask, [
+        '合同编号', '合同标题', '合同审批状态', '合同有效期截止时间',
+        '原合同主播卡片ID', '主播卡片ID',
+    ]].copy()
+    excluded_contract_df['说明'] = '指定合同编号,主播流程不导入'
+    eligible_mask = ~(excluded_our_party_mask | excluded_contract_mask)
     hand_matched_df = df.loc[eligible_mask & ~no_hand_anchor_mask].copy()
     hand_unmatched_df = df.loc[eligible_mask & no_hand_anchor_mask].copy()
     unmatched_keep_mask = hand_unmatched_df.apply(_is_unmatched_contract_kept, axis=1)
@@ -2513,6 +2553,11 @@ def resolve_source_values(source_df):
         f'源合同 {int(excluded_our_party_mask.sum())} 条; '
         f'原最终候选 {excluded_final_candidate_count} 条; '
         f'我方主体={"/".join(sorted(EXCLUDED_OUR_PARTY_NAMES))}'
+    )
+    print(
+        '[合同迁移-主播流程] 排除指定合同: '
+        f'{int(excluded_contract_mask.sum())} 条; '
+        f'合同编号={"/".join(sorted(EXCLUDED_CONTRACT_NUMBERS))}'
     )
 
     hand_matched_df['主播处理分组'] = 'Hand生产可查'
@@ -2532,6 +2577,14 @@ def resolve_source_values(source_df):
     retained_unmatched_df = _apply_unmatched_anchor_replacements(retained_unmatched_df)
 
     result_df = pd.concat([hand_matched_df, retained_unmatched_df]).sort_index()
+    hand_exact_anchor_ids = _build_hand_exact_anchor_id_set(result_df['主播卡片导入ID'])
+    result_df['主播卡片Hand生产可查'] = result_df['主播卡片导入ID'].map(
+        lambda value: c.format_code(value) in hand_exact_anchor_ids)
+    print(
+        '[合同迁移-主播流程] 最终主播卡片ID Hand精确命中: '
+        f'{int(result_df["主播卡片Hand生产可查"].sum())}/{len(result_df)}; '
+        f'未命中字段置空 {int((~result_df["主播卡片Hand生产可查"]).sum())}'
+    )
     anchor_vendor_by_id, anchor_vendor_by_name = build_anchor_vendor_info_maps(result_df)
     result_df.attrs['anchor_vendor_by_id_number'] = anchor_vendor_by_id
     result_df.attrs['anchor_vendor_by_name'] = anchor_vendor_by_name
@@ -2541,6 +2594,7 @@ def resolve_source_values(source_df):
     result_df.attrs['card_info_map'] = card_info_map
     result_df.attrs['identity_card_info_map'] = identity_card_info_map
     result_df.attrs['hand_card_info_by_index'] = hand_card_info_by_index
+    result_df.attrs['hand_exact_anchor_ids'] = hand_exact_anchor_ids
 
     excluded_columns = [
         '合同编号', '合同标题', '合同有效期截止时间', '合同审批状态',
@@ -2561,12 +2615,16 @@ def resolve_source_values(source_df):
     replacement_missing = retained_summary[
         retained_summary['主播替换匹配方式'].map(_text) == ''
     ].copy()
-    replacement_missing['说明'] = '《主播替换》未提供可用的新主播卡片ID,当前保留原ID'
+    replacement_missing['说明'] = (
+        '《主播替换》未提供可用的新主播卡片ID; '
+        '原泛微ID仅写入“泛微主播卡片ID”,智书主播卡片字段按Hand复查结果置空'
+    )
 
     result_df.attrs['excluded_no_hand_anchor_df'] = excluded_summary
     result_df.attrs['retained_no_hand_anchor_df'] = retained_summary
     result_df.attrs['anchor_replacement_missing_df'] = replacement_missing
     result_df.attrs['excluded_our_party_df'] = excluded_our_party_df
+    result_df.attrs['excluded_contract_df'] = excluded_contract_df
     print(
         '[合同迁移-主播流程] 最终保留口径: '
         f'Hand生产可查 {len(hand_matched_df)}; '
@@ -2626,7 +2684,8 @@ def build_main_output(source_df, headers):
         _set(row, '合同创建人user_id', _text(source['合同创建人user_id']))
         _set(row, '合同创建人状态', _text(source.get('合同创建人状态')))
         _set(row, 'custom_1024_61820798c0f348658d8daa64f8b2aef9（主播卡片）',
-             source['主播卡片导入ID'])
+             source['主播卡片导入ID'] if source['主播卡片Hand生产可查'] else '')
+        _set(row, '泛微主播卡片ID', _excel_id_value(source.get('原合同主播卡片ID')))
         _set(row, 'custom_1_ab6f99ee02e549469ec5b2d4a5a98452（主播姓名）',
              _first_non_blank(source['主播姓名'], source['主播姓名_卡片']))
         _set(row, 'custom_1_4fa3c71e706c489e94977935b512b0f6（主播昵称）',
@@ -2960,25 +3019,9 @@ def _build_hand_still_unmatched_recheck(source_df):
     if retained_df.empty:
         return pd.DataFrame(columns=HAND_RECHECK_PREFIX_COLUMNS + list(retained_df.columns))
 
-    card_ids = c.clean_codes(retained_df['主播卡片ID'])
-    matched_ids = set()
-    for batch in _chunked(card_ids, 300):
-        placeholders = c.in_placeholders(batch)
-        list_df = c.query_db(
-            'HAND',
-            'hfins',
-            f'SELECT header_id FROM anchor_profile_list WHERE header_id IN ({placeholders})',
-            batch,
-        )
-        header_df = c.query_db(
-            'HAND',
-            'hfins',
-            f'SELECT header_id FROM anchor_profile_header WHERE header_id IN ({placeholders}) '
-            "AND (delete_flag IS NULL OR delete_flag <> 'Y')",
-            batch,
-        )
-        matched_ids.update(c.format_code(value) for value in list_df.get('header_id', []))
-        matched_ids.update(c.format_code(value) for value in header_df.get('header_id', []))
+    matched_ids = source_df.attrs.get('hand_exact_anchor_ids')
+    if matched_ids is None:
+        matched_ids = _build_hand_exact_anchor_id_set(retained_df['主播卡片ID'])
 
     unmatched_df = retained_df.loc[
         ~retained_df['主播卡片ID'].map(lambda value: c.format_code(value) in matched_ids)
@@ -3106,6 +3149,10 @@ def collect_excluded_our_party(source_df):
     return source_df.attrs.get('excluded_our_party_df', pd.DataFrame()).drop_duplicates()
 
 
+def collect_excluded_contract(source_df):
+    return source_df.attrs.get('excluded_contract_df', pd.DataFrame()).drop_duplicates()
+
+
 def collect_contract_creator_audit(source_df):
     columns = [
         '主播处理分组', '合同编号', '合同标题', '合同有效期截止时间',
@@ -3200,6 +3247,7 @@ def run():
         'Hand未命中_条件保留': collect_retained_no_hand_anchor(source_df),
         '主播替换ID_未匹配': collect_anchor_replacement_missing(source_df),
         '排除我方主体_不导入': collect_excluded_our_party(source_df),
+        '排除指定合同_不导入': collect_excluded_contract(source_df),
         '申请人在职替换核对': collect_contract_creator_audit(source_df),
         '主播卡片补充信息_未匹配': collect_missing_anchor_card(source_df),
         '最终主播卡片_未匹配': collect_missing_final_anchor_card(source_df),

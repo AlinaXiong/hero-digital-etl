@@ -1721,7 +1721,7 @@ def attachment_download_workers(default=8):
     return max(1, min(workers, 32))
 
 
-def attachment_download_retries(default=3):
+def attachment_download_retries(default=10):
     raw = os.getenv(ATTACHMENT_DOWNLOAD_RETRIES_ENV, '').strip()
     if not raw:
         return default
@@ -1729,7 +1729,7 @@ def attachment_download_retries(default=3):
         retries = int(raw)
     except ValueError:
         return default
-    return max(1, min(retries, 10))
+    return max(1, min(retries, 20))
 
 
 def build_attachment_referer(base_url, imagefileid, docid):
