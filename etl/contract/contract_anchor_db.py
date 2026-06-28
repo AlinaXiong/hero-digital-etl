@@ -17,7 +17,9 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 if __package__ is None or __package__ == '':
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -40,6 +42,7 @@ ANCHOR_REPLACEMENT_FILE = TEMPLATE_DIR / '主播替换.xlsx'
 OUTPUT_FILE = OUTPUT_DIR / f'智书合同字段_主播流程_{DATE_SUFFIX}.xlsx'
 EXCEPTION_FILE = OUTPUT_DIR / f'未匹配清单_主播流程_{DATE_SUFFIX}.xlsx'
 MANIFEST_FILE = OUTPUT_DIR / f'主播流程合同附件下载清单_{DATE_SUFFIX}.xlsx'
+HAND_RECHECK_FILE = OUTPUT_DIR / f'Hand主播档案仍未命中_替换后_{DATE_SUFFIX}.xlsx'
 
 SHEET_MAIN = '字段模板'
 SHEET_OPTIONS = '选项'
@@ -2946,6 +2949,159 @@ def collect_anchor_replacement_missing(source_df):
     return source_df.attrs.get('anchor_replacement_missing_df', pd.DataFrame()).drop_duplicates()
 
 
+HAND_RECHECK_PREFIX_COLUMNS = [
+    '是否已替换主播ID', '未命中类型', 'Hand复查结果',
+]
+
+
+def _build_hand_still_unmatched_recheck(source_df):
+    """用替换后的主播卡片 ID 精确复查 Hand,返回最终仍未命中的清单。"""
+    retained_df = collect_retained_no_hand_anchor(source_df).copy()
+    if retained_df.empty:
+        return pd.DataFrame(columns=HAND_RECHECK_PREFIX_COLUMNS + list(retained_df.columns))
+
+    card_ids = c.clean_codes(retained_df['主播卡片ID'])
+    matched_ids = set()
+    for batch in _chunked(card_ids, 300):
+        placeholders = c.in_placeholders(batch)
+        list_df = c.query_db(
+            'HAND',
+            'hfins',
+            f'SELECT header_id FROM anchor_profile_list WHERE header_id IN ({placeholders})',
+            batch,
+        )
+        header_df = c.query_db(
+            'HAND',
+            'hfins',
+            f'SELECT header_id FROM anchor_profile_header WHERE header_id IN ({placeholders}) '
+            "AND (delete_flag IS NULL OR delete_flag <> 'Y')",
+            batch,
+        )
+        matched_ids.update(c.format_code(value) for value in list_df.get('header_id', []))
+        matched_ids.update(c.format_code(value) for value in header_df.get('header_id', []))
+
+    unmatched_df = retained_df.loc[
+        ~retained_df['主播卡片ID'].map(lambda value: c.format_code(value) in matched_ids)
+    ].copy()
+    replaced_mask = unmatched_df['主播替换匹配方式'].map(_text) != ''
+    unmatched_df.insert(0, 'Hand复查结果', 'Hand生产库未命中')
+    unmatched_df.insert(
+        0,
+        '未命中类型',
+        replaced_mask.map({
+            True: '替换后仍未命中Hand',
+            False: '未发生替换仍未命中Hand',
+        }),
+    )
+    unmatched_df.insert(0, '是否已替换主播ID', replaced_mask.map({True: '是', False: '否'}))
+    print(
+        '[合同迁移-主播流程] 替换后 Hand 精确复查: '
+        f'候选 {len(retained_df)}; '
+        f'已命中 {len(retained_df) - len(unmatched_df)}; '
+        f'仍未命中 {len(unmatched_df)} '
+        f'(已替换 {int(replaced_mask.sum())}, 未替换 {int((~replaced_mask).sum())})'
+    )
+    return unmatched_df
+
+
+def _write_hand_recheck_workbook(output_file, recheck_df):
+    """生成“Hand 主播档案替换后仍未命中”汇总和明细工作簿。"""
+    wb = Workbook()
+    summary_ws = wb.active
+    summary_ws.title = '汇总'
+    summary_ws.sheet_view.showGridLines = False
+
+    total_count = len(recheck_df)
+    replaced_count = int((recheck_df.get('是否已替换主播ID', pd.Series(dtype=str)) == '是').sum())
+    unchanged_count = total_count - replaced_count
+
+    summary_ws.merge_cells('A1:B1')
+    summary_ws['A1'] = 'Hand主播档案替换后仍未命中清单'
+    summary_ws.append([])
+    summary_ws.append(['统计项', '数量'])
+    summary_ws.append(['最终仍未命中 Hand', total_count])
+    summary_ws.append(['其中：已替换后仍未命中', replaced_count])
+    summary_ws.append(['其中：未发生替换仍未命中', unchanged_count])
+    summary_ws.append([])
+    summary_ws.append(['复查说明', '内容'])
+    summary_ws.append([
+        'Hand复查口径',
+        '替换后的主播卡片ID，精确查询 Hand 生产库 anchor_profile_list / anchor_profile_header',
+    ])
+    summary_ws.append(['生成日期', datetime.now().strftime('%Y-%m-%d')])
+
+    title_fill = PatternFill('solid', fgColor='0F766E')
+    section_fill = PatternFill('solid', fgColor='DCEFEA')
+    note_fill = PatternFill('solid', fgColor='E2E8F0')
+    header_bottom = Side(style='double', color='0F766E')
+    summary_ws['A1'].fill = title_fill
+    summary_ws['A1'].font = Font(name='Carlito', size=16, bold=True, color='FFFFFF')
+    summary_ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
+    for cell in summary_ws[3]:
+        cell.fill = section_fill
+        cell.font = Font(name='Carlito', size=11, bold=True, color='134E4A')
+        cell.border = Border(bottom=header_bottom)
+    for row_index in (4, 5, 6):
+        summary_ws.cell(row_index, 1).font = Font(name='Carlito', size=11, bold=True)
+        count_cell = summary_ws.cell(row_index, 2)
+        count_cell.font = Font(name='Carlito', size=11, bold=True, color='0F766E')
+        count_cell.alignment = Alignment(horizontal='right')
+        count_cell.number_format = '#,##0'
+    for cell in summary_ws[8]:
+        cell.fill = note_fill
+        cell.font = Font(name='Carlito', size=11, bold=True, color='334155')
+    for row_index in (9, 10):
+        for cell in summary_ws[row_index]:
+            cell.font = Font(name='Carlito', size=11)
+            cell.alignment = Alignment(vertical='top', wrap_text=True)
+    summary_ws.column_dimensions['A'].width = 32
+    summary_ws.column_dimensions['B'].width = 68
+    summary_ws.row_dimensions[1].height = 28
+    summary_ws.freeze_panes = 'A3'
+
+    detail_ws = wb.create_sheet(f'{total_count}条清单')
+    detail_ws.sheet_view.showGridLines = False
+    detail_ws.freeze_panes = 'A2'
+    detail_ws.append(list(recheck_df.columns))
+    for row in recheck_df.itertuples(index=False, name=None):
+        detail_ws.append([None if pd.isna(value) else value for value in row])
+
+    detail_header_fill = PatternFill('solid', fgColor='1E3A5F')
+    alternate_fill = PatternFill('solid', fgColor='BDE3F2')
+    replaced_fill = PatternFill('solid', fgColor='FFF2CC')
+    detail_bottom = Side(style='double', color='0F172A')
+    for cell in detail_ws[1]:
+        cell.fill = detail_header_fill
+        cell.font = Font(name='Carlito', size=11, bold=True, color='FFFFFF')
+        cell.border = Border(bottom=detail_bottom)
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    for row_index in range(2, detail_ws.max_row + 1):
+        row_fill = alternate_fill if row_index % 2 == 0 else None
+        for cell in detail_ws[row_index]:
+            cell.font = Font(name='Carlito', size=10)
+            cell.alignment = Alignment(vertical='center', wrap_text=cell.column in (5, 11, 18))
+            if row_fill:
+                cell.fill = row_fill
+        if detail_ws.cell(row_index, 1).value == '是':
+            detail_ws.cell(row_index, 1).fill = replaced_fill
+
+    widths = [18, 24, 20, 18, 42, 16, 16, 14, 14, 24, 60, 16, 16, 16, 16, 16, 16, 52]
+    for column_index, width in enumerate(widths, start=1):
+        detail_ws.column_dimensions[get_column_letter(column_index)].width = width
+    detail_ws.row_dimensions[1].height = 32
+    detail_ws.auto_filter.ref = f'A1:R{max(1, detail_ws.max_row)}'
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        wb.save(output_file)
+        return output_file
+    except PermissionError:
+        fallback = _timestamped_path(output_file)
+        print(f'Hand复查清单被占用,改写到: {fallback}')
+        wb.save(fallback)
+        return fallback
+
+
 def collect_excluded_our_party(source_df):
     return source_df.attrs.get('excluded_our_party_df', pd.DataFrame()).drop_duplicates()
 
@@ -3070,6 +3226,9 @@ def run():
     })
     if manifest_file:
         print('已写出:', manifest_file)
+    hand_recheck_df = _build_hand_still_unmatched_recheck(source_df)
+    hand_recheck_file = _write_hand_recheck_workbook(HAND_RECHECK_FILE, hand_recheck_df)
+    print('已写出:', hand_recheck_file)
 
 
 if __name__ == '__main__':
