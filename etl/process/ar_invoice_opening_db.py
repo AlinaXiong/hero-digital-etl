@@ -18,7 +18,11 @@ if __package__ is None or __package__ == '':
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from etl.util import common as c
-from etl.process.ap_prepayment_opening_db import build_fw_project_code_map_for_ids
+from etl.process.ap_prepayment_opening_db import (
+    build_fw_project_code_map_for_ids,
+    project_filter_codes,
+    EVENT_PROJECT_SHEET,
+)
 
 # ============================ 文件 / 模板 ============================
 TASK_NAME = 'ar_invoice_opening_db'
@@ -132,8 +136,6 @@ TAX_PREFERRED_DESCRIPTIONS = {
     0.13: ['13%税率(价外)', '13%销项税，中国', '13%'],
 }
 
-DATE_FROM = '2026-01-01'
-ISSUED_STATUS_CODE = 0
 VOID_CODE = 0
 
 
@@ -173,9 +175,7 @@ LEFT JOIN (
     WHERE kpysdh IS NOT NULL AND TRIM(kpysdh) <> ''
     GROUP BY kpysdh
 ) r ON r.kpysdh = m.lcbh
-WHERE m.sqrq >= %(date_from)s
-  AND m.kpzt = %(issued_status_code)s
-  AND (m.sfzf IS NULL OR m.sfzf <> %(void_code)s)
+WHERE (m.sfzf IS NULL OR m.sfzf <> %(void_code)s)
 ORDER BY m.id
 """
 
@@ -183,19 +183,10 @@ ORDER BY m.id
 # 仅用于打印过滤前后数量,便于核对口径。
 STATS_SQL = """
 SELECT
+    COUNT(*) AS total_count,
+    SUM(CASE WHEN m.sfzf = %(void_code)s THEN 1 ELSE 0 END) AS void_count,
     SUM(CASE
-        WHEN m.sqrq >= %(date_from)s
-         AND m.kpzt = %(issued_status_code)s
-        THEN 1 ELSE 0 END) AS matched_count,
-    SUM(CASE
-        WHEN m.sqrq >= %(date_from)s
-         AND m.kpzt = %(issued_status_code)s
-         AND m.sfzf = %(void_code)s
-        THEN 1 ELSE 0 END) AS void_count,
-    SUM(CASE
-        WHEN m.sqrq >= %(date_from)s
-         AND m.kpzt = %(issued_status_code)s
-         AND (m.sfzf IS NULL OR m.sfzf <> %(void_code)s)
+        WHEN (m.sfzf IS NULL OR m.sfzf <> %(void_code)s)
         THEN 1 ELSE 0 END) AS kept_count
 FROM uf_xtyykp m
 """
@@ -240,8 +231,6 @@ EXPECTED_RECEIPT_FIELDS = {
 def _query_fw(sql):
     """查询泛微库,统一带上本任务过滤参数。"""
     return c.query_db('FW', 'vspn_xtyy', sql, {
-        'date_from': DATE_FROM,
-        'issued_status_code': ISSUED_STATUS_CODE,
         'void_code': VOID_CODE,
     })
 
@@ -439,21 +428,38 @@ def build_output(invoice_df):
     return output_df[OUTPUT_COLUMNS]
 
 
+def _filter_by_project_whitelist(invoice_df, sheet_name):
+    """按指定白名单 sheet 的「原泛微项目编码」过滤已解析项目编号的开票记录。
+
+    应收期初当前仅处理赛事,传 EVENT_PROJECT_SHEET;后续 MCN 数据处理时另走
+    MCN_PROJECT_SHEET,两部分白名单区分开,互不混用。
+    """
+    if invoice_df.empty:
+        return invoice_df
+    allowed_codes = project_filter_codes(sheet_name)
+    mask = invoice_df['项目编号'].map(_text).isin(allowed_codes)
+    filtered = invoice_df.loc[mask].copy()
+    print(f"[应收期初-应收报账单-DB] 项目白名单过滤({sheet_name}): "
+          f"{len(filtered)}/{len(invoice_df)} 行 (白名单项目 {len(allowed_codes)} 个)")
+    return filtered
+
+
 def read_invoice_source():
-    """从 DB 直接读取过滤后的开票记录,并补充输出构建需要的展示值。"""
+    """从 DB 读取未作废开票记录,解析后按项目白名单过滤。"""
     c.validate_fw_fields(FW_INVOICE_TABLE, EXPECTED_INVOICE_FIELDS)
     c.validate_fw_fields(FW_RECEIPT_TABLE, EXPECTED_RECEIPT_FIELDS)
     stats = _query_fw(STATS_SQL).iloc[0]
-    status_name = INVOICE_STATUS_MEANINGS.get(ISSUED_STATUS_CODE, '')
     void_name = VOID_FLAG_MEANINGS.get(VOID_CODE, '')
-    print(f"[应收期初-应收报账单-DB] SQL过滤: 申请日期>={DATE_FROM} "
-          f"且 开票状态={ISSUED_STATUS_CODE}({status_name}) 且 是否作废≠{VOID_CODE}({void_name})")
-    print(f"  满足前两项 {int(stats['matched_count'] or 0)} 行; "
-          f"其中剔除作废 {int(stats['void_count'] or 0)} 行; "
-          f"最终保留开票记录 {int(stats['kept_count'] or 0)} 行")
+    print(f"[应收期初-应收报账单-DB] SQL过滤: 仅 是否作废≠{VOID_CODE}({void_name}); "
+          f"不再过滤申请日期/开票状态,改由项目白名单过滤")
+    print(f"  全部 {int(stats['total_count'] or 0)} 行; "
+          f"剔除作废 {int(stats['void_count'] or 0)} 行; "
+          f"SQL保留(未作废) {int(stats['kept_count'] or 0)} 行")
 
     invoice_df = resolve_source_values(_query_fw(SOURCE_SQL))
-    print('[应收期初-应收报账单-DB] SQL开票记录行数:', len(invoice_df))
+    print('[应收期初-应收报账单-DB] 未作废开票记录行数:', len(invoice_df))
+    # 应收期初当前仅处理赛事,只按赛事白名单过滤;MCN 部分后续单独按 MCN sheet 处理。
+    invoice_df = _filter_by_project_whitelist(invoice_df, EVENT_PROJECT_SHEET)
     return invoice_df
 
 
