@@ -8,8 +8,7 @@
 
 | 任务名 | 业务含义 | 数据源 | 产出模板 |
 | --- | --- | --- | --- |
-| `ap_payment_opening_db` | 应付期初 - 对公付款单(DB直连版) | 泛微 `uf_dgfktz` + `uf_dgfktz_dt1` | 英雄期初对公付款单导入模版 |
-| `ap_payment_opening_extra_db` | 应付期初 - 对公付款单补充三 tab(DB直连版) | `ap_payment_opening_db` 口径 + 泛微 `uf_plfy` / `uf_plfy_dt1` + `uf_xtyynbsz` / `uf_xtyynbsz_dt10` / `view_costlist_ys` | 英雄期初对公付款单导入模版 |
+| `ap_payment_opening_extra_db` | 应付期初 - 对公付款单(含批量费用 / 只转入外部成本 / MCN 多 tab)(DB直连版) | 泛微 `uf_dgfktz` / `uf_dgfktz_dt1` + `uf_plfy` / `uf_plfy_dt1` + `uf_xtyynbsz` / `uf_xtyynbsz_dt10` / `view_costlist_ys` | 英雄期初对公付款单导入模版 |
 | `ap_prepayment_opening_db` | 预付期初 - 供应商预付款单 + 零工预付款单(DB直连版) | 泛微 `uf_yfkxx` + `uf_yfkxx_dt1` + `uf_dgfktz_dt2`；`uf_lgptfk` + `formtable_main_279` + `formtable_main_279_dt3` + `formtable_main_279_dt4` | 英雄期初预付款单导入模版 |
 | `ar_invoice_opening_db` | 应收期初 - 应收报账单(DB直连版) | 泛微 `uf_xtyykp` + `uf_skdj` | 应收报账单期初数据导入模板 |
 | `contract_general_db` | 合同迁移 - 一般流程 Excel 导出 | 泛微 `uf_htk` + 项目&订单清洗表 | 智书合同字段-一般流程 |
@@ -69,20 +68,11 @@ python run.py contract_all_with_attachments   # 含附件下载
 python run.py export_feishu_employees          # 单独导出飞书全量员工信息
 ```
 
-### ap_payment_opening_db（应付期初 - 对公付款单 DB 直连版）
-
-把泛微「对公付款」单据清洗成中台的期初对公付款单导入数据；源数据不读 Excel，直接从泛微库读取 `uf_dgfktz` / `uf_dgfktz_dt1`。
-
-- **行过滤**：流程来源 ∈ {对公付款, 个人劳务付款} 且 申请日期 ≥ 2026-01-01 且 流程状态=审批完成 且 非作废
-- **行粒度**：主子按 ID 合并，一行=一条费用明细
-- **关键映射**：经办人→工号、公司主体→核算主体编码、供应商→收款方编码、预算科目→费用项目编码、付款币种→ISO；人员/部门/枚举/币种等 ID 转成原 Excel 导出同款展示值；实际已支付金额按支付状态判定
-- **产出**：`英雄期初对公付款单导入_应付期初_<YYYYMMDD>.xlsx`（24 列单 tab）
-
 ### ap_payment_opening_extra_db（应付期初 - 对公付款单补充三 tab DB 直连版）
 
 一次生成「应付期初」同一个 Excel 的三个 tab：`期初对公付款单导入`、`批量费用流程`、`只转入外部成本`。
 
-- **期初对公付款单导入**：复用 `ap_payment_opening_db` 的读取、过滤、供应商、合同、银行账号和预算科目逻辑。
+- **期初对公付款单导入**：对公付款主流程，从泛微 `uf_dgfktz` / `uf_dgfktz_dt1` 读数；读取、过滤、供应商、合同、银行账号、预算科目等逻辑已内联本模块。
 - **批量费用流程源表**：泛微 `uf_plfy` + `uf_plfy_dt1`；过滤 `d.sfqr=0`、明细未作废、记录日期 ≥ 2026-01-01。
 - **只转入外部成本源表**：泛微 `uf_xtyynbsz` + `uf_xtyynbsz_dt10`，并关联 `view_costlist_ys` 取费用单明细；同时处理赛事来源 `ly=5` 和 MCN 来源 `ly=2`。
 - **项目/订单字段**：先把泛微项目浏览框 ID 解析成泛微项目编号，再按 0619 项目&订单清洗表映射订单编号/订单名称，并保留 `泛微项目编号`。
@@ -222,8 +212,7 @@ hero-digital-etl/
 │   │   ├── contract_anti_bribery_attachments_db.py
 │   │   └── anti_bribery_signers_db.py  #   反商业贿赂协议签署情况补登
 │   ├── process/                        # 期初流程
-│   │   ├── ap_payment_opening_db.py    #   应付期初 - 对公付款单
-│   │   ├── ap_payment_opening_extra_db.py #   应付期初 - 补充三 tab
+│   │   ├── ap_payment_opening_extra_db.py #   应付期初 - 对公付款单 / 补充三 tab / MCN
 │   │   ├── ap_prepayment_opening_db.py #   预付期初 - 供应商/零工预付款单
 │   │   └── ar_invoice_opening_db.py    #   应收期初 - 应收报账单
 │   ├── invoice/
@@ -255,7 +244,7 @@ python run.py ap_payment_opening_extra_db
 数据库访问统一走 SQLAlchemy。调试时可打印已代入参数、可直接复制到 MySQL 执行的 SQL：
 
 ```bash
-SQL_ECHO=1 python run.py ap_payment_opening_db
+SQL_ECHO=1 python run.py ap_payment_opening_extra_db
 ```
 
 如需 SQLAlchemy 原生日志，可使用 `SQLALCHEMY_ECHO=1`。

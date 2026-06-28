@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """任务入口。用法:
-    python run.py            # 默认跑 ap_payment_opening_db
-    python run.py ap_payment_opening_db # 跑指定任务
+    python run.py            # 默认跑 ap_payment_opening_extra_db
+    python run.py ap_payment_opening_extra_db # 跑指定任务
     python run.py --list     # 列出所有任务
 
 新增任务:在 etl/<分组> 下加一个 <任务名>.py,再在下面 TASKS 登记。
@@ -23,7 +23,6 @@ from etl.contract import (
     contract_general_db,
 )
 from etl.process import (
-    ap_payment_opening_db,
     ap_payment_opening_extra_db,
     ap_prepayment_opening_db,
     ar_invoice_opening_db,
@@ -33,8 +32,7 @@ from etl.invoice import invoice_info_db
 # 登记任务:任务名 -> run 函数。新增任务在这里加一行。
 TASKS = {
     'anti_bribery_signers_db': anti_bribery_signers_db.run,  # 反商业贿赂协议签署情况补登(DB直连版)
-    'ap_payment_opening_db': ap_payment_opening_db.run,   # 应付期初 对公付款单(DB直连版)
-    'ap_payment_opening_extra_db': ap_payment_opening_extra_db.run,  # 应付期初 批量费用流程/只转入外部成本(DB直连版)
+    'ap_payment_opening_extra_db': ap_payment_opening_extra_db.run,  # 应付期初 对公付款单/批量费用流程/只转入外部成本/MCN(DB直连版)
     'ap_prepayment_opening_db': ap_prepayment_opening_db.run,  # 预付期初 供应商预付款单/零工预付款单(DB直连版)
     'ar_invoice_opening_db': ar_invoice_opening_db.run,   # 应收期初 应收报账单(DB直连版)
     'contract_anti_bribery_db': contract_anti_bribery_db.run,  # 合同迁移 反商业贿赂协议(DB直连版)
@@ -144,7 +142,7 @@ TASKS['contract_all_with_attachments'] = run_contract_all_with_attachments
 
 
 def main():
-    arg = sys.argv[1] if len(sys.argv) > 1 else 'ap_payment_opening_db'
+    arg = sys.argv[1] if len(sys.argv) > 1 else 'ap_payment_opening_extra_db'
     if arg in ('--list', '-l'):
         print('可用任务:', ', '.join(TASKS))
         return

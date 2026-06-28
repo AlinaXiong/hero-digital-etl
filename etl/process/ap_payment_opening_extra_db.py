@@ -21,7 +21,6 @@ if __package__ is None or __package__ == '':
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from etl.util import common as c
-from etl.process import ap_payment_opening_db as base_payment
 
 
 # ============================ 文件 / 模板 ============================
@@ -92,6 +91,16 @@ OUTPUT_COLUMNS = [
     '泛微项目编号',
     '泛微费用项目编码',
 ]
+
+# ====== 以下从已删除的 ap_payment_opening_db 内联(赛事对公付款的原 base 口径),逻辑保持不变 ======
+# 当前任务只取对公付款和个人劳务付款;预付款、零工平台付款等来源走其他任务。
+SOURCE_CODES = (2, 10)
+# 泛微 uf_dgfktz.zfzt 支付状态: 0=已支付。
+PAYMENT_STATUS_MEANINGS = {
+    0: '已支付',
+}
+# 原 base build_output 落库列序:比 OUTPUT_COLUMNS 少「泛微项目编号」(该列由 _apply_order_project_columns 追加)。
+BASE_OUTPUT_COLUMNS = [column for column in OUTPUT_COLUMNS if column != '泛微项目编号']
 
 BATCH_ISSUE_SOURCE_FIELDS = {
     '申请人工号': '申请人',
@@ -1157,15 +1166,162 @@ def allocate_external_cost_amounts(source_df):
 
 
 # ============================ 批量费用流程 ============================
+# ====== 以下解析/输出函数原属 ap_payment_opening_db,内联进来后逻辑保持不变 ======
+def _lookup_first_browser_value(mapping, value):
+    for item_id in c.parse_browser_ids(value):
+        mapped = mapping.get(item_id, '')
+        if mapped:
+            return mapped
+    return ''
+
+
+def resolve_payment_status_name(value):
+    """uf_dgfktz.zfzt 支付状态: 0=已支付。"""
+    code = c.format_code(value)
+    return PAYMENT_STATUS_MEANINGS.get(int(code), '') if code.isdigit() else ''
+
+
+def resolve_source_values(source_df):
+    """基于主 SQL 返回的泛微 ID 字段补充输出需要的展示值。
+
+    保留原始 ID 列,新增展示列:
+    - 经办人ID -> 经办人 / 经办人工号
+    - 公司主体ID -> 公司主体
+    - 相关合同ID -> 合同编号
+    - 付款币种ID -> 付款币种
+    - 预算科目ID -> 预算科目完整路径
+    """
+    df = source_df.copy()
+    employee_map = c.build_fw_employee_info_map_for_ids(df['经办人ID'])
+    company_map = c.build_fw_company_name_map_for_ids(df['公司主体ID'])
+    contract_map = c.build_fw_contract_code_map_for_ids(df['相关合同ID'])
+    currency_map = c.build_fw_currency_name_map_for_ids(df['付款币种ID'])
+    cost_center_map = c.build_fw_cost_center_map_for_ids(df['成本中心ID'])
+    subject_map = c.build_fw_budget_subject_path_map_for_ids(df['预算科目ID'])
+    bank_account_map = c.build_fw_supplier_bank_account_map_for_ids(df['银行账号'])
+
+    # [主表] jbr -> hrmresource / hrmjobtitles
+    df['经办人'] = df['经办人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
+    df['经办人工号'] = df['经办人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
+    # [主表] gszt -> uf_gstt.gsmc
+    df['公司主体'] = df['公司主体ID'].map(lambda value: company_map.get(c.format_code(value), ''))
+    # [主表] xght -> uf_htsp.htbh
+    df['相关合同'] = df['相关合同ID'].map(lambda value: _lookup_first_browser_value(contract_map, value))
+    # [主表] yhzh 是供应商银行账号浏览框 ID,先转成账号文本,后续再按 Hand 供应商银行卡校验。
+    df['银行账号'] = df['银行账号'].map(
+        lambda value: _lookup_first_browser_value(bank_account_map, value)
+        or ('' if pd.isna(value) else str(value).strip()))
+    # [主表] fkbz -> fnacurrency.CURRENCYNAME
+    df['付款币种'] = df['付款币种ID'].map(lambda value: currency_map.get(c.format_code(value), ''))
+    # [主表] rzdw(成本中心) -> uf_cbzx.mc(成本中心名称)
+    df['成本中心'] = df['成本中心ID'].map(lambda value: _lookup_first_browser_value(cost_center_map, value))
+    # [主表] zfzt: 0=已支付
+    df['支付状态'] = df['支付状态ID'].map(resolve_payment_status_name)
+    # [明细表] yskm -> fnabudgetfeetype 层级路径
+    df['预算科目'] = df['预算科目ID'].map(lambda value: subject_map.get(c.format_code(value), ''))
+    return df
+
+
+def build_output(merged_df):
+    """DB 源数据 -> 导入模版 24 列。
+    能从泛微 DB 原始字段/ID 直接取得的字段直接取;跨系统编码再查中台/规则表。
+    """
+    def lookup_by_name(mapping, value):
+        return '' if pd.isna(value) else mapping.get(c.normalize_name(value), '')
+
+    # 供应商编码: [主表] gys -> common 供应商判断 -> Hand hfbs_system_vender.vender_code。
+    # 同时输出 Hand 按 ID 查不到的供应商诊断清单。
+    vendor_map = c.build_supplier_vendor_info_map_for_rows(
+        merged_df['供应商ID'],
+        supplier_texts=merged_df['供应商-文本'],
+        document_numbers=merged_df['流程编号'],
+        missing_report_file=BASE_SUPPLIER_VENDOR_MISSING_FILE,
+        log_prefix='[应付期初-供应商付款-DB]',
+    )
+    # 核算主体编号: [主表] gszt -> 公司主体名称 -> Hand hfac_accounting_entity.acc_entity_code。
+    entity_map = c.build_accounting_entity_map_for_names(merged_df['公司主体'])
+    # 费用项目编码/描述: [明细] yskm -> 预算科目路径 -> 规则表「业财项目_数据映射规则.xlsx」。
+    subject_map = c.build_subject_map()
+
+    def lookup_vendor(index, field):
+        return vendor_map.get(index, {}).get(field, '')
+
+    def vendor_description(index, fallback_text):
+        name = lookup_vendor(index, 'name')
+        if name:
+            return name
+        return '' if pd.isna(fallback_text) else str(fallback_text).strip()
+
+    def subject_item(subject_path, index):
+        if pd.isna(subject_path):
+            return ''
+        return subject_map.get(c.remove_slashes(subject_path), ('', ''))[index]
+
+    payment_amount = pd.to_numeric(merged_df['付款金额'], errors='coerce')
+    paid_mask = merged_df['支付状态ID'].map(c.format_code) == '0'
+
+    output_df = pd.DataFrame(index=merged_df.index)
+
+    # 固定值:当前任务来源就是泛微,单据类型固定为期初对公付款单。
+    output_df['来源系统'] = 'FW'
+    output_df['单据类型'] = DOCUMENT_TYPE
+
+    # 泛微主表直取字段。
+    output_df['来源单据编号'] = merged_df['流程编号']                  # [主表] lcbh
+    output_df['申请日期'] = merged_df['申请日期'].map(c.format_date)   # [主表] sqrq
+    output_df['申请人工号'] = merged_df['经办人工号']                  # [主表] jbr -> hrmjobtitles.JOBTITLENAME
+    output_df['申请人姓名'] = merged_df['经办人']                      # [主表] jbr -> hrmresource.LASTNAME
+    output_df['备注'] = merged_df['备注'].astype(str).where(
+        merged_df['备注'].notna(), '').str.slice(0, 150)              # [主表] bz,导入限制截前150字符
+    output_df['合同号'] = merged_df['相关合同'].where(
+        merged_df['相关合同'].notna(), '')                            # [主表] xght -> uf_htsp.htbh
+    output_df['银行账号'] = merged_df['银行账号'].where(
+        merged_df['银行账号'].notna(), '')                            # [主表] yhzh 原值
+    output_df['计划付款日期'] = merged_df['预计付款日期'].map(c.format_date)  # [主表] yjfkrq
+
+    # 当前源数据没有直接可用的订单/计划行/银行备注/主播房间号,按模板留空。
+    output_df['订单编号'] = ''                                         # 模板字段,当前口径不取项目编号
+    output_df['订单名称'] = ''
+    output_df['合同收支计划行'] = ''
+    output_df['银行转账备注'] = ''
+    output_df['主播房间号'] = ''
+
+    # 跨系统映射字段。
+    output_df['核算主体编号'] = merged_df['公司主体'].map(
+        lambda value: lookup_by_name(entity_map, value))              # [主表] gszt -> Hand 核算主体编号
+    output_df['核算主体描述'] = merged_df['公司主体']                  # [主表] gszt -> uf_gstt.gsmc
+    output_df['收款方编码'] = [lookup_vendor(index, 'code') for index in merged_df.index]  # [主表] gys -> Hand vender_code
+    output_df['收款方描述'] = [
+        vendor_description(index, supplier_text)
+        for index, supplier_text in zip(merged_df.index, merged_df['供应商-文本'])
+    ]                                                                  # 优先 Hand description,兜底 [主表] gyswb
+    output_df['银行账号'] = c.resolve_hand_vendor_bank_accounts(
+        output_df['收款方编码'], merged_df['银行账号'])                  # 按收款方 Hand 供应商银行卡校验;为空/不匹配时取默认账号
+
+    # 金额和费用项目。
+    output_df['实际已支付金额'] = [
+        c.round_amount(value) if is_paid else 0 for value, is_paid in zip(payment_amount, paid_mask)
+    ]                                                                  # [明细] fkje;仅 zfzt=0(已支付) 计入
+    output_df['费用项目编码'] = merged_df['预算科目'].map(
+        lambda value: subject_item(value, 0))                          # [明细] yskm -> 规则表编码
+    output_df['费用项目描述'] = merged_df['预算科目'].map(
+        lambda value: subject_item(value, 1))                          # [明细] yskm -> 规则表描述
+    output_df['报账币种'] = merged_df['付款币种'].map(c.to_iso_currency)  # [主表] fkbz -> ISO币种
+    output_df['报账金额（支付币种）'] = payment_amount.map(c.round_amount)  # [明细] fkje
+    output_df['泛微费用项目编码'] = merged_df['预算科目'].where(
+        merged_df['预算科目'].notna(), '')                             # [明细] yskm -> 原泛微预算科目路径
+    # write_to_template 按 DataFrame 顺序写入模板,这里显式固定列序。
+    return output_df[BASE_OUTPUT_COLUMNS]
+
+
 def read_base_source():
     """读取赛事对公付款,仅按赛事项目白名单过滤。"""
-    base_payment.SUPPLIER_VENDOR_MISSING_FILE = BASE_SUPPLIER_VENDOR_MISSING_FILE
     event_project_ids = project_filter_ids(EVENT_PROJECT_SHEET, EVENT_PROJECT_TABLES)
     if not event_project_ids:
         return pd.DataFrame()
 
     params = {
-        'source_codes': base_payment.SOURCE_CODES,
+        'source_codes': SOURCE_CODES,
         'project_ids': event_project_ids,
         'project_codes': tuple(sorted(project_filter_codes(EVENT_PROJECT_SHEET))),
         'date_from': DATE_FROM,
@@ -1174,7 +1330,7 @@ def read_base_source():
     print('[应付期初-供应商付款-DB] SQL过滤: 仅保留赛事项目白名单; 不再过滤申请日期/流程状态/作废状态')
     print(f"  命中主表 {int(stats['document_count'] or 0)} 单 / 明细 {int(stats['detail_count'] or 0)} 行; "
           f"金额合计 {float(stats['amount_total'] or 0):.2f}")
-    source_df = base_payment.resolve_source_values(_query_fw(BASE_EVENT_SOURCE_SQL, params))
+    source_df = resolve_source_values(_query_fw(BASE_EVENT_SOURCE_SQL, params))
     source_df = _filter_by_project_whitelist(
         source_df, '项目编号', EVENT_PROJECT_SHEET, EVENT_PROJECT_TABLES,
         '应付期初-供应商付款-DB',
@@ -1672,7 +1828,7 @@ def run():
     # 2. 构建六个 sheet 输出:原三类保持独立,MCN 三类追加在后。
     base_issue_source_df = _with_resolved_project_fields(base_source_df)
     base_output_df = _apply_order_project_columns(
-        base_payment.build_output(base_source_df),
+        build_output(base_source_df),
         base_issue_source_df,
     )
     if '申请人' not in base_issue_source_df.columns and '经办人' in base_issue_source_df.columns:
