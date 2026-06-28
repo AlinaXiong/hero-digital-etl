@@ -129,6 +129,12 @@ FORM_DOC_FIELD_TYPES_BY_TABLE = {
 # 未匹配到上述稿件字段的表单, 退回单一稿件字段 htqdg, 归生效稿。
 FORM_DOC_FALLBACK_FIELD = 'htqdg'
 
+# 固定附件覆盖: 个别合同业务确认只下载指定附件(按 docid), 绕过常规稿件归类与目标稿件过滤。
+# SHSY-B-202408018-S1(困困经纪约补充协议): 附件只挂在修订稿字段会被过滤, 业务确认仅下载补充协议 docx 一份。
+FIXED_CONTRACT_ATTACHMENT_DOCIDS = {
+    'SHSY-B-202408018-S1': {1784677},  # 困困别睡辣补充协议.docx (imagefileid 1958491)
+}
+
 # 赛事源 uf_htsp 的稿件字段(逗号分隔 docid) -> 固定归类。
 SAISHI_DOC_FIELD_TYPES = (
     ('赛事生效稿DOCID', ATTACHMENT_TYPE_EFFECTIVE),
@@ -819,7 +825,11 @@ def build_contract_attachment_manifest(source_df, retention_mode='legacy'):
     for source in source_df.to_dict('records'):
         contract_number = _text(source['合同编号'])
         contract_dir = _sanitize_path_part(contract_number, f'contract_{_text(source.get("ID"))}')
-        for docref in docrefs_by_contract.get(contract_number, []):
+        fixed_docids = FIXED_CONTRACT_ATTACHMENT_DOCIDS.get(contract_number)
+        contract_docrefs = docrefs_by_contract.get(contract_number, [])
+        if fixed_docids:
+            contract_docrefs = [dr for dr in contract_docrefs if dr['docid'] in fixed_docids]
+        for docref in contract_docrefs:
             docid = docref['docid']
             doc_rows = docimage_map.get(docid, [])
             if not doc_rows:
@@ -852,7 +862,7 @@ def build_contract_attachment_manifest(source_df, retention_mode='legacy'):
                 ))
                 attachment_type = _classify_attachment_type(
                     doc_row, image_info, doc_info, docref.get('attachment_type', ''))
-                skip_reason = _attachment_skip_reason(source, attachment_type)
+                skip_reason = '' if fixed_docids else _attachment_skip_reason(source, attachment_type)
                 if skip_reason:
                     continue
                 candidate_rows.append({

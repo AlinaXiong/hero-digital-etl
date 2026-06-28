@@ -100,6 +100,7 @@ EXCLUDED_OUR_PARTY_NAME_KEYS = {
 EXCLUDED_CONTRACT_NUMBERS = {
     '-T-202202233',
     'YF-B-202606001',
+    'HH-B-202112051',
 }
 EXCLUDED_CONTRACT_NUMBER_KEYS = {
     re.sub(r'\s+', '', number).upper()
@@ -170,7 +171,10 @@ SELECT
 FROM uf_htk h
 LEFT JOIN workflow_requestbase rb ON rb.requestid = h.htlc
 LEFT JOIN workflow_base wb ON wb.id = rb.workflowid
-LEFT JOIN workflow_nownode nn ON nn.requestid = h.htlc
+-- 聚合取 MAX(nownodeid): 一个流程在 workflow_nownode 可能残留多条当前节点记录(反复退回/并行),
+-- 直连会把单条合同扇出成多行重复; 取最靠后(id 最大)的节点作兜底, 对应最接近当前的节点。
+LEFT JOIN (SELECT requestid, MAX(nownodeid) AS nownodeid FROM workflow_nownode GROUP BY requestid) nn
+    ON nn.requestid = h.htlc
 LEFT JOIN workflow_nodebase nb ON nb.id = COALESCE(rb.currentnodeid, nn.nownodeid, rb.lastnodeid)
 WHERE h.htlx = %(anchor_contract_type_code)s
   AND h.htzt IN %(migration_status_codes)s
