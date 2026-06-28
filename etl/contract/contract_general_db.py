@@ -111,12 +111,22 @@ ATTACHMENT_TYPE_EFFECTIVE = '合同生效稿'
 
 # 审批流程表单(formtable_main_*)里的三个稿件字段 -> 固定归类。
 # OA「合同相关」显示名: 合同修订稿/合同签署版/合同生效版。
+# 注意: 字段代码因流程/表单而异; 下面是默认(主播协议审批流程 等)的字段名。
 FORM_DOC_FIELD_TYPES = (
     ('htsxb', ATTACHMENT_TYPE_EFFECTIVE),  # 合同生效版(= uf_htk.htqdg)
     ('htqsb', ATTACHMENT_TYPE_SIGNED),     # 合同签署版
     ('htxdg', ATTACHMENT_TYPE_REVISED),    # 合同修订稿
 )
-# 单字段表单(如 formtable_main_26)没有上面三字段, 退回单一稿件字段, 归生效稿。
+# 个别流程的表单字段名与默认不同, 按「表单数据表名」覆盖默认字段(界面标签相同)。
+# 合同补充/终止流程(流程类型 48)= formtable_main_26: 字段名为 htcg/htfwxdg/htqdg。
+FORM_DOC_FIELD_TYPES_BY_TABLE = {
+    'formtable_main_26': (
+        ('htqdg', ATTACHMENT_TYPE_EFFECTIVE),   # 合同生效版
+        ('htfwxdg', ATTACHMENT_TYPE_SIGNED),    # 合同签署版
+        ('htcg', ATTACHMENT_TYPE_REVISED),      # 合同修订稿
+    ),
+}
+# 未匹配到上述稿件字段的表单, 退回单一稿件字段 htqdg, 归生效稿。
 FORM_DOC_FALLBACK_FIELD = 'htqdg'
 
 # 赛事源 uf_htsp 的稿件字段(逗号分隔 docid) -> 固定归类。
@@ -689,9 +699,10 @@ def _load_form_doc_fields(request_form_tables):
     for request_id, tablename in request_form_tables.items():
         requests_by_table.setdefault(tablename, []).append(request_id)
 
-    typed_fields = [field for field, _ in FORM_DOC_FIELD_TYPES]
-    type_by_field = dict(FORM_DOC_FIELD_TYPES)
     for tablename, request_ids in requests_by_table.items():
+        field_types = FORM_DOC_FIELD_TYPES_BY_TABLE.get(tablename, FORM_DOC_FIELD_TYPES)
+        typed_fields = [field for field, _ in field_types]
+        type_by_field = dict(field_types)
         columns = _existing_columns(tablename, [*typed_fields, FORM_DOC_FALLBACK_FIELD])
         present_typed = [field for field in typed_fields if field in columns]
         use_fallback = not present_typed and FORM_DOC_FALLBACK_FIELD in columns

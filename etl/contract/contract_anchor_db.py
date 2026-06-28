@@ -99,13 +99,14 @@ EXCLUDED_OUR_PARTY_NAME_KEYS = {
 }
 EXCLUDED_CONTRACT_NUMBERS = {
     '-T-202202233',
-    '-B-202402005',
-    'CQ-J-202311001',
+    'YF-B-202606001',
 }
 EXCLUDED_CONTRACT_NUMBER_KEYS = {
     re.sub(r'\s+', '', number).upper()
     for number in EXCLUDED_CONTRACT_NUMBERS
 }
+# 工作流状态为「驳回」的合同(被驳回后常被强制归档,节点会显示归档)整份排除,不导入主播流程。
+REJECTED_WORKFLOW_STATUS = '驳回'
 
 # 法务确认: 以下主播收益/签约金/底薪类字段不参与“必输字段未达100%”校验。
 REQUIRED_CHECK_EXCLUDED_FIELDS = {
@@ -164,7 +165,8 @@ SELECT
     h.modedatacreater AS `申请人ID`,
     rb.workflowid AS `流程类型ID`,
     wb.workflowname AS `流程名称`,
-    nb.nodename AS `合同审批状态`
+    nb.nodename AS `合同审批状态`,
+    rb.status AS `合同工作流状态`
 FROM uf_htk h
 LEFT JOIN workflow_requestbase rb ON rb.requestid = h.htlc
 LEFT JOIN workflow_base wb ON wb.id = rb.workflowid
@@ -2535,7 +2537,13 @@ def resolve_source_values(source_df):
         '原合同主播卡片ID', '主播卡片ID',
     ]].copy()
     excluded_contract_df['说明'] = '指定合同编号,主播流程不导入'
-    eligible_mask = ~(excluded_our_party_mask | excluded_contract_mask)
+    rejected_mask = df['合同工作流状态'].map(_text) == REJECTED_WORKFLOW_STATUS
+    excluded_rejected_df = df.loc[rejected_mask, [
+        '合同编号', '合同标题', '合同审批状态', '合同工作流状态', '合同有效期截止时间',
+        '原合同主播卡片ID', '主播卡片ID',
+    ]].copy()
+    excluded_rejected_df['说明'] = '工作流状态为驳回,主播流程不导入'
+    eligible_mask = ~(excluded_our_party_mask | excluded_contract_mask | rejected_mask)
     hand_matched_df = df.loc[eligible_mask & ~no_hand_anchor_mask].copy()
     hand_unmatched_df = df.loc[eligible_mask & no_hand_anchor_mask].copy()
     unmatched_keep_mask = hand_unmatched_df.apply(_is_unmatched_contract_kept, axis=1)
@@ -2558,6 +2566,11 @@ def resolve_source_values(source_df):
         '[合同迁移-主播流程] 排除指定合同: '
         f'{int(excluded_contract_mask.sum())} 条; '
         f'合同编号={"/".join(sorted(EXCLUDED_CONTRACT_NUMBERS))}'
+    )
+    print(
+        '[合同迁移-主播流程] 排除驳回合同: '
+        f'{int(rejected_mask.sum())} 条; '
+        f'workflow_requestbase.status={REJECTED_WORKFLOW_STATUS}'
     )
 
     hand_matched_df['主播处理分组'] = 'Hand生产可查'
@@ -2625,6 +2638,7 @@ def resolve_source_values(source_df):
     result_df.attrs['anchor_replacement_missing_df'] = replacement_missing
     result_df.attrs['excluded_our_party_df'] = excluded_our_party_df
     result_df.attrs['excluded_contract_df'] = excluded_contract_df
+    result_df.attrs['excluded_rejected_df'] = excluded_rejected_df
     print(
         '[合同迁移-主播流程] 最终保留口径: '
         f'Hand生产可查 {len(hand_matched_df)}; '
@@ -3153,6 +3167,10 @@ def collect_excluded_contract(source_df):
     return source_df.attrs.get('excluded_contract_df', pd.DataFrame()).drop_duplicates()
 
 
+def collect_excluded_rejected(source_df):
+    return source_df.attrs.get('excluded_rejected_df', pd.DataFrame()).drop_duplicates()
+
+
 def collect_contract_creator_audit(source_df):
     columns = [
         '主播处理分组', '合同编号', '合同标题', '合同有效期截止时间',
@@ -3248,6 +3266,7 @@ def run():
         '主播替换ID_未匹配': collect_anchor_replacement_missing(source_df),
         '排除我方主体_不导入': collect_excluded_our_party(source_df),
         '排除指定合同_不导入': collect_excluded_contract(source_df),
+        '排除驳回合同_不导入': collect_excluded_rejected(source_df),
         '申请人在职替换核对': collect_contract_creator_audit(source_df),
         '主播卡片补充信息_未匹配': collect_missing_anchor_card(source_df),
         '最终主播卡片_未匹配': collect_missing_final_anchor_card(source_df),
