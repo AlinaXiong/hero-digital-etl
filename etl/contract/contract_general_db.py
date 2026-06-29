@@ -37,6 +37,7 @@ OUTPUT_DIR = c.OUT_DIR / TASK_NAME
 DATE_SUFFIX = c.today_suffix()
 
 TEMPLATE_FILE = TEMPLATE_DIR / '智书合同字段-一般流程.xlsx'
+ANTI_BRIBERY_TEMPLATE_FILE = TEMPLATE_DIR / '签署反商业贿赂协议6.25终版.xlsx'
 RULE_CSV = c.RULES_DIR / '业财项目_数据映射规则 - 合同数据映射规则-for法务.csv'
 # 专项品类映射: 泛微采购品类树(uf_xt_cgpldy)叶子 -> 原一级/二级/三级路径 -> 终版二级分类。
 SPECIAL_CATEGORY_CSV = c.RULES_DIR / '预算项&项目类型底稿 - 供应商分类【新旧mapping】.csv'
@@ -59,6 +60,10 @@ SHEET_PAYMENT_PLAN = '付款计划'
 SHEET_COLLECTION_PLAN = '收款计划'
 SHEET_CONTRACT_ATTACHMENT = '合同附件'
 SHEET_OTHER_ATTACHMENT = '其他附件'
+ANTI_BRIBERY_SOURCE_SHEETS = (
+    '归档的反贿赂供应商',
+    '未归档的反贿赂签署协议',
+)
 ATTACHMENT_FOLDER_MAIN = '主文件'
 ATTACHMENT_FOLDER_ARCHIVE_SCAN = '归档扫描件'
 
@@ -371,9 +376,9 @@ def load_saishi_order_init_mapping():
 
     by_oa = {}
     for _, row in df.iterrows():
-        oa_code = _text(row.get('OA编号'))
         order_code = _text(row.get('订单编号'))
-        if not (oa_code and order_code):
+        oa_codes = c.split_fanwei_project_codes(row.get('OA编号'))
+        if not (oa_codes and order_code):
             continue
         item = {
             '订单编号': order_code,
@@ -383,9 +388,10 @@ def load_saishi_order_init_mapping():
             '项目名称': _text(row.get('项目名称')),
             '映射来源': ORDER_INIT_MAPPING_SOURCE,
         }
-        items = by_oa.setdefault(oa_code, [])
-        if order_code not in {_text(existing.get('订单编号')) for existing in items}:
-            items.append(item)
+        for oa_code in oa_codes:
+            items = by_oa.setdefault(oa_code, [])
+            if order_code not in {_text(existing.get('订单编号')) for existing in items}:
+                items.append(item)
 
     print(
         '[合同迁移-一般流程] 赛事订单初始化映射:',
@@ -404,16 +410,34 @@ def _saishi_order_init_items_for_source(row):
     if not _is_saishi_source(row):
         return []
     mapping = load_saishi_order_init_mapping()
-    for project_code in (
-            row.get('泛微项目编号'),
-            row.get('合同所属项目编号ID'),
-            row.get('项目编号'),
-            row.get('清洗后项目编号')):
-        for key in c.split_fanwei_project_codes(project_code):
-            items = mapping.get(key)
-            if items:
-                return items
+    for key in c.split_fanwei_project_codes(row.get('泛微项目编号')):
+        items = mapping.get(key)
+        if items:
+            return items
     return []
+
+
+def _order_init_items_for_source(row):
+    if _is_saishi_source(row):
+        return _saishi_order_init_items_for_source(row)
+
+    items = []
+    seen_orders = set()
+    for project_code in (row.get('项目编号'), row.get('泛微项目编号'), row.get('清洗后项目编号')):
+        for info in c.cleanable_order_infos_for_project(project_code):
+            order_code = _text(info.get('订单编号'))
+            if not order_code or order_code in seen_orders:
+                continue
+            seen_orders.add(order_code)
+            items.append({
+                '订单编号': order_code,
+                '订单标题': _text(info.get('订单标题')),
+                '申请人员工编码': '',
+                '项目编号': _first_non_blank(*(info.get('项目编号候选') or [])),
+                '项目名称': '',
+                '映射来源': _text(info.get('映射来源')) or ORDER_INIT_MAPPING_SOURCE,
+            })
+    return items
 
 
 def _join_order_item_field(items, field):
@@ -456,6 +480,10 @@ def _normalize_cached(text):
 def _normalize_field_name(value):
     # 热路径: 模板表头/字段名在 5 万行 × 数十字段上反复归一化, 缓存避免重复正则。
     return _normalize_cached(_text(value))
+
+
+def _contract_number_key(value):
+    return re.sub(r'\s+', '', _text(value)).upper()
 
 
 def _first_browser_id(value):
@@ -2218,27 +2246,27 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
         lambda info: _text(info.get('映射来源')) if info else '')
     df['项目编号'] = df.apply(lambda row: _first_non_blank(row['项目编号'], row['泛微项目编号']), axis=1)
     df['项目名称'] = df.apply(lambda row: _first_non_blank(row['项目名称'], row['合同所属项目']), axis=1)
-    df['订单编号'] = df['项目编号'].map(lambda value: c.project_order_mapping_value(value, '订单编号'))
-    df['订单名称'] = df['项目编号'].map(lambda value: c.project_order_mapping_value(value, '订单标题'))
     df['清洗后项目编号'] = df['项目编号']
     df['清洗后项目名称'] = df['项目名称']
-    df['订单映射来源'] = df['项目编号'].map(lambda value: c.project_order_mapping_value(value, '映射来源'))
+    order_init_items = df.apply(_order_init_items_for_source, axis=1)
+    has_order_init_items = order_init_items.map(bool)
+    df['订单编号'] = ''
+    df['订单名称'] = ''
+    df['订单映射来源'] = ''
     df['订单申请人员工编码'] = ''
-    saishi_mask = df['数据来源'].map(_text).eq('泛微(赛事)')
-    if bool(saishi_mask.any()):
-        df.loc[saishi_mask, ['订单编号', '订单名称', '订单映射来源', '订单申请人员工编码']] = ''
-    saishi_order_items = df.apply(_saishi_order_init_items_for_source, axis=1)
-    saishi_has_order = saishi_order_items.map(bool)
-    if bool(saishi_has_order.any()):
-        df.loc[saishi_has_order, '订单编号'] = saishi_order_items[saishi_has_order].map(
+    if bool(has_order_init_items.any()):
+        df.loc[has_order_init_items, '订单编号'] = order_init_items[has_order_init_items].map(
             lambda items: _join_order_item_field(items, '订单编号'))
-        df.loc[saishi_has_order, '订单名称'] = saishi_order_items[saishi_has_order].map(
+        df.loc[has_order_init_items, '订单名称'] = order_init_items[has_order_init_items].map(
             lambda items: _join_order_item_field(items, '订单标题'))
-        df.loc[saishi_has_order, '订单申请人员工编码'] = saishi_order_items[saishi_has_order].map(
+        df.loc[has_order_init_items, '订单申请人员工编码'] = order_init_items[has_order_init_items].map(
             lambda items: _join_order_item_field(items, '申请人员工编码'))
-        df.loc[saishi_has_order, '订单映射来源'] = ORDER_INIT_MAPPING_SOURCE
-        saishi_count = int(saishi_mask.sum())
-        print(f'[合同迁移-一般流程] 赛事订单初始化表命中 {int(saishi_has_order.sum())}/{saishi_count} 行')
+        df.loc[has_order_init_items, '订单映射来源'] = order_init_items[has_order_init_items].map(
+            lambda items: _join_order_item_field(items, '映射来源'))
+    saishi_mask = df['数据来源'].map(_text).eq('泛微(赛事)')
+    saishi_has_order = saishi_mask & has_order_init_items
+    if bool(saishi_mask.any()):
+        print(f'[合同迁移-一般流程] 赛事订单初始化表命中 {int(saishi_has_order.sum())}/{int(saishi_mask.sum())} 行')
     df = _apply_contract_creator_rules(df, status_by_number, status_by_name)
     print(f'[计时] ✓   项目/订单映射(逐行apply): {time.perf_counter() - _t0:.1f}s', flush=True)
 
@@ -2291,22 +2319,60 @@ def _merge_attrs(target_df, source_dfs):
     return target_df
 
 
-def filter_cleanable_contract_scope(source_df):
-    _, _, mapping_file = c.load_cleanable_order_info()
-    if mapping_file is None:
-        source_df.attrs['clean_scope_excluded'] = pd.DataFrame()
-        return source_df
-    keep_mask = source_df.apply(lambda row: bool(_cleanable_order_infos_for_source(row)), axis=1)
-    excluded = source_df.loc[~keep_mask].copy()
-    filtered = source_df.loc[keep_mask].copy()
-    filtered.attrs.update(source_df.attrs)
-    filtered.attrs['clean_scope_excluded'] = excluded
+@lru_cache(maxsize=1)
+def load_anti_bribery_contract_number_keys():
+    """读取反商业贿赂协议任务的来源模板合同编号,供一般流程排除。"""
+    if not ANTI_BRIBERY_TEMPLATE_FILE.exists():
+        print(f'[合同迁移-一般流程] 反贿赂模板不存在,跳过反贿赂合同排除: {ANTI_BRIBERY_TEMPLATE_FILE}')
+        return frozenset()
+
+    keys = set()
+    source_counts = []
+    for sheet_name in ANTI_BRIBERY_SOURCE_SHEETS:
+        try:
+            df = pd.read_excel(ANTI_BRIBERY_TEMPLATE_FILE, sheet_name=sheet_name, dtype=object)
+        except Exception as error:
+            print(f'[合同迁移-一般流程] 反贿赂模板sheet读取失败({sheet_name}),跳过该sheet: {error}')
+            continue
+        if '合同编号' not in df.columns:
+            print(f'[合同迁移-一般流程] 反贿赂模板sheet缺少「合同编号」列,跳过: {sheet_name}')
+            continue
+        sheet_keys = {_contract_number_key(value) for value in df['合同编号']}
+        sheet_keys.discard('')
+        keys.update(sheet_keys)
+        source_counts.append(f'{sheet_name} {len(sheet_keys)} 个')
+
     print(
-        '[合同迁移-一般流程] 清洗范围筛选:',
-        f'保留 {len(filtered)}/{len(source_df)} 条;',
-        f'排除 {len(excluded)} 条(无Y标记订单)',
+        '[合同迁移-一般流程] 反贿赂合同编号排除池:',
+        '; '.join(source_counts) if source_counts else '无有效来源',
+        f'合计去重 {len(keys)} 个',
     )
-    return filtered
+    return frozenset(keys)
+
+
+def _exclude_anti_bribery_contracts(*source_dfs):
+    anti_keys = load_anti_bribery_contract_number_keys()
+    filtered_dfs = []
+    excluded_dfs = []
+    for source_df in source_dfs:
+        if source_df.empty or not anti_keys:
+            filtered_dfs.append(source_df)
+            continue
+        exclude_mask = source_df['合同编号'].map(lambda value: _contract_number_key(value) in anti_keys)
+        excluded = source_df.loc[exclude_mask].copy()
+        filtered = source_df.loc[~exclude_mask].copy()
+        filtered_dfs.append(filtered)
+        if not excluded.empty:
+            excluded_dfs.append(excluded)
+
+    excluded_df = pd.concat(excluded_dfs, ignore_index=True) if excluded_dfs else pd.DataFrame()
+    if not excluded_df.empty:
+        print(
+            '[合同迁移-一般流程] 反贿赂合同排除:',
+            f'{len(excluded_df)} 条;',
+            f'合同编号 {excluded_df["合同编号"].map(_contract_number_key).nunique()} 个',
+        )
+    return (*filtered_dfs, excluded_df)
 
 
 def read_source():
@@ -2326,10 +2392,11 @@ def read_source():
     htsp_df = _timed('read_source/赛事取数(uf_htsp)', lambda: c.query_db(
         'FW', 'vspn_xtyy', SOURCE_SQL_HTSP, {'htsp_status_codes': HTSP_MIGRATION_STATUS_CODES}))
     htsp_df['数据来源'] = '泛微(赛事)'
+    mcn_df, htsp_df, anti_bribery_excluded_df = _exclude_anti_bribery_contracts(mcn_df, htsp_df)
     mcn_codes = set(mcn_df['合同编号'].map(_text))
     before = len(htsp_df)
     htsp_df = htsp_df[~htsp_df['合同编号'].map(_text).isin(mcn_codes)].copy()
-    print(f'[合同迁移-一般流程] 赛事(uf_htsp) 审批中/归档行数 {before}; 去重(MCN优先)后 {len(htsp_df)}')
+    print(f'[合同迁移-一般流程] 赛事(uf_htsp) 反贿赂排除后行数 {before}; 去重(MCN优先)后 {len(htsp_df)}')
 
     resolved_mcn = _timed('read_source/解析MCN(%d行)' % len(mcn_df),
                           lambda: resolve_source_values(mcn_df, option_table=FW_TABLE))
@@ -2341,8 +2408,8 @@ def read_source():
 
     merged = pd.concat([resolved_mcn, resolved_htsp], ignore_index=True)
     _merge_attrs(merged, [resolved_mcn, resolved_htsp])
-    merged = filter_cleanable_contract_scope(merged)
-    merged = _apply_supplement_amount_rollup(merged)
+    merged.attrs['anti_bribery_excluded'] = anti_bribery_excluded_df
+    merged = _timed('read_source/补充协议金额汇总', lambda: _apply_supplement_amount_rollup(merged))
     # 赛事收支计划明细(uf_htsp_dt4): 供付款/收款计划按 dt4 真实多期展开。
     plan_map = (
         _timed('read_source/赛事收支计划dt4', lambda: load_htsp_plan_detail_map(resolved_htsp['ID']))
@@ -2902,17 +2969,20 @@ def build_order_audit_df(source_df):
     ])
 
 
-def build_clean_scope_excluded_df(source_df):
-    excluded = source_df.attrs.get('clean_scope_excluded')
+def build_anti_bribery_excluded_df(source_df):
+    excluded = source_df.attrs.get('anti_bribery_excluded')
+    columns = [
+        '数据来源', '合同编号', '合同标题', '合同签署状态ID', '合同流程ID',
+        '流程类型ID', '流程名称', '合同审批状态', '排除原因',
+    ]
     if excluded is None or excluded.empty:
-        return pd.DataFrame(columns=[
-            '数据来源', '合同编号', '合同标题', '泛微项目编号', '清洗后项目编号', '订单编号', '排除原因',
-        ])
+        return pd.DataFrame(columns=columns)
     result = _audit_df(excluded, [
-        '数据来源', '合同编号', '合同标题', '泛微项目编号', '清洗后项目编号', '订单编号', '订单名称',
+        '数据来源', '合同编号', '合同标题', '合同签署状态ID', '合同流程ID',
+        '流程类型ID', '流程名称', '合同审批状态',
     ])
-    result['排除原因'] = f'{c.PROJECT_ORDER_MAPPING_XLSX_NAME} 未找到标注Y的对应订单'
-    return result
+    result['排除原因'] = '合同编号已由 contract_anti_bribery_db 处理'
+    return result.reindex(columns=columns)
 
 
 def build_supplement_amount_backtest_df(source_df):
@@ -3069,7 +3139,7 @@ def run():
         '关联合同编号_未匹配': collect_missing_relation(relation_source_df),
         '合同附件下载清单': contract_attachment_meta_df,
         '合同附件DOCID_缺失映射': contract_attachment_missing_df,
-        '清洗范围_无Y订单排除': build_clean_scope_excluded_df(source_df),
+        '反贿赂合同排除': build_anti_bribery_excluded_df(source_df),
         '补充协议金额回测': build_supplement_amount_backtest_df(source_df),
     }
     exception_sheets.update({
