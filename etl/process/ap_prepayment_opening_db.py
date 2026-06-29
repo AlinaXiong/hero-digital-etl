@@ -1104,6 +1104,7 @@ def load_mcn_fee_subjects():
         if old_code and subject_code:
             result[old_code] = (subject_code, subject_name)
     result.setdefault('JG', ('AB0103', '其他周边搭建'))
+    result.update(c.build_fanwei_fee_item_override_map())
     _MCN_FEE_SUBJECT_CACHE = result
     return result
 
@@ -1639,6 +1640,7 @@ def build_supplier_output(merged_df):
     output_df['已付未核（支付币种）'] = unsettled_amount.map(c.round_amount)     # [明细] yfje(预付金额) - 已到票核销金额
     output_df['泛微费用项目编码'] = merged_df['预算科目'].where(
         merged_df['预算科目'].notna(), '')                               # [明细] yskm -> 原泛微预算科目路径
+    output_df = c.apply_order_multi_mapping_fix(output_df)
     return output_df[SUPPLIER_OUTPUT_COLUMNS]
 
 
@@ -1736,6 +1738,7 @@ def build_gig_output(merged_df):
     output_df['核算主体编号'] = merged_df['公司主体'].map(
         lambda value: entity_map.get(c.normalize_name(value), '') if _text(value) else '')  # [建模头] gszt(公司主体) -> Hand 核算主体编号
     output_df['核算主体描述'] = merged_df['公司主体']                    # [建模头] gszt(公司主体) -> uf_gstt.gsmc(公司主体名称)
+    output_df = c.apply_order_multi_mapping_fix(output_df)
     return output_df[GIG_OUTPUT_COLUMNS]
 
 
@@ -2033,6 +2036,7 @@ def build_mcn_supplier_output(source_df, fill_anchor_room=False):
         _fanwei_fee_item_display(code, name)
         for code, name in zip(source_df['费用项编码'], source_df.get('费用项名称', pd.Series('', index=source_df.index)))
     ]
+    output_df = c.apply_order_multi_mapping_fix(output_df)
     return output_df[SUPPLIER_OUTPUT_COLUMNS]
 
 
@@ -2258,6 +2262,7 @@ def build_mcn_gig_output(
         _fanwei_fee_item_display(code, name)
         for code, name in zip(source_df['费用项编码'], source_df.get('费用项名称', pd.Series('', index=source_df.index)))
     ]
+    output_df = c.apply_order_multi_mapping_fix(output_df)
     return output_df[GIG_OUTPUT_COLUMNS]
 
 

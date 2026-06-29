@@ -32,6 +32,12 @@ DATE_SUFFIX = c.today_suffix()
 PROJECT_FILTER_ENV = 'PROJECT_FILTER_XLSX'
 PROJECT_FILTER_DEFAULT_FILE = c.RULES_DIR / '数据清洗涉及泛微项目编码_0629_分类.xlsx'
 PROJECT_FILTER_FILE = Path(os.getenv(PROJECT_FILTER_ENV, '').strip() or PROJECT_FILTER_DEFAULT_FILE)
+PAYMENT_VENDOR_FIX_ENV = 'AP_PAYMENT_VENDOR_FIX_XLSX'
+PAYMENT_VENDOR_FIX_DEFAULT_FILE = c.RULES_DIR / '问题处理-应付单据-收款方编码缺失或错误.xlsx'
+PAYMENT_VENDOR_FIX_FILE = Path(os.getenv(PAYMENT_VENDOR_FIX_ENV, '').strip() or PAYMENT_VENDOR_FIX_DEFAULT_FILE)
+FEE_ITEM_FIX_ENV = 'AP_FEE_ITEM_FIX_XLSX'
+FEE_ITEM_FIX_DEFAULT_FILE = c.RULES_DIR / '费用项目编码映射.xlsx'
+FEE_ITEM_FIX_FILE = Path(os.getenv(FEE_ITEM_FIX_ENV, '').strip() or FEE_ITEM_FIX_DEFAULT_FILE)
 
 TEMPLATE_FILE = TEMPLATE_DIR / '英雄期初对公付款单导入模版.xlsx'
 OUTPUT_FILE = OUTPUT_DIR / f'英雄期初对公付款单导入_应付期初全量_{DATE_SUFFIX}.xlsx'
@@ -54,6 +60,7 @@ DOCUMENT_TYPE = 'AP01-1'
 DATE_FROM = '2026-01-01'
 SOURCE_SYSTEM = 'FW'
 VIRTUAL_VENDOR_NAME = '外部成本转移虚拟供应商'
+VIRTUAL_VENDOR_PROJECT_CODES = {'A3-2026-001'}
 DIRECT_PAYMENT_PLATFORM_CODE = '2'
 NOT_PREPAYMENT_CODE = '1'
 DEPARTMENT_MODULE_CODE = '1'
@@ -62,6 +69,9 @@ MCN_PROJECT_SHEET = 'MCN'
 EVENT_PROJECT_TABLES = ('uf_xtyyxmkp', 'uf_xmkp', 'view_xmjkzb')
 MCN_PROJECT_TABLES = ('uf_xmkp', 'view_xmjkzb', 'uf_xtyyxmkp')
 SQL_BATCH_SIZE = 800
+_VIRTUAL_VENDOR_CODE_CACHE = None
+_PAYMENT_VENDOR_FIX_CACHE = None
+_FEE_ITEM_FIX_CACHE = None
 
 OUTPUT_COLUMNS = [
     '来源系统',
@@ -79,6 +89,7 @@ OUTPUT_COLUMNS = [
     '合同收支计划行',
     '收款方编码',
     '收款方描述',
+    '身份证号',
     '银行账号',
     '计划付款日期',
     '银行转账备注',
@@ -99,8 +110,8 @@ SOURCE_CODES = (2, 10)
 PAYMENT_STATUS_MEANINGS = {
     0: '已支付',
 }
-# 原 base build_output 落库列序:比 OUTPUT_COLUMNS 少「泛微项目编号」(该列由 _apply_order_project_columns 追加)。
-BASE_OUTPUT_COLUMNS = [column for column in OUTPUT_COLUMNS if column != '泛微项目编号']
+# 原 base build_output 落库列序:项目/订单补充列和身份证号由 _apply_order_project_columns 统一追加。
+BASE_OUTPUT_COLUMNS = [column for column in OUTPUT_COLUMNS if column not in ('泛微项目编号', '身份证号')]
 
 BATCH_ISSUE_SOURCE_FIELDS = {
     '申请人工号': '申请人',
@@ -664,6 +675,7 @@ def load_mcn_fee_subjects():
         if old_code and subject_code:
             result[old_code] = (subject_code, subject_name)
     result.setdefault('JG', ('AB0103', '其他周边搭建'))
+    result.update(c.build_fanwei_fee_item_override_map())
     _MCN_FEE_SUBJECT_CACHE = result
     return result
 
@@ -816,6 +828,159 @@ def _filter_by_project_whitelist(source_df, project_column, sheet_name, table_or
     return filtered
 
 
+def _virtual_vendor_code():
+    global _VIRTUAL_VENDOR_CODE_CACHE
+    if _VIRTUAL_VENDOR_CODE_CACHE is None:
+        vendor_map = c.build_vendor_map()
+        _VIRTUAL_VENDOR_CODE_CACHE = vendor_map.get(c.normalize_name(VIRTUAL_VENDOR_NAME), '')
+    return _VIRTUAL_VENDOR_CODE_CACHE
+
+
+def _apply_virtual_vendor_project_rule(df, project_codes):
+    """指定项目的应付流程统一使用外部成本转移虚拟供应商。"""
+    mask = project_codes.isin(VIRTUAL_VENDOR_PROJECT_CODES)
+    if not mask.any():
+        return df
+
+    vendor_code = _virtual_vendor_code()
+    df.loc[mask, '收款方编码'] = vendor_code
+    df.loc[mask, '收款方描述'] = VIRTUAL_VENDOR_NAME
+    df.loc[mask, '银行账号'] = c.resolve_hand_vendor_bank_accounts(df.loc[mask, '收款方编码'])
+    return df
+
+
+def _load_payment_vendor_fix_df():
+    """读取需按 Excel 修正收款方信息的应付流程明细。"""
+    global _PAYMENT_VENDOR_FIX_CACHE
+    if _PAYMENT_VENDOR_FIX_CACHE is not None:
+        return _PAYMENT_VENDOR_FIX_CACHE
+
+    columns = ['来源单据编号', '收款方编码', '收款方描述', '身份证号', '银行账号']
+    if not PAYMENT_VENDOR_FIX_FILE.exists():
+        print(f'[应付期初-收款方修正] 未找到修正表: {PAYMENT_VENDOR_FIX_FILE}')
+        _PAYMENT_VENDOR_FIX_CACHE = pd.DataFrame(columns=[*columns, '_流程行序号'])
+        return _PAYMENT_VENDOR_FIX_CACHE
+
+    fix_df = pd.read_excel(PAYMENT_VENDOR_FIX_FILE, sheet_name=0, dtype=str, engine='openpyxl')
+    missing_columns = [column for column in columns if column not in fix_df.columns]
+    if missing_columns:
+        raise ValueError(
+            f'{PAYMENT_VENDOR_FIX_FILE} 缺少列: {", ".join(missing_columns)}'
+        )
+
+    fix_df = fix_df[columns].copy()
+    for column in columns:
+        fix_df[column] = fix_df[column].map(_text)
+    fix_df = fix_df[fix_df['来源单据编号'] != ''].copy()
+    fix_df['_流程行序号'] = fix_df.groupby('来源单据编号', sort=False).cumcount()
+    print(
+        f'[应付期初-收款方修正] 使用: {PAYMENT_VENDOR_FIX_FILE} '
+        f'| 流程 {fix_df["来源单据编号"].nunique()} 个 | 明细 {len(fix_df)} 行'
+    )
+    _PAYMENT_VENDOR_FIX_CACHE = fix_df
+    return _PAYMENT_VENDOR_FIX_CACHE
+
+
+def _apply_payment_vendor_fix_rule(df):
+    """命中问题处理 Excel 的流程明细时,收款方字段直接以 Excel 为准。"""
+    fix_df = _load_payment_vendor_fix_df()
+    if fix_df.empty or df.empty or '来源单据编号' not in df.columns:
+        return df
+
+    result = df.copy()
+    result['_流程行序号'] = result.groupby('来源单据编号', sort=False).cumcount()
+    fix_lookup = fix_df.copy()
+    fix_lookup['_命中收款方修正'] = True
+    merged = result[['来源单据编号', '_流程行序号']].merge(
+        fix_lookup,
+        on=['来源单据编号', '_流程行序号'],
+        how='left',
+        sort=False,
+    )
+    matched = merged['_命中收款方修正'].fillna(False).astype(bool)
+    if matched.any():
+        for column in ['收款方编码', '收款方描述', '身份证号', '银行账号']:
+            result.loc[matched.to_numpy(), column] = merged.loc[matched, column].to_numpy()
+        print(f'[应付期初-收款方修正] Excel覆盖 {int(matched.sum())} 行')
+
+    result = result.drop(columns=['_流程行序号'])
+    return result
+
+
+def _load_fee_item_fix_df():
+    """读取需按 Excel 兜底费用项目编码/描述的应付单据。"""
+    global _FEE_ITEM_FIX_CACHE
+    if _FEE_ITEM_FIX_CACHE is not None:
+        return _FEE_ITEM_FIX_CACHE
+
+    columns = ['来源单据编号', '费用项目编码', '费用项目描述']
+    if not FEE_ITEM_FIX_FILE.exists():
+        print(f'[应付期初-费用项目兜底] 未找到映射表: {FEE_ITEM_FIX_FILE}')
+        _FEE_ITEM_FIX_CACHE = pd.DataFrame(columns=columns)
+        return _FEE_ITEM_FIX_CACHE
+
+    fix_df = pd.read_excel(FEE_ITEM_FIX_FILE, sheet_name=0, dtype=str, engine='openpyxl')
+    missing_columns = [column for column in columns if column not in fix_df.columns]
+    if missing_columns:
+        raise ValueError(
+            f'{FEE_ITEM_FIX_FILE} 缺少列: {", ".join(missing_columns)}'
+        )
+
+    fix_df = fix_df[columns].copy()
+    for column in columns:
+        fix_df[column] = fix_df[column].map(_text)
+    fix_df = fix_df[
+        (fix_df['来源单据编号'] != '')
+        & ((fix_df['费用项目编码'] != '') | (fix_df['费用项目描述'] != ''))
+    ].drop_duplicates()
+
+    conflict = (
+        fix_df.groupby('来源单据编号')[['费用项目编码', '费用项目描述']]
+        .nunique()
+        .reset_index()
+    )
+    conflict = conflict[(conflict['费用项目编码'] > 1) | (conflict['费用项目描述'] > 1)]
+    if len(conflict) > 0:
+        sample = conflict.head(10).to_dict('records')
+        raise ValueError(f'{FEE_ITEM_FIX_FILE} 存在同一来源单据编号指定多个费用项目: {sample}')
+
+    fix_df = fix_df.drop_duplicates('来源单据编号', keep='first')
+    print(
+        f'[应付期初-费用项目兜底] 使用: {FEE_ITEM_FIX_FILE} '
+        f'| 单据 {fix_df["来源单据编号"].nunique()} 个'
+    )
+    _FEE_ITEM_FIX_CACHE = fix_df
+    return _FEE_ITEM_FIX_CACHE
+
+
+def _apply_fee_item_fix_rule(df):
+    """费用项目编码/描述未匹配时,按 Excel 指定值兜底。"""
+    fix_df = _load_fee_item_fix_df()
+    required_columns = {'来源单据编号', '费用项目编码', '费用项目描述'}
+    if fix_df.empty or df.empty or not required_columns.issubset(df.columns):
+        return df
+
+    result = df.copy()
+    fix_by_doc = fix_df.set_index('来源单据编号')
+    fix_codes = result['来源单据编号'].map(fix_by_doc['费用项目编码'])
+    fix_descriptions = result['来源单据编号'].map(fix_by_doc['费用项目描述'])
+
+    code_mask = (result['费用项目编码'].map(_text) == '') & (fix_codes.map(_text) != '')
+    description_mask = (
+        (result['费用项目描述'].map(_text) == '')
+        & (fix_descriptions.map(_text) != '')
+    )
+    if code_mask.any():
+        result.loc[code_mask, '费用项目编码'] = fix_codes.loc[code_mask].to_numpy()
+    if description_mask.any():
+        result.loc[description_mask, '费用项目描述'] = fix_descriptions.loc[description_mask].to_numpy()
+
+    matched_count = int((code_mask | description_mask).sum())
+    if matched_count:
+        print(f'[应付期初-费用项目兜底] Excel覆盖 {matched_count} 行')
+    return result
+
+
 def _apply_order_project_columns(output_df, source_df, table_order=EVENT_PROJECT_TABLES):
     """按预付期初口径补充泛微项目编号,并用订单申请初始化导入表映射订单字段。"""
     df = output_df.copy()
@@ -836,6 +1001,15 @@ def _apply_order_project_columns(output_df, source_df, table_order=EVENT_PROJECT
         ]
     elif '预算科目' in source_df.columns:
         df['泛微费用项目编码'] = source_df['预算科目'].where(source_df['预算科目'].notna(), '')
+    if '身份证号' not in df.columns:
+        if '身份证号' in source_df.columns:
+            df['身份证号'] = source_df['身份证号'].map(_text)
+        else:
+            df['身份证号'] = ''
+    df = _apply_virtual_vendor_project_rule(df, project_codes)
+    df = _apply_payment_vendor_fix_rule(df)
+    df = c.apply_order_multi_mapping_fix(df)
+    df = _apply_fee_item_fix_rule(df)
     return df[OUTPUT_COLUMNS]
 
 
@@ -1390,7 +1564,7 @@ def build_batch_output(source_df):
     )
     entity_map = c.build_accounting_entity_map_for_names(source_df['公司主体'])
     subject_lookup = c.build_subject_map()
-    amount = pd.to_numeric(source_df['金额'], errors='coerce')
+    amount = pd.to_numeric(source_df['金额'], errors='coerce').fillna(0)
 
     def vendor_field(index, field):
         return vendor_info_map.get(index, {}).get(field, '')

@@ -41,7 +41,17 @@ PROJECT_ORDER_MAPPING_ENV = 'PROJECT_ORDER_MAPPING_XLSX'
 PROJECT_ORDER_MAPPING_XLSX_NAME = '订单申请初始化导入-基础信息+财务信息.xlsx'
 PROJECT_ORDER_INIT_SHEET = '基础信息+财务信息'
 PROJECT_ORDER_INIT_KEY_COLUMN = 'OA编号'
+ORDER_MULTI_MAPPING_FIX_ENV = 'ORDER_MULTI_MAPPING_FIX_XLSX'
+ORDER_MULTI_MAPPING_FIX_XLSX_NAME = '问题表-订单多映射.xlsx'
+FANWEI_FEE_ITEM_OVERRIDES = (
+    ('AV0501', '水费', 'AR日常运营费用/AR6房屋租赁/AR63能源消耗/AR633水费/AR6331办公房屋'),
+    ('AV0401', '电费', 'AR日常运营费用/AR6房屋租赁/AR63能源消耗/AR631电费/AR6311办公房屋'),
+    ('AV0301', '能耗费', 'AR日常运营费用/AR6房屋租赁/AR63能源消耗/AR632能耗费/AR6321办公房屋'),
+    ('AF0601', '货运费', 'AF第三方人员费用/AF5车辆物流'),
+    ('AN0201', '城际交通-内部', 'AR日常运营费用/AR1差旅费/AR12国际差旅费'),
+)
 _PROJECT_ORDER_MAPPING_CACHE = None
+_ORDER_MULTI_MAPPING_FIX_CACHE = None
 _CLEANED_PROJECT_MAPPING_CACHE = None
 _CLEANABLE_ORDER_INFO_CACHE = None
 
@@ -1884,6 +1894,18 @@ def _find_project_order_mapping_file():
     return None
 
 
+def _find_order_multi_mapping_fix_file():
+    configured = os.getenv(ORDER_MULTI_MAPPING_FIX_ENV, '').strip()
+    if configured:
+        path = Path(configured)
+        if path.exists():
+            return path
+        print(f'[订单多映射指定] {ORDER_MULTI_MAPPING_FIX_ENV} 指向的文件不存在:', configured)
+
+    path = RULES_DIR / ORDER_MULTI_MAPPING_FIX_XLSX_NAME
+    return path if path.exists() else None
+
+
 def _order_init_source_label(path):
     return f'{Path(path).name}:{PROJECT_ORDER_INIT_SHEET}({PROJECT_ORDER_INIT_KEY_COLUMN})'
 
@@ -2134,6 +2156,106 @@ def project_order_mapping_value(project_code, field):
     return safe_map.get(_cell_text(project_code), {}).get(field, '')
 
 
+def load_order_multi_mapping_fix():
+    """读取多候选订单的人工指定结果,键为 (来源单据编号, 泛微项目编号)。"""
+    global _ORDER_MULTI_MAPPING_FIX_CACHE
+    if _ORDER_MULTI_MAPPING_FIX_CACHE is not None:
+        return _ORDER_MULTI_MAPPING_FIX_CACHE
+
+    fix_file = _find_order_multi_mapping_fix_file()
+    columns = ['来源单据编号', '泛微项目编号', '指定订单编号', '来源Sheet']
+    if fix_file is None:
+        print('[订单多映射指定] 未找到问题表,多候选订单编号保持为空。')
+        _ORDER_MULTI_MAPPING_FIX_CACHE = pd.DataFrame(columns=columns)
+        return _ORDER_MULTI_MAPPING_FIX_CACHE
+
+    rows = []
+    try:
+        sheet_names = pd.ExcelFile(fix_file, engine='openpyxl').sheet_names
+        for sheet_name in sheet_names:
+            sheet_df = pd.read_excel(
+                fix_file,
+                sheet_name=sheet_name,
+                dtype=str,
+                keep_default_na=False,
+                engine='openpyxl',
+            )
+            required = {'来源单据编号', '泛微项目编号', '指定订单编号'}
+            missing = required - set(sheet_df.columns)
+            if missing:
+                raise ValueError(f'{sheet_name} 缺少列: {sorted(missing)}')
+            for _, row in sheet_df.iterrows():
+                doc_no = _cell_text(row.get('来源单据编号'))
+                project_code = _cell_text(row.get('泛微项目编号'))
+                order_code = _cell_text(row.get('指定订单编号'))
+                if doc_no and project_code and order_code:
+                    rows.append({
+                        '来源单据编号': doc_no,
+                        '泛微项目编号': project_code,
+                        '指定订单编号': order_code,
+                        '来源Sheet': sheet_name,
+                    })
+    except Exception as error:
+        raise ValueError(f'{ORDER_MULTI_MAPPING_FIX_XLSX_NAME} 读取失败: {error}') from error
+
+    if not rows:
+        fix_df = pd.DataFrame(columns=columns)
+    else:
+        fix_df = pd.DataFrame(rows, columns=columns).drop_duplicates()
+        conflict = (
+            fix_df.groupby(['来源单据编号', '泛微项目编号'])['指定订单编号']
+            .nunique()
+            .reset_index(name='指定订单数')
+        )
+        conflict = conflict[conflict['指定订单数'] > 1]
+        if len(conflict) > 0:
+            sample = conflict.head(10).to_dict('records')
+            raise ValueError(f'{ORDER_MULTI_MAPPING_FIX_XLSX_NAME} 存在同一单据+项目指定多个订单: {sample}')
+        fix_df = fix_df.drop_duplicates(['来源单据编号', '泛微项目编号'], keep='first')
+
+    print(
+        '[订单多映射指定] 使用:',
+        fix_file,
+        '| 指定记录数:', len(fix_df),
+        '| 单据数:', fix_df['来源单据编号'].nunique() if len(fix_df) else 0,
+        '| 项目数:', fix_df['泛微项目编号'].nunique() if len(fix_df) else 0,
+    )
+    _ORDER_MULTI_MAPPING_FIX_CACHE = fix_df
+    return _ORDER_MULTI_MAPPING_FIX_CACHE
+
+
+def apply_order_multi_mapping_fix(
+        output_df, doc_col='来源单据编号', project_col='泛微项目编号',
+        order_col='订单编号'):
+    """按《问题表-订单多映射》覆盖多候选项目的订单编号。"""
+    if output_df.empty or not {doc_col, project_col, order_col}.issubset(output_df.columns):
+        return output_df
+
+    fix_df = load_order_multi_mapping_fix()
+    if fix_df.empty:
+        return output_df
+
+    result = output_df.copy()
+    keys = pd.DataFrame({
+        '_row_pos': range(len(result)),
+        '来源单据编号': result[doc_col].map(_cell_text),
+        '泛微项目编号': result[project_col].map(_cell_text),
+    })
+    merged = keys.merge(
+        fix_df[['来源单据编号', '泛微项目编号', '指定订单编号']],
+        on=['来源单据编号', '泛微项目编号'],
+        how='left',
+        sort=False,
+    )
+    matched = merged['指定订单编号'].map(_cell_text) != ''
+    if matched.any():
+        row_positions = merged.loc[matched, '_row_pos'].astype(int).to_numpy()
+        order_col_index = result.columns.get_loc(order_col)
+        result.iloc[row_positions, order_col_index] = merged.loc[matched, '指定订单编号'].to_numpy()
+        print(f'[订单多映射指定] 覆盖订单编号 {int(matched.sum())} 行')
+    return result
+
+
 def collect_order_mapping_issues(
         source_df, doc_col='流程编号', project_col='项目编号',
         project_id_col='项目编号ID', project_name_col='项目名称'):
@@ -2162,10 +2284,15 @@ def collect_order_mapping_issues(
         }])
         return sheets
 
+    fixed_order_df = load_order_multi_mapping_fix()
+    fixed_order_keys = set()
+    if len(fixed_order_df) > 0:
+        fixed_order_keys = set(zip(fixed_order_df['来源单据编号'], fixed_order_df['泛微项目编号']))
+
     ambiguous_rows = []
     for _, row in rows.iterrows():
         candidates = ambiguous_map.get(row['泛微项目编号'])
-        if candidates:
+        if candidates and (row['来源单据编号'], row['泛微项目编号']) not in fixed_order_keys:
             ambiguous_rows.append({
                 '来源单据编号': row['来源单据编号'],
                 '泛微项目编号': row['泛微项目编号'],
@@ -2223,6 +2350,17 @@ def _first_subject_pair(row, pairs):
 def _read_rule_sheet(sheet_name):
     return pd.read_excel(RULE_XLSX, sheet_name=sheet_name, header=None, engine='calamine')
 
+
+def build_fanwei_fee_item_override_map():
+    """泛微费用项目编码路径 -> (费用项目编码, 费用项目描述)。"""
+    result = {}
+    for code, name, fanwei_code in FANWEI_FEE_ITEM_OVERRIDES:
+        normalized_key = remove_slashes(fanwei_code)
+        if normalized_key:
+            result[normalized_key] = (code, name)
+        if fanwei_code:
+            result[fanwei_code] = (code, name)
+    return result
 
 def build_subject_map():
     """费用科目(预算科目)-> (费用项目编码, 费用项目描述)。
@@ -2282,6 +2420,7 @@ def build_subject_map():
         if subject_code:
             for key in (k for k in keys if k):
                 subject_map.setdefault(key, (subject_code, subject_name))
+    subject_map.update(build_fanwei_fee_item_override_map())
     return subject_map
 
 
