@@ -10,6 +10,7 @@
 跑法:在项目根执行  python run.py ar_invoice_opening_db
 """
 import sys
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -63,6 +64,7 @@ OUTPUT_COLUMNS = [
     '开票类型编码',
     '核销金额',
     '头备注',
+    '发票号',
     '自审批',
     '自审核',
     '凭证推送',
@@ -91,6 +93,7 @@ ISSUE_SOURCE_FIELD_MAP = {
     '支付币种': '开票币种',
     '付款对象': '客户',
     '合同编号': '开票合同ID',
+    '发票号': '发票号',
     '业务类型编码': '业务类型',
     '核销金额': '收款登记已收款金额',
     '金额': '开票金额（含税价）',
@@ -101,6 +104,7 @@ ISSUE_SOURCE_FIELD_MAP = {
 
 FW_INVOICE_TABLE = 'uf_xtyykp'
 FW_RECEIPT_TABLE = 'uf_skdj'
+INVOICE_NUMBER_SEPARATOR_RE = re.compile(r'[,，、;；|\s]+')
 
 
 # ============================ 枚举 / 过滤口径 ============================
@@ -160,6 +164,7 @@ SELECT
     m.se AS `税额`,
     m.kpbz AS `开票币种ID`,
     m.kptxt AS `开票备注`,
+    m.fphm AS `发票号`,
     m.ywlx AS `业务类型ID`,
     m.xmje AS `不含税金额（明细）`,
     m.xmjshj AS `价税合计（明细）`,
@@ -212,6 +217,7 @@ EXPECTED_INVOICE_FIELDS = {
         'kpbz': '开票币种',
         'sfzf': '是否作废',
         'kptxt': '开票备注',
+        'fphm': '发票号码',
         'ywlx': '业务类型',
         'xmje': '不含税金额（明细）',
         'xmjshj': '价税合计（明细）',
@@ -254,6 +260,15 @@ def _lookup_first_browser_value(mapping, value):
         if mapped:
             return mapped
     return ''
+
+
+def _invoice_numbers_text(value):
+    """发票号码可能录成逗号、顿号、分号或换行分隔,输出统一用英文逗号。"""
+    text = _text(value)
+    if not text:
+        return ''
+    invoice_numbers = [part.strip() for part in INVOICE_NUMBER_SEPARATOR_RE.split(text) if part.strip()]
+    return ','.join(invoice_numbers)
 
 
 def resolve_business_type_name(value):
@@ -345,7 +360,7 @@ def _tax_description(value, tax_description_map):
 
 
 def build_output(invoice_df):
-    """DB 源数据 -> 应收报账单期初导入模板 71 列。
+    """DB 源数据 -> 应收报账单期初导入模板 73 列。
     能从泛微 DB 原始字段/ID 直接取得的字段直接取;跨系统编码再查中台/值集。
     """
     # 核算主体: [开票表] gszt -> 公司主体名称 -> Hand hfac_accounting_entity.acc_entity_code。
@@ -384,6 +399,7 @@ def build_output(invoice_df):
         invoice_df['开票合同'].notna(), '')                          # [开票表] kpht -> uf_htsp.htbh
     output_df['头备注'] = invoice_df['开票备注'].astype(str).where(
         invoice_df['开票备注'].notna(), '').str.slice(0, 150)         # [开票表] kptxt,截前150字符
+    output_df['发票号'] = invoice_df['发票号'].map(_invoice_numbers_text)  # [开票表] fphm,多个发票号用英文逗号隔开
 
     # 当前口径没有直接可用的维度字段,按模板留空。
     output_df['里程碑阶段'] = ''
