@@ -30,7 +30,7 @@ OUTPUT_DIR = c.OUT_DIR / TASK_NAME
 DATE_SUFFIX = c.today_suffix()
 
 PROJECT_FILTER_ENV = 'PROJECT_FILTER_XLSX'
-PROJECT_FILTER_DEFAULT_FILE = c.RULES_DIR / '数据清洗涉及泛微项目编码_0624_分类.xlsx'
+PROJECT_FILTER_DEFAULT_FILE = c.RULES_DIR / '数据清洗涉及泛微项目编码_0629_分类.xlsx'
 PROJECT_FILTER_FILE = Path(os.getenv(PROJECT_FILTER_ENV, '').strip() or PROJECT_FILTER_DEFAULT_FILE)
 
 TEMPLATE_FILE = TEMPLATE_DIR / '英雄期初对公付款单导入模版.xlsx'
@@ -817,7 +817,7 @@ def _filter_by_project_whitelist(source_df, project_column, sheet_name, table_or
 
 
 def _apply_order_project_columns(output_df, source_df, table_order=EVENT_PROJECT_TABLES):
-    """按预付期初口径补充泛微项目编号,并用项目&订单清洗表映射订单字段。"""
+    """按预付期初口径补充泛微项目编号,并用订单申请初始化导入表映射订单字段。"""
     df = output_df.copy()
     project_source_df = _with_resolved_project_fields(source_df, table_order=table_order)
     project_codes = project_source_df['项目编号'].map(_text)

@@ -6,7 +6,7 @@
 输出:同目录下生成 *_平铺去重.xlsx,第一列每行一个编码,保持首次出现顺序去重。
 
 用法:
-    python etl/util/flatten_project_codes.py "C:\\path\\数据清洗涉及泛微项目编码_0624.xlsx"
+    python etl/util/flatten_project_codes.py "C:\\path\\数据清洗涉及泛微项目编码_0629.xlsx"
     # 不传参数时默认处理下面 DEFAULT_INPUT
 """
 import re
@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 
-DEFAULT_INPUT = Path.home() / 'Downloads' / '数据清洗涉及泛微项目编码_0624.xlsx'
+DEFAULT_INPUT = Path(__file__).resolve().parents[2] / 'resources' / 'source' / 'other_cleaned_data' / '数据清洗涉及泛微项目编码_0629.xlsx'
 
 # 分隔符:中英文分号、顿号、中英文逗号、斜杠、竖线及各类空白
 SEP_RE = re.compile(r'[;；、，,/|\s]+')

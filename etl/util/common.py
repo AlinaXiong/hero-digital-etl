@@ -12,7 +12,6 @@ import re
 import json
 import atexit
 import unicodedata
-import html
 import http.client
 import time
 import urllib.error
@@ -39,14 +38,9 @@ SUPPLIER_VENDOR_MAPPING_JSON = SRC_DIR / 'supplier_vendor_aliases.json'
 CUSTOMER_ALIAS_MAPPING_JSON = SRC_DIR / 'customer_aliases.json'
 SUPPLIER_VENDOR_NAME_MATCH_JSON = SRC_DIR / 'supplier_vendor_name_matches.json'
 PROJECT_ORDER_MAPPING_ENV = 'PROJECT_ORDER_MAPPING_XLSX'
-PROJECT_ORDER_MAPPING_XLSX_NAME = '业财项目_项目订单清洗汇总终版.xlsx'
-PROJECT_ORDER_MAPPING_SHEETS = {
-    '全量项目': '全量项目_清洗后',
-    '全量订单': '全量订单主表_清洗后',
-    '订单明细': '全量订单明细行表_清洗后',
-}
-CLEANED_PROJECT_SOURCE_SHEETS = ('赛事专项项目_清洗前', 'MCN专项项目_清洗前')
-PROJECT_ORDER_CLEANABLE_COLUMN = '是否可洗流程'
+PROJECT_ORDER_MAPPING_XLSX_NAME = '订单申请初始化导入-基础信息+财务信息.xlsx'
+PROJECT_ORDER_INIT_SHEET = '基础信息+财务信息'
+PROJECT_ORDER_INIT_KEY_COLUMN = 'OA编号'
 _PROJECT_ORDER_MAPPING_CACHE = None
 _CLEANED_PROJECT_MAPPING_CACHE = None
 _CLEANABLE_ORDER_INFO_CACHE = None
@@ -1890,158 +1884,109 @@ def _find_project_order_mapping_file():
     return None
 
 
-def _dedupe_headers(headers):
-    seen = {}
-    deduped_headers = []
-    for header in headers:
-        header = header or '未命名'
-        if header in seen:
-            seen[header] += 1
-            header = f'{header}.{seen[header]}'
-        else:
-            seen[header] = 0
-        deduped_headers.append(header)
-    return deduped_headers
+def _order_init_source_label(path):
+    return f'{Path(path).name}:{PROJECT_ORDER_INIT_SHEET}({PROJECT_ORDER_INIT_KEY_COLUMN})'
 
 
-def _read_cleaned_order_sheet(path, sheet_name, required_columns):
-    raw_df = pd.read_excel(path, sheet_name=sheet_name, dtype=str, keep_default_na=False, header=None)
-    required = set(required_columns)
+def _read_order_init_sheet(path):
+    try:
+        df = pd.read_excel(
+            path,
+            sheet_name=PROJECT_ORDER_INIT_SHEET,
+            dtype=str,
+            keep_default_na=False,
+        )
+    except Exception as error:
+        raise ValueError(f'{PROJECT_ORDER_INIT_SHEET} 读取失败: {error}') from error
 
-    header_index = None
-    headers = []
-    for index, row in raw_df.iterrows():
-        normalized = [_cell_text(value).replace('\n', '') for value in row.tolist()]
-        if required.issubset(set(normalized)):
-            header_index = index
-            headers = normalized
-            break
-    if header_index is None:
-        raise ValueError(f'{sheet_name} 未找到表头列: {sorted(required)}')
-
-    df = raw_df.iloc[header_index + 1:].copy()
-    df.columns = _dedupe_headers(headers)
+    required = {PROJECT_ORDER_INIT_KEY_COLUMN, '订单编号', '项目编号'}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f'{PROJECT_ORDER_INIT_SHEET} 缺少列: {sorted(missing)}')
     return df
 
 
-def _find_cleaned_column(columns, *patterns):
-    for column in columns:
-        text = _cell_text(column).replace('\n', '')
-        lowered = text.lower()
-        if any(pattern in text or pattern in lowered for pattern in patterns):
-            return column
-    return None
-
-
-def _project_name_key(value):
-    text = html.unescape(_cell_text(value))
-    text = re.sub(r'<[^>]+>', ' ', text)
-    return normalize_name(text)
-
-
-def _read_cleaned_project_source_rows(mapping_file):
+def _build_order_init_candidates(mapping_file):
+    """读取订单申请初始化导入表,按 OA编号(旧泛微项目编号) 建立订单/项目候选。"""
+    df = _read_order_init_sheet(mapping_file)
     rows = []
-    for sheet_name in CLEANED_PROJECT_SOURCE_SHEETS:
-        try:
-            df = pd.read_excel(mapping_file, sheet_name=sheet_name, dtype=str, keep_default_na=False)
-        except ValueError:
+    source_label = _order_init_source_label(mapping_file)
+    for _, order_row in df.iterrows():
+        fanwei_projects = split_fanwei_project_codes(order_row.get(PROJECT_ORDER_INIT_KEY_COLUMN, ''))
+        order_code = _cell_text(order_row.get('订单编号', ''))
+        project_code = _cell_text(order_row.get('项目编号', ''))
+        if not fanwei_projects or not (order_code or project_code):
             continue
-        id_col = _find_cleaned_column(df.columns, 'id')
-        code_col = _find_cleaned_column(df.columns, 'prj_dim_value', '项目编号')
-        name_col = _find_cleaned_column(df.columns, 'project_name', '项目名称')
-        if id_col is None or code_col is None or name_col is None:
-            continue
-        for _, row in df.iterrows():
-            project_id = format_code(row.get(id_col))
-            project_code = _cell_text(row.get(code_col))
-            project_name = _cell_text(row.get(name_col))
-            if not (project_id and project_code):
-                continue
+        for fanwei_project in fanwei_projects:
             rows.append({
-                '泛微项目ID': project_id,
+                '泛微项目编号': fanwei_project,
+                '订单编号': order_code,
+                '订单标题': _cell_text(order_row.get('订单标题', '')),
                 '项目编号': project_code,
-                '项目名称': project_name,
-                '项目名称key': _project_name_key(project_name),
-                '映射来源': sheet_name,
+                '项目名称': _cell_text(order_row.get('项目名称', '')),
+                '映射来源': source_label,
             })
-    return rows
+
+    if not rows:
+        return _empty_order_candidates_df()
+    return pd.DataFrame(
+        rows,
+        columns=['泛微项目编号', '订单编号', '订单标题', '项目编号', '项目名称', '映射来源'],
+    ).drop_duplicates()
+
+
+def _build_order_info_maps_from_candidates(mapping_df, mapping_file, log_label):
+    by_order = {}
+    by_project = {}
+    for _, row in mapping_df.iterrows():
+        order_code = _cell_text(row.get('订单编号'))
+        project_codes = clean_text_values([row.get('泛微项目编号'), row.get('项目编号')])
+        if not order_code and not project_codes:
+            continue
+        info = {
+            '订单编号': order_code,
+            '订单标题': _cell_text(row.get('订单标题')),
+            '项目编号候选': project_codes,
+            '项目经理A': '',
+            '项目经理B': '',
+            '项目经理候选': [],
+            '映射来源': _cell_text(row.get('映射来源')) or _order_init_source_label(mapping_file),
+        }
+        if order_code:
+            if order_code in by_order:
+                _merge_cleanable_order_info(by_order[order_code], info)
+            else:
+                by_order[order_code] = _copy_cleanable_order_info(info)
+        for project_code in project_codes:
+            project_items = by_project.setdefault(project_code, [])
+            existing = next((item for item in project_items if item.get('订单编号') == order_code), None)
+            if existing:
+                _merge_cleanable_order_info(existing, info)
+            else:
+                project_items.append(_copy_cleanable_order_info(info))
+
+    print(
+        '[项目订单映射]',
+        log_label,
+        f'{len(mapping_df)} 行,',
+        f'订单 {len(by_order)} 个,',
+        f'项目 {len(by_project)} 个',
+    )
+    return by_order, by_project
 
 
 def load_cleaned_project_mapping():
-    """读取项目清洗前表,支持按 合同所属项目编号ID+项目名称 定位清洗后项目编号。"""
+    """旧项目清洗前表不再读取;保留空映射接口兼容调用方。"""
     global _CLEANED_PROJECT_MAPPING_CACHE
     if _CLEANED_PROJECT_MAPPING_CACHE is not None:
         return _CLEANED_PROJECT_MAPPING_CACHE
-
-    mapping_file = _find_project_order_mapping_file()
-    if mapping_file is None:
-        _CLEANED_PROJECT_MAPPING_CACHE = ({}, {}, {}, {}, None)
-        return _CLEANED_PROJECT_MAPPING_CACHE
-
-    rows = _read_cleaned_project_source_rows(mapping_file)
-    by_id_name = {}
-    by_id = {}
-    by_code = {}
-    for row in rows:
-        project_id = row['泛微项目ID']
-        project_name_key = row['项目名称key']
-        project_code = row['项目编号']
-        if project_name_key:
-            by_id_name.setdefault((project_id, project_name_key), row)
-        by_id.setdefault(project_id, []).append(row)
-        by_code.setdefault(project_code, row)
-
-    by_unique_id = {}
-    for project_id, items in by_id.items():
-        project_codes = {_cell_text(item['项目编号']) for item in items if _cell_text(item['项目编号'])}
-        if len(project_codes) == 1:
-            by_unique_id[project_id] = items[0]
-
-    print(
-        '[项目清洗映射] 使用:',
-        mapping_file,
-        '| 清洗前项目记录数:', len(rows),
-        '| ID+名称映射数:', len(by_id_name),
-        '| 唯一ID映射数:', len(by_unique_id),
-    )
-    _CLEANED_PROJECT_MAPPING_CACHE = (by_id_name, by_id, by_unique_id, by_code, mapping_file)
+    _CLEANED_PROJECT_MAPPING_CACHE = ({}, {}, {}, {}, None)
     return _CLEANED_PROJECT_MAPPING_CACHE
 
 
 def cleaned_project_mapping(project_id_value, project_name='', project_code=''):
-    by_id_name, by_id, by_unique_id, by_code, _ = load_cleaned_project_mapping()
-    project_name_key = _project_name_key(project_name)
-    project_ids = parse_browser_ids(project_id_value) or [format_code(project_id_value)]
-    for project_id in project_ids:
-        project_id = format_code(project_id)
-        if project_id and project_name_key:
-            mapped = by_id_name.get((project_id, project_name_key))
-            if mapped:
-                return mapped
-    if project_name_key:
-        for project_id in project_ids:
-            for mapped in by_id.get(format_code(project_id), []):
-                mapped_name_key = mapped.get('项目名称key', '')
-                if mapped_name_key and (project_name_key in mapped_name_key or mapped_name_key in project_name_key):
-                    return mapped
-    for project_code_item in split_fanwei_project_codes(project_code):
-        mapped = by_code.get(project_code_item)
-        if mapped:
-            return mapped
-    for project_id in project_ids:
-        mapped = by_unique_id.get(format_code(project_id))
-        if mapped:
-            return mapped
+    load_cleaned_project_mapping()
     return {}
-
-
-def _filter_cleanable_order_rows(order_df):
-    """0621 订单主表口径:仅处理“是否可洗流程”包含 Y 的订单行。"""
-    if PROJECT_ORDER_CLEANABLE_COLUMN not in order_df.columns:
-        print(f'[项目订单映射] {PROJECT_ORDER_MAPPING_SHEETS["全量订单"]} 未找到 {PROJECT_ORDER_CLEANABLE_COLUMN} 列,暂不按可洗流程过滤。')
-        return order_df
-    flag = order_df[PROJECT_ORDER_CLEANABLE_COLUMN].map(_cell_text).str.upper()
-    return order_df[flag.str.contains('Y', na=False)].copy()
 
 
 def split_person_names(value):
@@ -2082,74 +2027,28 @@ def _copy_cleanable_order_info(info):
 
 
 def load_cleanable_order_info():
-    """读取清洗终版中标记 Y 的订单主表,返回 (订单号映射, 项目号映射, 文件路径)。"""
+    """读取订单申请初始化导入表,返回 (订单号映射, 项目号映射, 文件路径)。"""
     global _CLEANABLE_ORDER_INFO_CACHE
     if _CLEANABLE_ORDER_INFO_CACHE is not None:
         return _CLEANABLE_ORDER_INFO_CACHE
 
     mapping_file = _find_project_order_mapping_file()
     if mapping_file is None:
-        print('[项目订单映射] 未找到项目&订单清洗后 Excel,无法按可洗订单范围过滤合同。')
+        print('[项目订单映射] 未找到订单申请初始化导入 Excel,无法补充订单/项目映射。')
         _CLEANABLE_ORDER_INFO_CACHE = ({}, {}, None)
         return _CLEANABLE_ORDER_INFO_CACHE
 
     try:
-        order_df = _read_cleaned_order_sheet(
-            mapping_file,
-            PROJECT_ORDER_MAPPING_SHEETS['全量订单'],
-            ['原泛微项目编码', '订单编号', '订单标题', PROJECT_ORDER_CLEANABLE_COLUMN],
-        )
+        mapping_df = _build_order_init_candidates(mapping_file)
     except ValueError as error:
-        print(f'[项目订单映射] 读取可洗订单失败: {error}')
+        print(f'[项目订单映射] 读取订单申请初始化导入表失败: {error}')
         _CLEANABLE_ORDER_INFO_CACHE = ({}, {}, mapping_file)
         return _CLEANABLE_ORDER_INFO_CACHE
 
-    before_count = len(order_df)
-    order_df = _filter_cleanable_order_rows(order_df)
-    by_order = {}
-    by_project = {}
-    for _, row in order_df.iterrows():
-        order_code = _cell_text(row.get('订单编号'))
-        if not order_code:
-            continue
-        project_codes = []
-        for column in ('原泛微项目编码', '项目编号', '来源项目编码'):
-            for project_code in split_fanwei_project_codes(row.get(column, '')):
-                if project_code and project_code not in project_codes:
-                    project_codes.append(project_code)
-        manager_a = _cell_text(row.get('项目经理A'))
-        manager_b = _cell_text(row.get('项目经理B'))
-        manager_names = []
-        for value in (manager_a, manager_b):
-            for name in split_person_names(value):
-                if name not in manager_names:
-                    manager_names.append(name)
-        info = {
-            '订单编号': order_code,
-            '订单标题': _cell_text(row.get('订单标题')),
-            '项目编号候选': project_codes,
-            '项目经理A': manager_a,
-            '项目经理B': manager_b,
-            '项目经理候选': manager_names,
-            '映射来源': PROJECT_ORDER_MAPPING_SHEETS['全量订单'],
-        }
-        if order_code in by_order:
-            _merge_cleanable_order_info(by_order[order_code], info)
-        else:
-            by_order[order_code] = _copy_cleanable_order_info(info)
-        for project_code in project_codes:
-            project_items = by_project.setdefault(project_code, [])
-            existing = next((item for item in project_items if item.get('订单编号') == order_code), None)
-            if existing:
-                _merge_cleanable_order_info(existing, info)
-            else:
-                project_items.append(_copy_cleanable_order_info(info))
-
-    print(
-        '[项目订单映射] 可洗订单主表:',
-        f'{len(order_df)}/{before_count} 行,',
-        f'订单 {len(by_order)} 个,',
-        f'项目 {len(by_project)} 个',
+    by_order, by_project = _build_order_info_maps_from_candidates(
+        mapping_df,
+        mapping_file,
+        '订单申请初始化导入表:',
     )
     _CLEANABLE_ORDER_INFO_CACHE = (by_order, by_project, mapping_file)
     return _CLEANABLE_ORDER_INFO_CACHE
@@ -2173,208 +2072,18 @@ def _empty_order_candidates_df():
     return pd.DataFrame(columns=['泛微项目编号', '订单编号', '订单标题', '项目编号', '项目名称', '映射来源'])
 
 
-def _mcn_order_project_code(value):
-    text = _cell_text(value)
-    match = re.match(r'^(.+)-\d{3,}$', text)
-    return match.group(1) if match else ''
-
-
-def _build_full_project_lookup(mapping_file):
-    """读取 0619 新版全量项目表,建立 新项目编码 -> 原泛微项目编码列表 的映射。"""
-    project_df = _read_cleaned_order_sheet(
-        mapping_file,
-        PROJECT_ORDER_MAPPING_SHEETS['全量项目'],
-        ['原泛微项目编码', '项目编码', '项目名称'],
-    )
-
-    rows = []
-    project_lookup = {}
-    seen_lookup = set()
-    for _, row in project_df.iterrows():
-        fanwei_projects = split_fanwei_project_codes(row.get('原泛微项目编码', ''))
-        project_code = _cell_text(row.get('项目编码', ''))
-        project_name = _cell_text(row.get('项目名称', ''))
-        if not fanwei_projects:
-            continue
-
-        for fanwei_project in fanwei_projects:
-            rows.append({
-                '泛微项目编号': fanwei_project,
-                '订单编号': '',
-                '订单标题': '',
-                '映射来源': PROJECT_ORDER_MAPPING_SHEETS['全量项目'],
-            })
-
-            if not project_code:
-                continue
-            lookup_key = (project_code, fanwei_project)
-            if lookup_key in seen_lookup:
-                continue
-            seen_lookup.add(lookup_key)
-            project_lookup.setdefault(project_code, []).append({
-                '泛微项目编号': fanwei_project,
-                '项目编号': project_code,
-                '项目名称': project_name,
-            })
-
-    presence_df = pd.DataFrame(rows, columns=['泛微项目编号', '订单编号', '订单标题', '映射来源'])
-    return project_lookup, presence_df.drop_duplicates()
-
-
-def _order_project_items(order_row, project_lookup):
-    """取订单行关联的所有原泛微项目编号。
-
-    0619 全量订单表自身带「原泛微项目编码」;如果为空,用「项目编号」去全量项目表反查。
-    「原泛微项目编码」可在同一格维护多个编码,需要拆分后逐个保留。
-    如果一个新项目编码对应多个原泛微项目编码,这些原编码都保留为订单候选。
-    """
-    items = []
-    seen_projects = set()
-    order_project_code = _cell_text(order_row.get('项目编号', ''))
-    order_project_name = _cell_text(order_row.get('项目名称', ''))
-    direct_fanwei_projects = split_fanwei_project_codes(order_row.get('原泛微项目编码', ''))
-
-    def add_item(fanwei_project, project_code, project_name, source):
-        fanwei_project = _cell_text(fanwei_project)
-        if not fanwei_project or fanwei_project in seen_projects:
-            return
-        seen_projects.add(fanwei_project)
-        items.append({
-            '泛微项目编号': fanwei_project,
-            '项目编号': _cell_text(project_code) or order_project_code,
-            '项目名称': _cell_text(project_name) or order_project_name,
-            '映射来源': source,
-        })
-
-    for direct_fanwei_project in direct_fanwei_projects:
-        add_item(
-            direct_fanwei_project,
-            order_project_code,
-            order_project_name,
-            PROJECT_ORDER_MAPPING_SHEETS['全量订单'],
-        )
-    if not direct_fanwei_projects:
-        for project_item in project_lookup.get(order_project_code, []):
-            add_item(
-                project_item.get('泛微项目编号', ''),
-                project_item.get('项目编号', ''),
-                order_project_name or project_item.get('项目名称', ''),
-                f"{PROJECT_ORDER_MAPPING_SHEETS['全量项目']}+{PROJECT_ORDER_MAPPING_SHEETS['全量订单']}",
-            )
-
-    return items
-
-
 def _build_project_order_presence(mapping_file):
-    """读取新版全量项目+全量订单表,汇总所有出现过的泛微项目编号。"""
-    project_lookup, project_presence_df = _build_full_project_lookup(mapping_file)
-    order_df = _read_cleaned_order_sheet(
-        mapping_file,
-        PROJECT_ORDER_MAPPING_SHEETS['全量订单'],
-        ['原泛微项目编码', '订单编号', '订单标题', '项目编号'],
-    )
-    order_df = _filter_cleanable_order_rows(order_df)
-
-    rows = project_presence_df.to_dict('records')
-    for _, order_row in order_df.iterrows():
-        for project_item in _order_project_items(order_row, project_lookup):
-            rows.append({
-                '泛微项目编号': project_item['泛微项目编号'],
-                '订单编号': _cell_text(order_row.get('订单编号', '')),
-                '订单标题': _cell_text(order_row.get('订单标题', '')),
-                '映射来源': project_item['映射来源'],
-            })
-
-    detail_df = _build_order_detail_candidates(mapping_file)
-    for _, detail_row in detail_df.iterrows():
-        rows.append({
-            '泛微项目编号': detail_row['泛微项目编号'],
-            '订单编号': detail_row['订单编号'],
-            '订单标题': detail_row['订单标题'],
-            '映射来源': detail_row['映射来源'],
-        })
-
-    if not rows:
-        return _empty_order_presence_df()
-    return pd.DataFrame(rows, columns=['泛微项目编号', '订单编号', '订单标题', '映射来源']).drop_duplicates()
-
-
-def _build_order_detail_candidates(mapping_file):
-    try:
-        detail_df = _read_cleaned_order_sheet(
-            mapping_file,
-            PROJECT_ORDER_MAPPING_SHEETS['订单明细'],
-            ['原泛微项目编码', '原泛微MCN订单编码', '订单编号'],
-        )
-    except ValueError:
-        return _empty_order_candidates_df()
-
-    rows = []
-    for _, detail_row in detail_df.iterrows():
-        order_code = _cell_text(detail_row.get('订单编号', ''))
-        if not order_code:
-            continue
-        mcn_order_code = _cell_text(detail_row.get('原泛微MCN订单编码', ''))
-        project_keys = split_fanwei_project_codes(detail_row.get('原泛微项目编码', ''))
-        for key in (mcn_order_code, _mcn_order_project_code(mcn_order_code)):
-            if key and key not in project_keys:
-                project_keys.append(key)
-        order_title = _cell_text(detail_row.get('合作内容', '')) or _cell_text(detail_row.get('订单内容', ''))
-        project_name = _cell_text(detail_row.get('开票内容', ''))
-        for project_key in project_keys:
-            rows.append({
-                '泛微项目编号': project_key,
-                '订单编号': order_code,
-                '订单标题': order_title,
-                '项目编号': _mcn_order_project_code(mcn_order_code) or project_key,
-                '项目名称': project_name,
-                '映射来源': PROJECT_ORDER_MAPPING_SHEETS['订单明细'],
-            })
-
-    if not rows:
-        return _empty_order_candidates_df()
-    return pd.DataFrame(
-        rows,
-        columns=['泛微项目编号', '订单编号', '订单标题', '项目编号', '项目名称', '映射来源'],
-    ).drop_duplicates()
+    """汇总订单申请初始化导入表中出现过的 OA 编号。"""
+    mapping_df = _build_order_init_candidates(mapping_file)
+    return mapping_df[
+        ['泛微项目编号', '订单编号', '订单标题', '映射来源']
+    ].drop_duplicates()
 
 
 def _build_project_order_candidates(mapping_file):
-    project_lookup, _ = _build_full_project_lookup(mapping_file)
-    order_df = _read_cleaned_order_sheet(
-        mapping_file,
-        PROJECT_ORDER_MAPPING_SHEETS['全量订单'],
-        ['原泛微项目编码', '订单编号', '订单标题', '项目编号', '项目名称'],
-    )
-    before_count = len(order_df)
-    order_df = _filter_cleanable_order_rows(order_df)
-
-    rows = []
-    for _, order_row in order_df.iterrows():
-        order_code = _cell_text(order_row.get('订单编号', ''))
-        if not order_code:
-            continue
-        for project_item in _order_project_items(order_row, project_lookup):
-            rows.append({
-                '泛微项目编号': project_item['泛微项目编号'],
-                '订单编号': order_code,
-                '订单标题': _cell_text(order_row.get('订单标题', '')),
-                '项目编号': project_item['项目编号'],
-                '项目名称': project_item['项目名称'],
-                '映射来源': project_item['映射来源'],
-            })
-
-    if not rows:
-        result_df = _empty_order_candidates_df()
-    else:
-        result_df = pd.DataFrame(
-            rows,
-            columns=['泛微项目编号', '订单编号', '订单标题', '项目编号', '项目名称', '映射来源'],
-        )
-    detail_df = _build_order_detail_candidates(mapping_file)
-    result_df = pd.concat([result_df, detail_df], ignore_index=True).drop_duplicates()
-    print(f'[项目订单映射] 可洗订单过滤: {len(order_df)}/{before_count} 行')
-    return result_df[
+    mapping_df = _build_order_init_candidates(mapping_file)
+    print(f'[项目订单映射] 订单申请初始化导入表: {len(mapping_df)} 行,不按 Y 过滤')
+    return mapping_df[
         ['泛微项目编号', '订单编号', '订单标题', '项目编号', '项目名称', '映射来源']
     ]
 
@@ -2387,7 +2096,7 @@ def load_project_order_mapping():
 
     mapping_file = _find_project_order_mapping_file()
     if mapping_file is None:
-        print('[项目订单映射] 未找到项目&订单清洗后 Excel,订单字段保持为空。')
+        print('[项目订单映射] 未找到订单申请初始化导入 Excel,订单字段保持为空。')
         _PROJECT_ORDER_MAPPING_CACHE = ({}, {}, None)
         return _PROJECT_ORDER_MAPPING_CACHE
 
@@ -2448,7 +2157,7 @@ def collect_order_mapping_issues(
         sheets['订单映射_文件缺失'] = pd.DataFrame([{
             '说明': (
                 f'未找到 {PROJECT_ORDER_MAPPING_XLSX_NAME},'
-                f'可通过环境变量 {PROJECT_ORDER_MAPPING_ENV} 指定清洗后 Excel。'
+                f'可通过环境变量 {PROJECT_ORDER_MAPPING_ENV} 指定订单申请初始化导入 Excel。'
             ),
         }])
         return sheets
@@ -2483,11 +2192,11 @@ def collect_order_mapping_issues(
         for _, row in unmatched.iterrows():
             appearances = order_presence.get(row['泛微项目编号'], [])
             if appearances:
-                unmatched_reasons.append(f'{PROJECT_ORDER_MAPPING_XLSX_NAME} 项目/订单映射表中有该泛微项目编号,但没有可用订单编号')
+                unmatched_reasons.append(f'{PROJECT_ORDER_MAPPING_XLSX_NAME} 中有该 OA编号,但没有可用订单编号')
                 unmatched_sources.append('; '.join(_cell_text(item.get('映射来源')) for item in appearances))
                 unmatched_order_values.append('; '.join(_cell_text(item.get('订单编号')) or '(空)' for item in appearances))
             else:
-                unmatched_reasons.append(f'{PROJECT_ORDER_MAPPING_XLSX_NAME} 全量项目/全量订单均未出现该泛微项目编号')
+                unmatched_reasons.append(f'{PROJECT_ORDER_MAPPING_XLSX_NAME} 未出现该 OA编号')
                 unmatched_sources.append('')
                 unmatched_order_values.append('')
         unmatched.insert(2, '未匹配原因', unmatched_reasons)
