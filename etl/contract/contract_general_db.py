@@ -45,6 +45,11 @@ SPECIAL_CATEGORY_TABLE = 'uf_xt_cgpldy'
 ORDER_INIT_FILE = c.SRC_DIR / 'other_cleaned_data' / '订单申请初始化导入-基础信息+财务信息.xlsx'
 ORDER_INIT_SHEET = '基础信息+财务信息'
 ORDER_INIT_MAPPING_SOURCE = f'{ORDER_INIT_FILE.name}:{ORDER_INIT_SHEET}(OA编号)'
+PROJECT_FILTER_ENV = 'PROJECT_FILTER_XLSX'
+PROJECT_FILTER_DEFAULT_FILE = c.RULES_DIR / '数据清洗涉及泛微项目编码_0629_分类.xlsx'
+PROJECT_FILTER_FILE = Path(os.getenv(PROJECT_FILTER_ENV, '').strip() or PROJECT_FILTER_DEFAULT_FILE)
+EVENT_PROJECT_SHEET = '赛事'
+MCN_PROJECT_SHEET = 'MCN'
 OUTPUT_FILE = OUTPUT_DIR / f'智书合同字段_一般流程_{DATE_SUFFIX}.xlsx'
 EXCEPTION_FILE = OUTPUT_DIR / f'未匹配清单_一般流程_{DATE_SUFFIX}.xlsx'
 
@@ -258,7 +263,7 @@ SELECT
     h.htqsg AS `赛事签署稿DOCID`,
     h.htsxg AS `赛事生效稿DOCID`,
     h.cbzx AS `成本中心ID`,
-    h.glht AS `关联框架协议ID`,
+    COALESCE(h.glht, h.kjht) AS `关联框架协议ID`,
     NULL AS `变更类型ID`,
     NULL AS `补充/终止编号生成`,
     h.xmbh AS `合同所属项目编号ID`,
@@ -354,6 +359,107 @@ def _split_joined_field(value):
         for item in re.split(r'[;；\n\r]+', text)
         if item.strip()
     ]
+
+
+@lru_cache(maxsize=1)
+def load_contract_project_filter_codes():
+    """读取合同一般流程项目白名单:赛事/MCN sheet 的 OA编号。"""
+    if not PROJECT_FILTER_FILE.exists():
+        raise FileNotFoundError(f'项目白名单不存在: {PROJECT_FILTER_FILE}')
+
+    result = {}
+    for sheet_name in (EVENT_PROJECT_SHEET, MCN_PROJECT_SHEET):
+        df = pd.read_excel(PROJECT_FILTER_FILE, sheet_name=sheet_name, dtype=object)
+        if df.empty:
+            result[sheet_name] = set()
+            continue
+        if 'OA编号' in df.columns:
+            code_column = 'OA编号'
+        elif '原泛微项目编码' in df.columns:
+            code_column = '原泛微项目编码'
+        else:
+            code_column = df.columns[0]
+        codes = []
+        for value in df[code_column]:
+            codes.extend(c.split_fanwei_project_codes(value))
+        result[sheet_name] = set(codes)
+
+    print(
+        '[合同迁移-一般流程-项目白名单] 使用:',
+        PROJECT_FILTER_FILE,
+        f'| 赛事 {len(result[EVENT_PROJECT_SHEET])} 个',
+        f'| MCN {len(result[MCN_PROJECT_SHEET])} 个',
+    )
+    return result
+
+
+def _project_filter_sheet_for_source(source_name):
+    source_name = _text(source_name)
+    if source_name == '泛微(赛事)':
+        return EVENT_PROJECT_SHEET
+    if source_name == '泛微(MCN)':
+        return MCN_PROJECT_SHEET
+    return ''
+
+
+def _project_code_filter_reason(row):
+    sheet_name = _project_filter_sheet_for_source(row.get('数据来源'))
+    # 规则1: 框架合同(KF/KS/KJ)不经过白名单, 始终保留。
+    if _is_framework_contract(row.get('合同编号')):
+        return sheet_name, ''
+    project_codes = c.split_fanwei_project_codes(row.get('泛微项目编号'))
+    if not sheet_name:
+        return '', '未知数据来源'
+    if not project_codes:
+        return sheet_name, '泛微项目编码为空'
+    allowed_codes = load_contract_project_filter_codes().get(sheet_name, set())
+    if any(code in allowed_codes for code in project_codes):
+        return sheet_name, ''
+    return sheet_name, f'泛微项目编码不在{sheet_name} sheet'
+
+
+def _filter_by_contract_project_whitelist(source_df):
+    if source_df.empty:
+        return source_df, pd.DataFrame()
+
+    check = source_df.apply(_project_code_filter_reason, axis=1)
+    sheet_names = check.map(lambda item: item[0])
+    reasons = check.map(lambda item: item[1])
+    keep_mask = reasons.map(_text).eq('')
+    filtered = source_df.loc[keep_mask].copy()
+    excluded = source_df.loc[~keep_mask].copy()
+    if not excluded.empty:
+        excluded['项目白名单Sheet'] = sheet_names.loc[~keep_mask].to_numpy()
+        excluded['项目白名单校验'] = reasons.loc[~keep_mask].to_numpy()
+    print(f'[合同迁移-一般流程] 泛微项目编码白名单过滤: {len(filtered)}/{len(source_df)} 行')
+    return filtered, excluded
+
+
+# 规则2: 合同审批状态硬过滤 —— 只保留这些审批节点(精确匹配清洗后的 nodename); 空/其他状态一律剔除。
+KEPT_APPROVAL_STATUSES = (
+    '上传修订版',
+    '申请人确认签约性质',
+    '法务确认',
+    '用印',
+    '上传电子档',
+    '归档',
+)
+
+
+def _filter_by_approval_status(source_df):
+    """规则2: 仅保留合同审批状态∈KEPT_APPROVAL_STATUSES 的合同(含框架合同), 空/其他状态剔除。"""
+    if source_df.empty:
+        return source_df, pd.DataFrame()
+    status = source_df.get('合同审批状态', pd.Series('', index=source_df.index)).map(_text)
+    keep_mask = status.isin(KEPT_APPROVAL_STATUSES)
+    filtered = source_df.loc[keep_mask].copy()
+    excluded = source_df.loc[~keep_mask].copy()
+    if not excluded.empty:
+        excluded['审批状态过滤'] = status.loc[~keep_mask].map(
+            lambda value: '审批状态为空' if not value else f'审批状态不在保留清单:{value}'
+        ).to_numpy()
+    print(f'[合同迁移-一般流程] 合同审批状态过滤: {len(filtered)}/{len(source_df)} 行')
+    return filtered, excluded
 
 
 @lru_cache(maxsize=1)
@@ -1153,6 +1259,8 @@ def _collect_missing_details(output_df, source_df, required_cols, source_field_m
             .drop_duplicates('_doc_key')
             .set_index('_doc_key')
         )
+        # 下面 source_by_doc.at[...] 是逐行调用,摘掉 attrs 避免每次 deepcopy 大映射(含赛事收支计划)。
+        source_by_doc.attrs = {}
     for column in required_cols:
         if column not in output_df.columns:
             continue
@@ -1298,7 +1406,7 @@ def build_supplier_info_map_for_values(supplier_values):
     return result
 
 
-def build_contract_info_map_for_ids(contract_values):
+def build_contract_info_map_for_ids(contract_values, option_table=FW_TABLE):
     contract_ids = c.clean_codes(
         contract_id
         for value in contract_values
@@ -1306,15 +1414,29 @@ def build_contract_info_map_for_ids(contract_values):
     )
     if not contract_ids:
         return {}
+    if option_table == FW_TABLE_HTSP:
+        source_table = FW_TABLE_HTSP
+        secondary_option_field = 'htejfl'
+        select_sql = (
+            'SELECT id, htbh, htmc AS htbt, htlx, htejfl AS htejlx, xmbh AS htszxmbh, xmmc AS htszxm '
+            'FROM uf_htsp '
+            f'WHERE id IN ({c.in_placeholders(contract_ids)})'
+        )
+    else:
+        source_table = FW_TABLE
+        secondary_option_field = 'htejlx'
+        select_sql = (
+            'SELECT id, htbh, htbt, htlx, htejlx, htszxmbh, htszxm '
+            'FROM uf_htk '
+            f'WHERE id IN ({c.in_placeholders(contract_ids)})'
+        )
     contract_df = c.query_db(
         'FW',
         'vspn_xtyy',
-        'SELECT id, htbh, htbt, htlx, htejlx, htszxmbh, htszxm '
-        'FROM uf_htk '
-        f'WHERE id IN ({c.in_placeholders(contract_ids)})',
+        select_sql,
         contract_ids,
     )
-    option_maps = c.build_fw_select_option_maps(FW_TABLE, ['htlx', 'htejlx'])
+    option_maps = c.build_fw_select_option_maps(source_table, ['htlx', secondary_option_field])
     result = {}
     for _, row in contract_df.iterrows():
         contract_id = c.format_code(row['id'])
@@ -1329,9 +1451,10 @@ def build_contract_info_map_for_ids(contract_values):
             'type_id': type_id,
             'type': option_maps['htlx'].get(type_id, ''),
             'secondary_type_id': secondary_id,
-            'secondary_type': option_maps['htejlx'].get(secondary_id, ''),
+            'secondary_type': option_maps[secondary_option_field].get(secondary_id, ''),
             'project_id': _text(row.get('htszxmbh')),
             'project_name': _text(row.get('htszxm')),
+            'source_table': source_table,
         }
     return result
 
@@ -1734,6 +1857,14 @@ def _contract_prefix(contract_number):
     return match.group(0) if match else ''
 
 
+# 框架合同: 合同类型缩写 KF/KS/KJ。无独立缩写码表, 用合同编号前缀(H-KF/H-KS/H-KJ)判定。
+FRAMEWORK_CONTRACT_PREFIXES = ('H-KF', 'H-KS', 'H-KJ')
+
+
+def _is_framework_contract(contract_number):
+    return _contract_prefix(contract_number) in FRAMEWORK_CONTRACT_PREFIXES
+
+
 def _mcn_pay_letter(contract_number):
     """MCN 代字式编号(主体缩写-S/F/O…)的收支字母。S=收入 F=支出 O=其他。"""
     text = _text(contract_number).upper()
@@ -1998,6 +2129,11 @@ def _is_supplement_contract_number(contract_number):
 
 
 def _apply_supplement_amount_rollup(df):
+    # pandas 3.0 在每次列/行 boxing 时会 deepcopy df.attrs;本函数有逐行 iterrows + df.at,
+    # 带着 read_source 注入的大映射(attrs)会让本步从几秒劣化到数千秒。
+    # 这里临时摘掉 attrs、末尾恢复(本函数只按列计算,不读取 attrs)。
+    saved_attrs = df.attrs
+    df.attrs = {}
     contract_numbers = {_text(value) for value in df['合同编号']}
     df['主合同编号'] = ''
     df['是否补充协议'] = ''
@@ -2028,6 +2164,7 @@ def _apply_supplement_amount_rollup(df):
     df['收款计划汇总金额'] = df['合同编号'].map(lambda value: round(collection_sum.get(_text(value), 0.0), 2))
     df['补充协议数量'] = df['合同编号'].map(lambda value: child_count.get(_text(value), 0))
     df['补充协议编号'] = df['合同编号'].map(lambda value: '、'.join(child_codes.get(_text(value), [])))
+    df.attrs = saved_attrs
     return df
 
 
@@ -2146,7 +2283,10 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
     customer_info_map = _timed('  ├─客户映射', lambda: build_customer_info_map_for_values(df['合同客户ID']))
     supplier_info_map = _timed('  ├─供应商映射(汉得匹配)', lambda: build_supplier_info_map_for_values(df['合同供应商ID']))
     project_map = _timed('  ├─项目映射', lambda: build_fw_project_code_map_for_ids(df['合同所属项目编号ID']))
-    relation_info_map = _timed('  ├─关联框架映射', lambda: build_contract_info_map_for_ids(df['关联框架协议ID']))
+    relation_info_map = _timed(
+        '  ├─关联框架映射',
+        lambda: build_contract_info_map_for_ids(df['关联框架协议ID'], option_table=option_table),
+    )
     cost_center_platform_map = _timed('  └─成本中心平台映射',
                                       lambda: build_cost_center_platform_map(df.get('成本中心ID', pd.Series(dtype=object))))
 
@@ -2293,15 +2433,20 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
     df['支出总额_签名'] = signed_amount_tuples.map(lambda item: item[2])
     print(f'[计时] ✓   分类/金额(逐行apply): {time.perf_counter() - _t0:.1f}s', flush=True)
 
-    def relation_codes(value):
-        rows = []
+    def relation_items(value):
+        items = []
         for relation_id in c.parse_browser_ids(value):
             info = relation_info_map.get(relation_id, {})
             if info.get('number'):
-                rows.append(info['number'])
-        return ';'.join(rows)
+                item = dict(info)
+                item['id'] = relation_id
+                items.append(item)
+        return items
 
-    df['关联合同编号'] = df['关联框架协议ID'].map(relation_codes)
+    df['关联合同信息'] = df['关联框架协议ID'].map(relation_items)
+    df['关联合同编号'] = df['关联合同信息'].map(lambda items: ';'.join(item['number'] for item in items))
+    df['关联合同名称'] = df['关联合同信息'].map(lambda items: ';'.join(item.get('title', '') for item in items))
+
     df.attrs['company_info_map'] = company_info_map
     df.attrs['customer_info_map'] = customer_info_map
     df.attrs['supplier_info_map'] = supplier_info_map
@@ -2407,13 +2552,27 @@ def read_source():
     )
 
     merged = pd.concat([resolved_mcn, resolved_htsp], ignore_index=True)
+    merged, project_filter_excluded_df = _timed(
+        'read_source/泛微项目编码白名单过滤',
+        lambda: _filter_by_contract_project_whitelist(merged),
+    )
+    merged, approval_status_excluded_df = _timed(
+        'read_source/合同审批状态过滤',
+        lambda: _filter_by_approval_status(merged),
+    )
     _merge_attrs(merged, [resolved_mcn, resolved_htsp])
     merged.attrs['anti_bribery_excluded'] = anti_bribery_excluded_df
+    merged.attrs['project_filter_excluded'] = project_filter_excluded_df
+    merged.attrs['approval_status_excluded'] = approval_status_excluded_df
     merged = _timed('read_source/补充协议金额汇总', lambda: _apply_supplement_amount_rollup(merged))
     # 赛事收支计划明细(uf_htsp_dt4): 供付款/收款计划按 dt4 真实多期展开。
+    saishi_ids = merged.loc[
+        merged.get('数据来源', pd.Series('', index=merged.index)).map(_text).eq('泛微(赛事)'),
+        'ID',
+    ] if 'ID' in merged.columns else pd.Series(dtype=object)
     plan_map = (
-        _timed('read_source/赛事收支计划dt4', lambda: load_htsp_plan_detail_map(resolved_htsp['ID']))
-        if not resolved_htsp.empty else {}
+        _timed('read_source/赛事收支计划dt4', lambda: load_htsp_plan_detail_map(saishi_ids))
+        if not saishi_ids.empty else {}
     )
     merged.attrs['saishi_plan_map'] = plan_map
     print(f'[合同迁移-一般流程] 赛事收支计划明细: {sum(len(v) for v in plan_map.values())} 行 / {len(plan_map)} 合同')
@@ -2433,6 +2592,7 @@ def build_main_output(source_df, headers):
         contract_name = _text(source['合同标题'])
         _set(row, 'contract_number（合同编码）', _text(source['合同编号']))
         _set(row, 'contract_name（合同名称）', contract_name)
+        _set(row, '泛微项目编码', _text(source.get('泛微项目编号')))
         _set(row, '合同审批状态', _text(source.get('合同审批状态')))
         _set(row, '订单编号', _text(source.get('订单编号')))
         _set(row, 'contractCategory(智书框架合同类型)',
@@ -2488,19 +2648,45 @@ def build_relation_output(source_df, headers):
     source_rows = []
     for source in source_df.to_dict('records'):
         contract_number = _text(source['合同编号'])
-        for relation_id in c.parse_browser_ids(source['关联框架协议ID']):
-            info = relation_info_map.get(relation_id, {})
-            row = _new_row(headers)
-            _set(row, 'contract_number（合同编码）', contract_number)
-            _set(row, 'relation.relation_contracts（关联合同）', info.get('number', ''))
-            _set(row, '框架合同编号', info.get('number', ''))
-            rows.append(row)
-            source_rows.append({
-                'contract_number（合同编码）': contract_number,
-                '泛微关联合同ID': relation_id,
-                '关联合同编号': info.get('number', ''),
-                '关联合同名称': info.get('title', ''),
-            })
+        relation_items = source.get('关联合同信息') or []
+        if not isinstance(relation_items, list):
+            relation_items = []
+        if not relation_items:
+            relation_items = [
+                {'id': relation_id, **relation_info_map.get(relation_id, {})}
+                for relation_id in c.parse_browser_ids(source['关联框架协议ID'])
+            ]
+        relation_ids = []
+        relation_numbers = []
+        relation_titles = []
+        relation_source_tables = []
+        for info in relation_items:
+            relation_id = _text(info.get('id'))
+            relation_number = _text(info.get('number'))
+            relation_title = _text(info.get('title'))
+            relation_source_table = _text(info.get('source_table'))
+            if relation_id:
+                relation_ids.append(relation_id)
+            if relation_number:
+                relation_numbers.append(relation_number)
+            if relation_title:
+                relation_titles.append(relation_title)
+            if relation_source_table:
+                relation_source_tables.append(relation_source_table)
+
+        relation_number_text = ';'.join(c.clean_text_values(relation_numbers))
+        row = _new_row(headers)
+        _set(row, 'contract_number（合同编码）', contract_number)
+        _set(row, 'relation.relation_contracts（关联合同）', relation_number_text)
+        _set(row, '框架合同编号', relation_number_text)
+        rows.append(row)
+        source_rows.append({
+            'contract_number（合同编码）': contract_number,
+            '泛微关联合同ID': ';'.join(c.clean_text_values(relation_ids)),
+            '关联合同编号': relation_number_text,
+            '关联合同名称': ';'.join(c.clean_text_values(relation_titles)),
+            '关联合同来源表': ';'.join(c.clean_text_values(relation_source_tables)),
+        })
     return pd.DataFrame(rows, columns=headers), pd.DataFrame(source_rows)
 
 
@@ -2969,6 +3155,28 @@ def build_order_audit_df(source_df):
     ])
 
 
+def build_project_filter_excluded_df(source_df):
+    excluded = source_df.attrs.get('project_filter_excluded')
+    columns = [
+        '数据来源', '合同编号', '合同标题', '合同所属项目编号ID', '泛微项目编号', '泛微项目名称',
+        '项目白名单Sheet', '项目白名单校验',
+    ]
+    if excluded is None or excluded.empty:
+        return pd.DataFrame(columns=columns)
+    return _audit_df(excluded, columns)
+
+
+def build_approval_status_excluded_df(source_df):
+    excluded = source_df.attrs.get('approval_status_excluded')
+    columns = [
+        '数据来源', '合同编号', '合同标题', '合同签署状态ID', '合同流程ID',
+        '流程类型ID', '流程名称', '合同审批状态', '审批状态过滤',
+    ]
+    if excluded is None or excluded.empty:
+        return pd.DataFrame(columns=columns)
+    return _audit_df(excluded, columns)
+
+
 def build_anti_bribery_excluded_df(source_df):
     excluded = source_df.attrs.get('anti_bribery_excluded')
     columns = [
@@ -3139,6 +3347,8 @@ def run():
         '关联合同编号_未匹配': collect_missing_relation(relation_source_df),
         '合同附件下载清单': contract_attachment_meta_df,
         '合同附件DOCID_缺失映射': contract_attachment_missing_df,
+        '泛微项目编码_非白名单': build_project_filter_excluded_df(source_df),
+        '合同审批状态_已过滤': build_approval_status_excluded_df(source_df),
         '反贿赂合同排除': build_anti_bribery_excluded_df(source_df),
         '补充协议金额回测': build_supplement_amount_backtest_df(source_df),
     }
