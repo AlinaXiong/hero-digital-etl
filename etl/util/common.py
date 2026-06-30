@@ -41,6 +41,32 @@ PROJECT_ORDER_MAPPING_ENV = 'PROJECT_ORDER_MAPPING_XLSX'
 PROJECT_ORDER_MAPPING_XLSX_NAME = '订单申请初始化导入-基础信息+财务信息.xlsx'
 PROJECT_ORDER_INIT_SHEET = '基础信息+财务信息'
 PROJECT_ORDER_INIT_KEY_COLUMN = 'OA编号'
+AP_PROJECT_ORDER_FIXED_OVERRIDES = {
+    'V-303': {
+        '订单编号': 'A04-2026-0151-M001',
+        '订单标题': '资产技术平台-技术中心',
+    },
+    'V-306': {
+        '订单编号': 'A04-2026-0152-M001',
+        '订单标题': '东南亚区域中心',
+    },
+    'V-315': {
+        '订单编号': 'A04-2026-0156-M001',
+        '订单标题': '国内赛事业务-Aurora项目中心',
+    },
+    'V-316': {
+        '订单编号': 'A04-2026-0157-M001',
+        '订单标题': '国内赛事业务-CCI项目中心',
+    },
+    'V-319': {
+        '订单编号': 'A04-2026-0158-M001',
+        '订单标题': 'IP衍生中心',
+    },
+    'V-326': {
+        '订单编号': 'A04-2026-0160-M001',
+        '订单标题': '运营中心',
+    },
+}
 ORDER_MULTI_MAPPING_FIX_ENV = 'ORDER_MULTI_MAPPING_FIX_XLSX'
 ORDER_MULTI_MAPPING_FIX_XLSX_NAME = '问题表-订单多映射.xlsx'
 FANWEI_FEE_ITEM_OVERRIDES = (
@@ -2191,9 +2217,22 @@ def load_project_order_mapping():
     return _PROJECT_ORDER_MAPPING_CACHE
 
 
-def project_order_mapping_value(project_code, field):
+def project_order_mapping_value(project_code, field, fixed_overrides=None):
+    project_key = _cell_text(project_code)
+    fixed_value = (fixed_overrides or {}).get(project_key, {}).get(field, '')
+    if fixed_value:
+        return fixed_value
     safe_map, _, _ = load_project_order_mapping()
-    return safe_map.get(_cell_text(project_code), {}).get(field, '')
+    return safe_map.get(project_key, {}).get(field, '')
+
+
+def ap_project_order_mapping_value(project_code, field):
+    """应付/预付固定项目订单映射优先,其余项目继续使用订单初始化表。"""
+    return project_order_mapping_value(
+        project_code,
+        field,
+        fixed_overrides=AP_PROJECT_ORDER_FIXED_OVERRIDES,
+    )
 
 
 def load_order_multi_mapping_fix():
@@ -2297,9 +2336,18 @@ def apply_order_multi_mapping_fix(
 
 def collect_order_mapping_issues(
         source_df, doc_col='流程编号', project_col='项目编号',
-        project_id_col='项目编号ID', project_name_col='项目名称'):
+        project_id_col='项目编号ID', project_name_col='项目名称',
+        fixed_overrides=None):
     """输出项目->订单映射的未匹配和多候选清单。"""
     safe_map, ambiguous_map, mapping_file = load_project_order_mapping()
+    fixed_overrides = fixed_overrides or {}
+    if fixed_overrides:
+        safe_map = {**safe_map, **fixed_overrides}
+        ambiguous_map = {
+            project_code: candidates
+            for project_code, candidates in ambiguous_map.items()
+            if project_code not in fixed_overrides
+        }
     if doc_col not in source_df.columns or project_col not in source_df.columns:
         return {}
     issue_columns = {
@@ -2370,6 +2418,15 @@ def collect_order_mapping_issues(
         unmatched['订单映射表订单编号字段值'] = unmatched_order_values
         sheets['订单映射_未匹配'] = unmatched
     return sheets
+
+
+def collect_ap_order_mapping_issues(source_df, **kwargs):
+    """应付/预付订单异常清单,排除已在代码中固定映射的 OA 编号。"""
+    return collect_order_mapping_issues(
+        source_df,
+        fixed_overrides=AP_PROJECT_ORDER_FIXED_OVERRIDES,
+        **kwargs,
+    )
 
 
 def _joined_row_key(row, columns):

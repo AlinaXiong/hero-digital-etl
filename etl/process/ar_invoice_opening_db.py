@@ -94,6 +94,10 @@ OUTPUT_COLUMNS = [
     *[f'行维度{i}' for i in range(3, 21)],
     '泛微项目编号',
 ]
+MCN_OUTPUT_COLUMNS = [
+    *OUTPUT_COLUMNS,
+    '原泛微订单号',
+]
 
 # 问题清单里,目标字段缺失时带出的泛微源字段。
 ISSUE_SOURCE_FIELD_MAP = {
@@ -295,6 +299,7 @@ EXPECTED_MCN_ORDER_INVOICE_FIELDS = {
         'kpht': '开票合同',
     },
     'formtable_main_72_dt4': {
+        'ddbh': '订单编号',
         'szxm': '所属项目',
         'ddje': '开票金额',
         'pt': '平台',
@@ -303,6 +308,7 @@ EXPECTED_MCN_ORDER_INVOICE_FIELDS = {
         'bhsje': '不含税金额',
     },
     'formtable_main_72_dt5': {
+        'ptpqh': '订单号',
         'szxm': '所属项目',
         'ddje': '开票金额',
         'pt': '平台',
@@ -311,6 +317,7 @@ EXPECTED_MCN_ORDER_INVOICE_FIELDS = {
         'bhsje': '不含税金额',
     },
     'formtable_main_72_dt6': {
+        'ptpqh': '订单号',
         'szxm': '所属项目',
         'ddje': '开票金额',
         'pt': '平台',
@@ -319,6 +326,7 @@ EXPECTED_MCN_ORDER_INVOICE_FIELDS = {
         'bhsje': '不含税金额',
     },
     'formtable_main_72_dt7': {
+        'ddh': '订单号',
         'szxm': '所属项目',
         'dkje': '开票金额',
         'pt': '平台',
@@ -337,7 +345,9 @@ SELECT
     d.id AS `明细ID`,
     m.requestid AS `requestid`,
     rb.workflowid AS `workflowid`,
+    rb.REQUESTNAME AS `标题`,
     m.kpdh AS `开票单号`,
+    NULL AS `泛微订单编号`,
     m.sqr AS `申请人ID`,
     m.sqrbm AS `申请人部门ID`,
     m.sqrq AS `申请日期`,
@@ -370,7 +380,9 @@ SELECT
     d.id AS `明细ID`,
     m.requestid AS `requestid`,
     rb.workflowid AS `workflowid`,
+    rb.REQUESTNAME AS `标题`,
     m.kpdh AS `开票单号`,
+    COALESCE(od.ddbh, d.ddbh) AS `泛微订单编号`,
     m.sqr AS `申请人ID`,
     m.sqrbm AS `申请人部门ID`,
     m.sqrq AS `申请日期`,
@@ -391,6 +403,7 @@ SELECT
 FROM formtable_main_72 m
 JOIN workflow_requestbase rb ON rb.requestid = m.requestid
 JOIN formtable_main_72_dt4 d ON d.mainid = m.id
+LEFT JOIN uf_ddk od ON od.id = d.ddbh
 WHERE rb.currentnodetype = %(complete_node_type)s
   AND rb.workflowid IN %(mcn_order_workflow_ids)s
 
@@ -403,7 +416,9 @@ SELECT
     d.id AS `明细ID`,
     m.requestid AS `requestid`,
     rb.workflowid AS `workflowid`,
+    rb.REQUESTNAME AS `标题`,
     m.kpdh AS `开票单号`,
+    COALESCE(od.ddbh, d.ptpqh) AS `泛微订单编号`,
     m.sqr AS `申请人ID`,
     m.sqrbm AS `申请人部门ID`,
     m.sqrq AS `申请日期`,
@@ -424,6 +439,7 @@ SELECT
 FROM formtable_main_72 m
 JOIN workflow_requestbase rb ON rb.requestid = m.requestid
 JOIN formtable_main_72_dt5 d ON d.mainid = m.id
+LEFT JOIN formtable_main_79_dt2 od ON od.id = d.ptpqh
 WHERE rb.currentnodetype = %(complete_node_type)s
   AND rb.workflowid IN %(mcn_order_workflow_ids)s
 
@@ -436,7 +452,9 @@ SELECT
     d.id AS `明细ID`,
     m.requestid AS `requestid`,
     rb.workflowid AS `workflowid`,
+    rb.REQUESTNAME AS `标题`,
     m.kpdh AS `开票单号`,
+    COALESCE(od.ddbh, d.ptpqh) AS `泛微订单编号`,
     m.sqr AS `申请人ID`,
     m.sqrbm AS `申请人部门ID`,
     m.sqrq AS `申请日期`,
@@ -457,6 +475,7 @@ SELECT
 FROM formtable_main_72 m
 JOIN workflow_requestbase rb ON rb.requestid = m.requestid
 JOIN formtable_main_72_dt6 d ON d.mainid = m.id
+LEFT JOIN formtable_main_76_dt2 od ON od.id = d.ptpqh
 WHERE rb.currentnodetype = %(complete_node_type)s
   AND rb.workflowid IN %(mcn_order_workflow_ids)s
 
@@ -469,7 +488,9 @@ SELECT
     d.id AS `明细ID`,
     m.requestid AS `requestid`,
     rb.workflowid AS `workflowid`,
+    rb.REQUESTNAME AS `标题`,
     m.kpdh AS `开票单号`,
+    COALESCE(od.ddbh, d.ddh) AS `泛微订单编号`,
     m.sqr AS `申请人ID`,
     m.sqrbm AS `申请人部门ID`,
     m.sqrq AS `申请日期`,
@@ -490,8 +511,10 @@ SELECT
 FROM formtable_main_72 m
 JOIN workflow_requestbase rb ON rb.requestid = m.requestid
 JOIN formtable_main_72_dt7 d ON d.mainid = m.id
+LEFT JOIN formtable_main_76_dt2 od ON od.id = d.ddh
 WHERE rb.currentnodetype = %(complete_node_type)s
   AND rb.workflowid IN %(mcn_order_workflow_ids)s
+ORDER BY `开票单号`, `ID`, `明细来源`, `明细ID`
 """
 
 MCN_RECEIPT_SQL = """
@@ -994,6 +1017,41 @@ def build_output(invoice_df):
     return _apply_event_issue_fixes(output_df)
 
 
+def _mcn_receipt_allocations(invoice_df, line_amounts):
+    """把 MCN 收款登记头金额按开票单号顺序分摊到明细行,每行不超过本行金额。"""
+    if invoice_df.empty:
+        return pd.Series([], index=invoice_df.index)
+
+    receipt_amounts = pd.to_numeric(
+        invoice_df.get('收款登记已收款金额', pd.Series(0, index=invoice_df.index)),
+        errors='coerce',
+    ).fillna(0)
+    line_limits = pd.to_numeric(line_amounts, errors='coerce').fillna(0)
+    allocations = pd.Series(0.0, index=invoice_df.index)
+
+    invoice_numbers = invoice_df.get('开票单号', pd.Series('', index=invoice_df.index)).map(_text)
+    row_fallback_keys = pd.Series(
+        [f'__row_{row_no}' for row_no in range(len(invoice_numbers))],
+        index=invoice_df.index,
+    )
+    group_keys = invoice_numbers.where(invoice_numbers != '', row_fallback_keys)
+
+    for _, row_index in group_keys.groupby(group_keys, sort=False).groups.items():
+        remaining = float(receipt_amounts.loc[row_index].iloc[0])
+        if remaining <= 0:
+            continue
+        for idx in row_index:
+            line_limit = float(line_limits.loc[idx])
+            if line_limit <= 0:
+                continue
+            allocated = min(line_limit, remaining)
+            allocations.at[idx] = c.round_amount(allocated)
+            remaining = round(remaining - allocated, 10)
+            if remaining <= 0:
+                break
+    return allocations.map(c.round_amount)
+
+
 def build_mcn_output(invoice_df):
     """MCN 开票旧流程明细 -> 应收报账单期初导入模板 73 列。"""
     entity_map = c.build_accounting_entity_map_for_names(invoice_df['公司主体'])
@@ -1024,7 +1082,8 @@ def build_mcn_output(invoice_df):
 
     # 规则表备注为「不涉及」或当前无 MCN 源字段的列留空。
     output_df['里程碑阶段'] = ''
-    output_df['头备注'] = ''
+    output_df['头备注'] = invoice_df.get(
+        '标题', pd.Series('', index=invoice_df.index)).map(_text).str.slice(0, 150)
     output_df['发票号'] = ''
     output_df['自审批'] = ''
     output_df['自审核'] = ''
@@ -1043,9 +1102,9 @@ def build_mcn_output(invoice_df):
         lambda value: _mcn_invoice_type_code(value, invoice_type_map))
 
     # 金额和税率。
-    output_df['核销金额'] = pd.to_numeric(
-        invoice_df['收款登记已收款金额'], errors='coerce').fillna(0).map(c.round_amount)
-    output_df['金额'] = pd.to_numeric(invoice_df['开票金额'], errors='coerce').map(c.round_amount)
+    line_amounts = pd.to_numeric(invoice_df['开票金额'], errors='coerce')
+    output_df['核销金额'] = _mcn_receipt_allocations(invoice_df, line_amounts)
+    output_df['金额'] = line_amounts.map(c.round_amount)
     output_df['税率类型'] = invoice_df['税率'].map(lambda value: _tax_description(value, tax_description_map))
     output_df['税额'] = pd.to_numeric(invoice_df['税额'], errors='coerce').map(c.round_amount)
 
@@ -1057,8 +1116,10 @@ def build_mcn_output(invoice_df):
     for column in [f'行维度{i}' for i in range(3, 21)]:
         output_df[column] = ''
     output_df['泛微项目编号'] = project_codes
+    output_df['原泛微订单号'] = invoice_df.get(
+        '泛微订单编号', pd.Series('', index=invoice_df.index)).map(_text)
 
-    return output_df[OUTPUT_COLUMNS]
+    return output_df[MCN_OUTPUT_COLUMNS]
 
 
 def _filter_by_project_whitelist(invoice_df, sheet_name):

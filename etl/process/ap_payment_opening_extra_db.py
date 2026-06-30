@@ -1196,14 +1196,20 @@ def _apply_fee_item_fix_rule(df):
     return result
 
 
-def _apply_order_project_columns(output_df, source_df, table_order=EVENT_PROJECT_TABLES):
+def _apply_order_project_columns(
+        output_df, source_df, table_order=EVENT_PROJECT_TABLES, use_fixed_order_mapping=False):
     """按预付期初口径补充泛微项目编号,并用订单申请初始化导入表映射订单字段。"""
     df = output_df.copy()
     project_source_df = _with_resolved_project_fields(source_df, table_order=table_order)
     project_codes = project_source_df['项目编号'].map(_text)
+    mapping_value = (
+        c.ap_project_order_mapping_value
+        if use_fixed_order_mapping
+        else c.project_order_mapping_value
+    )
     df['泛微项目编号'] = project_codes
-    df['订单编号'] = project_codes.map(lambda value: c.project_order_mapping_value(value, '订单编号'))
-    df['订单名称'] = project_codes.map(lambda value: c.project_order_mapping_value(value, '订单标题'))
+    df['订单编号'] = project_codes.map(lambda value: mapping_value(value, '订单编号'))
+    df['订单名称'] = project_codes.map(lambda value: mapping_value(value, '订单标题'))
     if '费用项编码' in source_df.columns:
         fee_names = (
             source_df['费用项名称']
@@ -1812,7 +1818,11 @@ def build_batch_output(source_df):
     output_df['报账金额（支付币种）'] = amount.map(c.round_amount)
     output_df['泛微费用项目编码'] = source_df['预算科目'].where(source_df['预算科目'].notna(), '')
     output_df['银行账号'] = c.resolve_hand_vendor_bank_accounts(output_df['收款方编码'])
-    return _apply_order_project_columns(output_df, source_df)
+    return _apply_order_project_columns(
+        output_df,
+        source_df,
+        use_fixed_order_mapping=True,
+    )
 
 
 # ============================ MCN 对公付款流程 ============================
@@ -1929,7 +1939,12 @@ def build_mcn_payment_output(source_df):
     output_df['报账币种'] = 'CNY'
     output_df['报账金额（支付币种）'] = amount.map(c.round_amount)
     output_df['泛微费用项目编码'] = source_df['费用项编码'].map(_text)
-    return _apply_order_project_columns(output_df, source_df, MCN_PROJECT_TABLES), source_df
+    return _apply_order_project_columns(
+        output_df,
+        source_df,
+        MCN_PROJECT_TABLES,
+        use_fixed_order_mapping=False,
+    ), source_df
 
 
 # ============================ 只转入外部成本 ============================
@@ -2118,7 +2133,11 @@ def build_external_cost_output(source_df):
 
     # 供问题清单复用。
     expanded_df['收款方描述'] = VIRTUAL_VENDOR_NAME
-    return _apply_order_project_columns(output_df, expanded_df), expanded_df
+    return _apply_order_project_columns(
+        output_df,
+        expanded_df,
+        use_fixed_order_mapping=True,
+    ), expanded_df
 
 
 def collect_external_cost_pair_check(expanded_df):
@@ -2220,6 +2239,7 @@ def run():
     base_output_df = _apply_order_project_columns(
         build_output(base_source_df),
         base_issue_source_df,
+        use_fixed_order_mapping=True,
     )
     if '申请人' not in base_issue_source_df.columns and '经办人' in base_issue_source_df.columns:
         base_issue_source_df['申请人'] = base_issue_source_df['经办人']
@@ -2291,7 +2311,7 @@ def run():
     if not base_bank_issues.empty:
         base_sheets['银行账号_校验异常'] = base_bank_issues
     base_sheets = _enrich_missing_order_issue(base_sheets, base_output_df, base_issue_source_df)
-    base_sheets.update(c.collect_order_mapping_issues(base_issue_source_df))
+    base_sheets.update(c.collect_ap_order_mapping_issues(base_issue_source_df))
     c.attach_budget_issue_columns(base_sheets, c.build_budget_issue_map(base_issue_source_df))
     exception_sheets.update({f'期初对公付款单导入_{name}': df for name, df in base_sheets.items()})
 
@@ -2326,7 +2346,7 @@ def run():
     if not batch_bank_issues.empty:
         batch_sheets['银行账号_校验异常'] = batch_bank_issues
     batch_sheets = _enrich_missing_order_issue(batch_sheets, batch_output_df, batch_source_df)
-    batch_sheets.update(c.collect_order_mapping_issues(batch_source_df))
+    batch_sheets.update(c.collect_ap_order_mapping_issues(batch_source_df))
     c.attach_budget_issue_columns(batch_sheets, c.build_budget_issue_map(batch_source_df))
     exception_sheets.update({f'批量费用流程_{name}': df for name, df in batch_sheets.items()})
 
@@ -2338,7 +2358,7 @@ def run():
     if not external_bank_issues.empty:
         external_sheets['银行账号_校验异常'] = external_bank_issues
     external_sheets = _enrich_missing_order_issue(external_sheets, external_output_df, external_issue_source_df)
-    external_sheets.update(c.collect_order_mapping_issues(external_issue_source_df))
+    external_sheets.update(c.collect_ap_order_mapping_issues(external_issue_source_df))
     external_sheets.update(collect_external_cost_pair_check(external_issue_source_df))
     c.attach_budget_issue_columns(external_sheets, c.build_budget_issue_map(external_issue_source_df))
     exception_sheets.update({f'只转入外部成本_{name}': df for name, df in external_sheets.items()})

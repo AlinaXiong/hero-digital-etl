@@ -1845,8 +1845,8 @@ def build_supplier_output(merged_df):
 
     # 项目&订单清洗结果:泛微项目编号 -> 订单编号/订单标题。
     output_df['泛微项目编号'] = merged_df['项目编号'].map(_text)
-    output_df['订单编号'] = merged_df['项目编号'].map(lambda value: c.project_order_mapping_value(value, '订单编号'))
-    output_df['订单名称'] = merged_df['项目编号'].map(lambda value: c.project_order_mapping_value(value, '订单标题'))
+    output_df['订单编号'] = merged_df['项目编号'].map(lambda value: c.ap_project_order_mapping_value(value, '订单编号'))
+    output_df['订单名称'] = merged_df['项目编号'].map(lambda value: c.ap_project_order_mapping_value(value, '订单标题'))
 
     # 当前源数据没有直接可用的计划行/付款计划日期/银行备注/主播房间号,按模板留空。
     output_df['合同收支计划行'] = ''
@@ -1951,8 +1951,8 @@ def build_gig_output(merged_df):
 
     # 项目&订单清洗结果:泛微项目编号 -> 订单编号/订单标题。
     output_df['泛微项目编号'] = merged_df['项目编号'].map(_text)
-    output_df['订单编号'] = merged_df['项目编号'].map(lambda value: c.project_order_mapping_value(value, '订单编号'))
-    output_df['订单名称'] = merged_df['项目编号'].map(lambda value: c.project_order_mapping_value(value, '订单标题'))
+    output_df['订单编号'] = merged_df['项目编号'].map(lambda value: c.ap_project_order_mapping_value(value, '订单编号'))
+    output_df['订单名称'] = merged_df['项目编号'].map(lambda value: c.ap_project_order_mapping_value(value, '订单标题'))
     output_df['合同收支计划行'] = ''
     output_df['银行转账备注'] = ''
     if has_mapped_expense_items:
@@ -2803,14 +2803,20 @@ def _required_without(required_cols, excluded_cols):
 
 
 def _collect_exception_sheets(
-        output_df, source_df, required_cols, rule_table, source_field_map, bank_source_col=None):
+        output_df, source_df, required_cols, rule_table, source_field_map, *,
+        use_fixed_order_mapping, bank_source_col=None):
     sheets = {'必输字段未达100%': c.fill_summary(output_df, required_cols, RULE_SHEET, rule_table)}
     sheets.update(c.collect_field_issues(output_df, source_df, required_cols, source_field_map))
     if bank_source_col and bank_source_col in source_df.columns:
         bank_issues = c.collect_hand_vendor_bank_account_issues(output_df, source_df[bank_source_col])
         if not bank_issues.empty:
             sheets['银行账号_校验异常'] = bank_issues
-    sheets.update(c.collect_order_mapping_issues(source_df))
+    order_issue_collector = (
+        c.collect_ap_order_mapping_issues
+        if use_fixed_order_mapping
+        else c.collect_order_mapping_issues
+    )
+    sheets.update(order_issue_collector(source_df))
     c.attach_budget_issue_columns(sheets, c.build_budget_issue_map(source_df))
     return sheets
 
@@ -2891,13 +2897,17 @@ def run():
     exception_sheets = {}
     supplier_sheets = _collect_exception_sheets(
         supplier_output_df, supplier_merged_df, supplier_required, RULE_TABLE_SUPPLIER,
-        SUPPLIER_ISSUE_SOURCE_FIELDS, bank_source_col='银行卡号',
+        SUPPLIER_ISSUE_SOURCE_FIELDS,
+        use_fixed_order_mapping=True,
+        bank_source_col='银行卡号',
     )
     exception_sheets.update({f'供应商_{name}': df for name, df in supplier_sheets.items()})
 
     gig_sheets = _collect_exception_sheets(
         gig_output_df, gig_merged_df, gig_required_effective, RULE_TABLE_GIG,
-        GIG_ISSUE_SOURCE_FIELDS, bank_source_col='银行账号',
+        GIG_ISSUE_SOURCE_FIELDS,
+        use_fixed_order_mapping=True,
+        bank_source_col='银行账号',
     )
     exception_sheets.update({f'灵工_{name}': df for name, df in gig_sheets.items()})
 
@@ -2905,7 +2915,9 @@ def run():
         source_df = mcn_supplier_sources[sheet_name]
         sheets = _collect_exception_sheets(
             output_df, source_df, supplier_required, RULE_TABLE_SUPPLIER,
-            MCN_SUPPLIER_ISSUE_SOURCE_FIELDS, bank_source_col='银行账号',
+            MCN_SUPPLIER_ISSUE_SOURCE_FIELDS,
+            use_fixed_order_mapping=False,
+            bank_source_col='银行账号',
         )
         exception_sheets.update({f'{sheet_name}_{name}': df for name, df in sheets.items()})
 
@@ -2913,7 +2925,9 @@ def run():
         source_df = mcn_gig_sources[sheet_name]
         sheets = _collect_exception_sheets(
             output_df, source_df, mcn_gig_required, RULE_TABLE_GIG,
-            MCN_GIG_ISSUE_SOURCE_FIELDS, bank_source_col='明细银行账号',
+            MCN_GIG_ISSUE_SOURCE_FIELDS,
+            use_fixed_order_mapping=False,
+            bank_source_col='明细银行账号',
         )
         exception_sheets.update({f'{sheet_name}_{name}': df for name, df in sheets.items()})
 
