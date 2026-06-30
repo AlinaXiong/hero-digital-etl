@@ -533,6 +533,9 @@ def clean_fw_select_name(value, language_id=7):
         return ''
     marker = '~`~`'
     legacy_marker = '`~`'
+    # Some Ecology workflow names persist the same separator as visually similar
+    # tilde characters after encoding/display conversion.
+    text = text.replace('˜～', legacy_marker)
 
     def repair_legacy_mojibake(label):
         """部分泛微节点名的中文被按 Big5 解码,需按 Big5->GBK 还原。"""
@@ -547,17 +550,27 @@ def clean_fw_select_name(value, language_id=7):
             return repaired
         return label
 
+    delivery_match = re.search(
+        r'(?:`~`|~`~`|[丶、~]*~`)\s*\d+\s*(?:特送至|Special delivery\b)',
+        text,
+        flags=re.IGNORECASE,
+    )
+    if delivery_match:
+        prefix = text[:delivery_match.start()].strip('`~丶、 ')
+        if prefix:
+            return repair_legacy_mojibake(prefix)
+
     if marker not in text and legacy_marker not in text:
         return text
 
     def first_legacy_label(label):
         parts = [part.strip('`~ ') for part in label.split(legacy_marker)]
         for part in parts:
-            if part.startswith(str(language_id)):
-                return part[len(str(language_id)):].strip()
-        for part in parts:
             if part and not re.match(r'^\d+\s+', part):
                 return part
+        for part in parts:
+            if part.startswith(str(language_id)):
+                return part[len(str(language_id)):].strip()
         return re.sub(r'`~`\d+\s*', '', label).strip('`~ ')
 
     if marker in text:

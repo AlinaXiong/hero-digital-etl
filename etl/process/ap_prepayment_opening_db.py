@@ -68,6 +68,8 @@ PREPAYMENT_YES_CODE = '0'
 PREPAYMENT_NO_CODE = '1'
 
 SUPPLIER_OUTPUT_COLUMNS = [
+    '当前节点',
+    '当前状况',
     '来源系统',
     '来源单据编号',
     '申请日期',
@@ -98,6 +100,8 @@ SUPPLIER_OUTPUT_COLUMNS = [
     '泛微费用项目编码',
 ]
 GIG_OUTPUT_COLUMNS = [
+    '当前节点',
+    '当前状况',
     '来源系统',
     '来源单据编号',
     '申请日期',
@@ -213,6 +217,7 @@ PAYMENT_NATURE_MEANINGS = {
 SUPPLIER_SOURCE_SQL = """
 SELECT
     m.id AS `ID`,
+    COALESCE(NULLIF(NULLIF(CAST(m.requestId AS CHAR), ''), '0'), NULLIF(m.crbgxqqid, '')) AS `RequestID`,
     d.id AS `明细ID`,
     m.lcbh AS `流程编号`,
     m.sqrq AS `申请日期`,
@@ -1061,6 +1066,23 @@ WHERE d.xmbh IN %(project_ids)s
 GROUP BY m.jmyfklc, d.xmbh, d.fjxh
 """
 
+WORKFLOW_STATE_SQL = """
+SELECT
+    rb.requestid AS `RequestID`,
+    nb.nodename AS `当前节点`,
+    rb.status AS `当前状况`
+FROM workflow_requestbase rb
+LEFT JOIN (
+    SELECT requestid, MAX(nownodeid) AS nownodeid
+    FROM workflow_nownode
+    WHERE requestid IN %(requestids)s
+    GROUP BY requestid
+) nn ON nn.requestid = rb.requestid
+LEFT JOIN workflow_nodebase nb
+    ON nb.id = COALESCE(nn.nownodeid, rb.currentnodeid, rb.lastnodeid)
+WHERE rb.requestid IN %(requestids)s
+"""
+
 
 # 运行前校验字段真实含义。主表字段 detail_table 用空字符串。
 EXPECTED_SUPPLIER_FIELDS = {
@@ -1207,6 +1229,44 @@ def _chunks(values, size=SQL_BATCH_SIZE):
     values = list(values)
     for start in range(0, len(values), size):
         yield values[start:start + size]
+
+
+def attach_workflow_states(source_df, request_column='RequestID'):
+    """按 requestid 补当前节点和当前状况，当前节点取 MAX(nownodeid) 对应名称。"""
+    df = source_df.copy()
+    if df.empty or request_column not in df.columns:
+        df['当前节点'] = ''
+        df['当前状况'] = ''
+        return df
+
+    request_ids = sorted({
+        c.format_code(value)
+        for value in df[request_column]
+        if c.format_code(value)
+    })
+    if not request_ids:
+        df['当前节点'] = ''
+        df['当前状况'] = ''
+        return df
+
+    state_frames = [
+        _query_fw(WORKFLOW_STATE_SQL, {'requestids': tuple(chunk)})
+        for chunk in _chunks(request_ids)
+    ]
+    state_df = pd.concat(state_frames, ignore_index=True) if state_frames else pd.DataFrame()
+    if state_df.empty:
+        df['当前节点'] = ''
+        df['当前状况'] = ''
+        return df
+
+    state_df['requestid_key'] = state_df['RequestID'].map(c.format_code)
+    state_df = state_df.drop_duplicates('requestid_key', keep='last')
+    node_map = state_df.set_index('requestid_key')['当前节点'].map(c.clean_fw_select_name).to_dict()
+    status_map = state_df.set_index('requestid_key')['当前状况'].map(_text).to_dict()
+    request_keys = df[request_column].map(c.format_code)
+    df['当前节点'] = request_keys.map(node_map).fillna('')
+    df['当前状况'] = request_keys.map(status_map).fillna('')
+    return df
 
 
 def _amount_match_key(value):
@@ -1827,6 +1887,10 @@ def build_supplier_output(merged_df):
     output_df = pd.DataFrame(index=merged_df.index)
 
     # 固定值。
+    output_df['当前节点'] = merged_df.get(
+        '当前节点', pd.Series('', index=merged_df.index)).map(_text)
+    output_df['当前状况'] = merged_df.get(
+        '当前状况', pd.Series('', index=merged_df.index)).map(_text)
     output_df['来源系统'] = 'FW'
     output_df['单据类型'] = DOCUMENT_TYPE
 
@@ -1918,6 +1982,10 @@ def build_gig_output(merged_df):
     output_df = pd.DataFrame(index=merged_df.index)
 
     # 固定值。
+    output_df['当前节点'] = merged_df.get(
+        '当前节点', pd.Series('', index=merged_df.index)).map(_text)
+    output_df['当前状况'] = merged_df.get(
+        '当前状况', pd.Series('', index=merged_df.index)).map(_text)
     output_df['来源系统'] = 'FW'
     output_df['单据类型'] = GIG_DOCUMENT_TYPE
     output_df['保证金标志'] = ''
@@ -2238,6 +2306,10 @@ def build_mcn_supplier_output(source_df, fill_anchor_room=False):
         return vendor_info_map.get(index, {}).get(field, '')
 
     output_df = pd.DataFrame(index=source_df.index)
+    output_df['当前节点'] = source_df.get(
+        '当前节点', pd.Series('', index=source_df.index)).map(_text)
+    output_df['当前状况'] = source_df.get(
+        '当前状况', pd.Series('', index=source_df.index)).map(_text)
     output_df['来源系统'] = SOURCE_SYSTEM
     output_df['来源单据编号'] = source_df['流程编号']
     output_df['申请日期'] = source_df['申请日期'].map(c.format_date)
@@ -2456,6 +2528,10 @@ def build_mcn_gig_output(
     amount = pd.to_numeric(amount_source, errors='coerce')
 
     output_df = pd.DataFrame(index=source_df.index)
+    output_df['当前节点'] = source_df.get(
+        '当前节点', pd.Series('', index=source_df.index)).map(_text)
+    output_df['当前状况'] = source_df.get(
+        '当前状况', pd.Series('', index=source_df.index)).map(_text)
     output_df['来源系统'] = SOURCE_SYSTEM
     output_df['来源单据编号'] = source_df['流程编号']
     output_df['申请日期'] = source_df['申请日期'].map(c.format_date)
@@ -2639,6 +2715,7 @@ def read_supplier_source():
         '预付期初-供应商预付款-DB',
     )
     merged_df = resolve_supplier_source_values(source_df)
+    merged_df = attach_workflow_states(merged_df)
     print('[预付期初-供应商预付款-DB] SQL主子合并明细行数:', len(merged_df))
     return merged_df
 
@@ -2666,6 +2743,7 @@ def read_gig_source():
         '预付期初-零工预付款-收款人',
     )
     recipient_df = resolve_gig_source_values(recipient_source_df)
+    recipient_df = attach_workflow_states(recipient_df, request_column='流程请求ID')
     print('[预付期初-零工预付款-DB] SQL收款人明细行数:', len(recipient_df))
     budget_source_df = _query_fw(GIG_BUDGET_SOURCE_SQL, params)
     budget_source_df = _filter_by_project_whitelist(
@@ -2723,6 +2801,7 @@ def read_mcn_supplier_sources():
         )
         source_df = _apply_mcn_anchor_fee_usage(source_df)
         source_df = resolve_mcn_common_values(source_df)
+        source_df = attach_workflow_states(source_df)
         if not source_df.empty:
             source_df = apply_mcn_offset_amounts(source_df, _query_fw(offset_sql, params), link_column)
         source_by_sheet[sheet_name] = source_df
@@ -2739,6 +2818,7 @@ def _read_mcn_platform_gig_source(
         f'预付期初-{sheet_name}',
     )
     fee_df = resolve_mcn_common_values(fee_df)
+    fee_df = attach_workflow_states(fee_df)
     recipient_df = _query_fw(recipient_sql, params)
     if not fee_df.empty and not recipient_df.empty:
         recipient_df = recipient_df[recipient_df['ID'].isin(fee_df['ID'].dropna().unique())].copy()
@@ -2790,6 +2870,7 @@ def read_mcn_gig_sources():
     )
     anchor_df = _apply_mcn_anchor_fee_usage(anchor_df)
     anchor_df = resolve_mcn_common_values(anchor_df)
+    anchor_df = attach_workflow_states(anchor_df)
     if not anchor_df.empty:
         anchor_df['预付款金额分摊'] = anchor_df['金额']
     source_by_sheet[SHEET_MCN_ANCHOR_PLATFORM_PREPAYMENT] = anchor_df
