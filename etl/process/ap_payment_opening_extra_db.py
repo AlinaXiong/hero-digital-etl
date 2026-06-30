@@ -74,6 +74,8 @@ _PAYMENT_VENDOR_FIX_CACHE = None
 _FEE_ITEM_FIX_CACHE = None
 
 OUTPUT_COLUMNS = [
+    '当前节点',
+    '当前状况',
     '来源系统',
     '来源单据编号',
     '申请日期',
@@ -690,6 +692,31 @@ LEFT JOIN uf_yskm y ON y.id = v.fyx
 WHERE v.requestid IN %(request_ids)s
 """
 
+# 当前节点/当前状况:对照泛微流程监控。当前节点可能命中多个 nownode,取 MAX(nownodeid)。
+WORKFLOW_STATE_SQL = """
+SELECT
+    rb.requestid AS `requestid`,
+    nb.nodename AS `当前节点`,
+    rb.status AS `当前状况`
+FROM workflow_requestbase rb
+LEFT JOIN (
+    SELECT requestid, MAX(nownodeid) AS nownodeid
+    FROM workflow_nownode
+    WHERE requestid IN %(requestids)s
+    GROUP BY requestid
+) nn ON nn.requestid = rb.requestid
+LEFT JOIN workflow_nodebase nb
+    ON nb.id = COALESCE(nn.nownodeid, rb.currentnodeid, rb.lastnodeid)
+WHERE rb.requestid IN %(requestids)s
+"""
+
+# 建模表(对公付款/只转入外部成本)无可用 requestId 列,按单据号=requestmark 反查 requestid。
+REQUESTID_BY_MARK_SQL = """
+SELECT requestid, requestmark
+FROM workflow_requestbase
+WHERE requestmark IN %(marks)s
+"""
+
 
 # ============================ 小工具 ============================
 def _query_fw(sql, params=None):
@@ -755,6 +782,73 @@ def _chunks(values, size=SQL_BATCH_SIZE):
     values = list(values)
     for start in range(0, len(values), size):
         yield values[start:start + size]
+
+
+def _request_ids_by_doc_no(doc_nos):
+    """按单据号(requestmark=流程编号)反查 requestid;同号多 requestid 取最大(最新)。"""
+    marks = sorted({_text(value) for value in doc_nos if _text(value)})
+    if not marks:
+        return {}
+    frames = []
+    for chunk in _chunks(marks):
+        frames.append(_query_fw(REQUESTID_BY_MARK_SQL, {'marks': tuple(chunk)}))
+    mark_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if mark_df.empty:
+        return {}
+    mark_df['_mark'] = mark_df['requestmark'].map(_text)
+    mark_df['_rid'] = mark_df['requestid'].map(c.format_code)
+    mark_df = mark_df[mark_df['_mark'].ne('') & mark_df['_rid'].ne('')]
+    if mark_df.empty:
+        return {}
+    mark_df['_rid_int'] = pd.to_numeric(mark_df['_rid'], errors='coerce')
+    mark_df = mark_df.sort_values('_rid_int').drop_duplicates('_mark', keep='last')
+    return dict(zip(mark_df['_mark'], mark_df['_rid']))
+
+
+def attach_workflow_states(source_df, request_id_col=None, doc_no_col=None):
+    """补当前节点和当前状况(对照泛微流程监控)。当前节点取 MAX(nownodeid) 对应名称。
+
+    request_id_col: 源已带 requestId 列(MCN formtable 流程)时直接用;
+    doc_no_col: 建模表无 requestId 列时,按单据号(=requestmark)反查 requestid。
+    """
+    df = source_df.copy()
+    if df.empty:
+        df['当前节点'] = ''
+        df['当前状况'] = ''
+        return df
+
+    if request_id_col and request_id_col in df.columns:
+        request_keys = df[request_id_col].map(c.format_code)
+    elif doc_no_col and doc_no_col in df.columns:
+        doc_to_request = _request_ids_by_doc_no(df[doc_no_col])
+        request_keys = df[doc_no_col].map(lambda value: doc_to_request.get(_text(value), ''))
+    else:
+        df['当前节点'] = ''
+        df['当前状况'] = ''
+        return df
+
+    request_ids = sorted({key for key in request_keys if key})
+    if not request_ids:
+        df['当前节点'] = ''
+        df['当前状况'] = ''
+        return df
+
+    state_frames = []
+    for chunk in _chunks(request_ids):
+        state_frames.append(_query_fw(WORKFLOW_STATE_SQL, {'requestids': tuple(chunk)}))
+    state_df = pd.concat(state_frames, ignore_index=True) if state_frames else pd.DataFrame()
+    if state_df.empty:
+        df['当前节点'] = ''
+        df['当前状况'] = ''
+        return df
+
+    state_df['requestid_key'] = state_df['requestid'].map(c.format_code)
+    state_df = state_df.drop_duplicates('requestid_key', keep='last')
+    node_map = state_df.set_index('requestid_key')['当前节点'].map(c.clean_fw_select_name).to_dict()
+    status_map = state_df.set_index('requestid_key')['当前状况'].map(_text).to_dict()
+    df['当前节点'] = request_keys.map(node_map).fillna('')
+    df['当前状况'] = request_keys.map(status_map).fillna('')
+    return df
 
 
 def _amount_match_key(value):
@@ -1661,6 +1755,12 @@ def build_output(merged_df):
     output_df['来源系统'] = 'FW'
     output_df['单据类型'] = DOCUMENT_TYPE
 
+    # 泛微流程当前节点/当前状况(对照流程监控);源已在 read_*_source 阶段补好。
+    output_df['当前节点'] = merged_df.get(
+        '当前节点', pd.Series('', index=merged_df.index)).map(_text)
+    output_df['当前状况'] = merged_df.get(
+        '当前状况', pd.Series('', index=merged_df.index)).map(_text)
+
     # 泛微主表直取字段。
     output_df['来源单据编号'] = merged_df['流程编号']                  # [主表] lcbh
     output_df['申请日期'] = merged_df['申请日期'].map(c.format_date)   # [主表] sqrq
@@ -1731,6 +1831,7 @@ def read_base_source():
         '应付期初-供应商付款-DB',
     )
     source_df = _with_resolved_project_fields(source_df, '项目编号', EVENT_PROJECT_TABLES)
+    source_df = attach_workflow_states(source_df, doc_no_col='流程编号')
     print('[应付期初-供应商付款-DB] SQL主子合并明细行数:', len(source_df))
     return source_df
 
@@ -1755,7 +1856,7 @@ def read_batch_source():
         '应付期初-批量费用流程',
     )
     print('[应付期初-批量费用流程] SQL明细行数:', len(source_df))
-    return resolve_batch_values(source_df)
+    return attach_workflow_states(resolve_batch_values(source_df), doc_no_col='流程编号')
 
 
 def resolve_batch_values(source_df):
@@ -1792,6 +1893,10 @@ def build_batch_output(source_df):
 
     output_df = pd.DataFrame(index=source_df.index)
     output_df['来源系统'] = SOURCE_SYSTEM
+    output_df['当前节点'] = source_df.get(
+        '当前节点', pd.Series('', index=source_df.index)).map(_text)
+    output_df['当前状况'] = source_df.get(
+        '当前状况', pd.Series('', index=source_df.index)).map(_text)
     output_df['来源单据编号'] = source_df['流程编号']
     output_df['申请日期'] = source_df['申请日期'].map(c.format_date)
     output_df['单据类型'] = DOCUMENT_TYPE
@@ -1849,7 +1954,7 @@ def read_mcn_payment_source():
     )
     source_df = _apply_mcn_anchor_fee_usage(source_df)
     print('[应付期初-MCN对公付款] 三类流程明细行数:', len(source_df))
-    return resolve_mcn_payment_values(source_df)
+    return attach_workflow_states(resolve_mcn_payment_values(source_df), request_id_col='RequestID')
 
 
 def resolve_mcn_payment_values(source_df):
@@ -1908,6 +2013,10 @@ def build_mcn_payment_output(source_df):
 
     output_df = pd.DataFrame(index=source_df.index)
     output_df['来源系统'] = SOURCE_SYSTEM
+    output_df['当前节点'] = source_df.get(
+        '当前节点', pd.Series('', index=source_df.index)).map(_text)
+    output_df['当前状况'] = source_df.get(
+        '当前状况', pd.Series('', index=source_df.index)).map(_text)
     output_df['来源单据编号'] = source_df['流程编号']
     output_df['申请日期'] = source_df['申请日期'].map(c.format_date)
     output_df['单据类型'] = DOCUMENT_TYPE
@@ -1969,7 +2078,8 @@ def read_external_cost_source():
           f"转出金额合计 {float(stats['out_amount_total'] or 0):.2f}")
     source_df = _query_fw(EXTERNAL_COST_SOURCE_SQL, params)
     print('[应付期初-只转入外部成本] SQL费用明细行数:', len(source_df))
-    return resolve_external_cost_values(allocate_external_cost_amounts(source_df))
+    source_df = resolve_external_cost_values(allocate_external_cost_amounts(source_df))
+    return attach_workflow_states(source_df, doc_no_col='流程编号')
 
 
 def resolve_external_cost_values(source_df):
@@ -2105,6 +2215,10 @@ def build_external_cost_output(source_df):
 
     output_df = pd.DataFrame(index=expanded_df.index)
     output_df['来源系统'] = SOURCE_SYSTEM
+    output_df['当前节点'] = expanded_df.get(
+        '当前节点', pd.Series('', index=expanded_df.index)).map(_text)
+    output_df['当前状况'] = expanded_df.get(
+        '当前状况', pd.Series('', index=expanded_df.index)).map(_text)
     output_df['来源单据编号'] = expanded_df['流程编号']
     output_df['申请日期'] = expanded_df['申请日期'].map(c.format_date)
     output_df['单据类型'] = DOCUMENT_TYPE

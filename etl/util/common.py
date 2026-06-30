@@ -550,15 +550,28 @@ def clean_fw_select_name(value, language_id=7):
             return repaired
         return label
 
-    delivery_match = re.search(
-        r'(?:`~`|~`~`|[丶、~]*~`)\s*\d+\s*(?:特送至|Special delivery\b)',
-        text,
-        flags=re.IGNORECASE,
-    )
-    if delivery_match:
-        prefix = text[:delivery_match.start()].strip('`~丶、 ')
-        if prefix:
-            return repair_legacy_mojibake(prefix)
+    def clean_delivery_transition(label):
+        """保留「节点A 特送至 节点B」中文语义,去掉泛微多语言标记和英文段。"""
+        if '特送至' not in label and 'Special delivery' not in label:
+            return ''
+        normalized = label.replace(marker, legacy_marker)
+        normalized = normalized.replace('˜～', legacy_marker)
+        normalized = re.sub(r'[丶、]*(?<!`)~`', legacy_marker, normalized)
+        normalized = re.sub(r'(?<!`)~~`?', legacy_marker, normalized)
+        normalized = re.sub(r'(?<!`)~(?=\d+\s)', legacy_marker, normalized)
+        parts = []
+        for part in normalized.split(legacy_marker):
+            part = part.strip('`~丶、 ')
+            part = re.sub(r'^\d+\s*', '', part).strip()
+            part = part.strip('()（） ')
+            if not part or re.fullmatch(r'Special delivery(?:\s+to)?', part, flags=re.IGNORECASE):
+                continue
+            parts.append(part)
+        return repair_legacy_mojibake(''.join(parts)) if parts else ''
+
+    delivery_transition = clean_delivery_transition(text)
+    if delivery_transition:
+        return delivery_transition
 
     if marker not in text and legacy_marker not in text:
         return text

@@ -1262,7 +1262,7 @@ def attach_workflow_states(source_df, request_column='RequestID'):
     state_df['requestid_key'] = state_df['RequestID'].map(c.format_code)
     state_df = state_df.drop_duplicates('requestid_key', keep='last')
     node_map = state_df.set_index('requestid_key')['当前节点'].map(c.clean_fw_select_name).to_dict()
-    status_map = state_df.set_index('requestid_key')['当前状况'].map(_text).to_dict()
+    status_map = state_df.set_index('requestid_key')['当前状况'].map(c.clean_fw_select_name).to_dict()
     request_keys = df[request_column].map(c.format_code)
     df['当前节点'] = request_keys.map(node_map).fillna('')
     df['当前状况'] = request_keys.map(status_map).fillna('')
