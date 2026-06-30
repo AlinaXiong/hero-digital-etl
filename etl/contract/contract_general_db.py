@@ -198,6 +198,8 @@ SELECT
     h.htje AS `合同金额`,
     h.htyjsr AS `合同预计收入`,
     h.htyjzc AS `合同预计支出`,
+    NULL AS `收入币种ID`,
+    NULL AS `支出币种ID`,
     h.htzy AS `合同摘要`,
     h.htqdg AS `合同附件DOCID`,
     h.cbzx AS `成本中心ID`,
@@ -281,6 +283,8 @@ SELECT
     NULL AS `合同金额`,
     h.srje AS `合同预计收入`,
     h.zcje AS `合同预计支出`,
+    h.srbz AS `收入币种ID`,
+    h.zcbz AS `支出币种ID`,
     h.htzy AS `合同摘要`,
     h.htsxg AS `合同附件DOCID`,
     h.htcg AS `赛事初稿DOCID`,
@@ -2373,6 +2377,8 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
         '  ├─关联框架映射',
         lambda: build_contract_info_map_for_ids(df['关联框架协议ID'], option_table=option_table),
     )
+    currency_name_map = _timed('  ├─收支币种映射', lambda: c.build_fw_currency_name_map_for_ids(
+        pd.concat([df['收入币种ID'], df['支出币种ID']], ignore_index=True)))
     cost_center_platform_map = _timed('  └─成本中心平台映射',
                                       lambda: build_cost_center_platform_map(df.get('成本中心ID', pd.Series(dtype=object))))
 
@@ -2508,6 +2514,12 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
     df['合同分类'] = df.apply(resolve_contract_category, axis=1)
     df['合同分类依据'] = df.apply(resolve_contract_category_basis, axis=1)
     df['收支类型'] = df.apply(resolve_pay_type, axis=1)
+    income_currency = df['收入币种ID'].map(
+        lambda value: currency_name_map.get(c.format_code(value), ''))
+    expense_currency = df['支出币种ID'].map(
+        lambda value: currency_name_map.get(c.format_code(value), ''))
+    df['收入币种'] = income_currency.where(df['收支类型'].isin(('收入类', '既收又支')), '')
+    df['支出币种'] = expense_currency.where(df['收支类型'].isin(('支出类', '既收又支')), '')
     df['专项品类'] = df.get('专项分类编码', pd.Series('', index=df.index)).map(resolve_special_category)
     amount_tuples = df.apply(resolve_amounts, axis=1)
     df['合同总额_解析'] = amount_tuples.map(lambda item: item[0])
@@ -2737,6 +2749,8 @@ def build_main_output(source_df, headers):
         _set(row, '订单编号', _text(source.get('订单编号')))
         _set(row, 'contractCategory(智书框架合同类型)',
              '其他-保密协议' if '保密协议' in contract_name else source['合同分类'])
+        _set(row, '收入币种', _text(source.get('收入币种')))
+        _set(row, '支出币种', _text(source.get('支出币种')))
         _set(row, 'pay_type_code（收支类型）', source['收支类型'])
         _set(row, 'property_type_code（计价方式）', DEFAULT_PROPERTY_TYPE)
         _set(row, 'estimated_amount（预估金额）', amount)
