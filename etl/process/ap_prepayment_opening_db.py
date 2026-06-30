@@ -559,6 +559,51 @@ SELECT * FROM (
     LEFT JOIN formtable_main_76_dt2 od ON od.id = d.ddh
     LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
     LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx
+    UNION ALL
+    SELECT
+        'MCN预付款流程（订单）' AS `来源流程`,
+        m.id AS `ID`,
+        m.requestid AS `RequestID`,
+        d.id AS `明细ID`,
+        m.lcbh AS `流程编号`,
+        rb.REQUESTNAME AS `标题`,
+        m.sqrq AS `申请日期`,
+        m.sqr AS `申请人ID`,
+        m.gszt AS `公司主体ID`,
+        m.cbzx AS `成本中心ID`,
+        cc.bh AS `成本中心编号`,
+        m.gysmc AS `供应商ID`,
+        m.yhzh AS `银行账号ID`,
+        m.szht AS `主表合同ID`,
+        d.szht AS `明细合同ID`,
+        d.szxm AS `项目编号ID`,
+        d.xmmc AS `项目名称`,
+        d.fjxh AS `费用项编码`,
+        d.fyx AS `费用项名称`,
+        d.je AS `金额`,
+        NULL AS `泛微订单编号`,
+        NULL AS `主播房间号`,
+        NULL AS `主播昵称`,
+        NULL AS `身份证号`,
+        NULL AS `实际收款方`,
+        NULL AS `手机号`,
+        NULL AS `明细银行账号`
+    FROM formtable_main_83 m
+    JOIN formtable_main_83_dt1 d ON d.mainid = m.id
+    LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
+    LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx
+    WHERE NOT EXISTS (
+        SELECT 1 FROM formtable_main_83_dt3 x WHERE x.mainid = m.id
+    )
+      AND NOT EXISTS (
+        SELECT 1 FROM formtable_main_83_dt4 x WHERE x.mainid = m.id
+    )
+      AND NOT EXISTS (
+        SELECT 1 FROM formtable_main_83_dt5 x WHERE x.mainid = m.id
+    )
+      AND NOT EXISTS (
+        SELECT 1 FROM formtable_main_83_dt6 x WHERE x.mainid = m.id
+    )
 ) x
 WHERE (
       x.`项目编号ID` IN %(project_ids)s
@@ -587,11 +632,11 @@ MCN_ANCHOR_SOURCE_SELECTS = """
         m.dfgsmc AS `供应商ID`,
         COALESCE(m.gysyhzh, m.yhzh) AS `银行账号ID`,
         m.szht AS `主表合同ID`,
-        d.xght AS `明细合同ID`,
+        {contract_expr} AS `明细合同ID`,
         d.xmbh AS `项目编号ID`,
         d.xmmc AS `项目名称`,
-        d.fjxh AS `费用项编码`,
-        d.fyx AS `费用项名称`,
+        {fee_code_expr} AS `费用项编码`,
+        {fee_name_expr} AS `费用项名称`,
         {amount_expr} AS `金额`,
         d.zbid AS `主播房间号`,
         d.zbnc AS `主播昵称`,
@@ -605,12 +650,66 @@ MCN_ANCHOR_SOURCE_SELECTS = """
     JOIN {detail_table} d ON d.mainid = m.id
     LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestId
     LEFT JOIN uf_cbzx cc ON cc.id = COALESCE(d.cbzx, m.cbzx1, m.cbzxjs)
+    {detail_filter}
 """
+
+MCN_ANCHOR_DETAIL_SELECTS = [
+    MCN_ANCHOR_SOURCE_SELECTS.format(
+        detail_table='formtable_main_38_dt4',
+        contract_expr='d.xght',
+        fee_code_expr='d.fjxh',
+        fee_name_expr='d.fyx',
+        amount_expr='COALESCE(d.dkje, d.yfuje, d.skje, d.yfaje)',
+        detail_filter='',
+    ),
+    MCN_ANCHOR_SOURCE_SELECTS.format(
+        detail_table='formtable_main_38_dt2',
+        contract_expr="''",
+        fee_code_expr="''",
+        fee_name_expr="''",
+        amount_expr='COALESCE(d.dkje, d.yfje, d.skje)',
+        detail_filter="""
+    WHERE NOT EXISTS (
+        SELECT 1 FROM formtable_main_38_dt4 x WHERE x.mainid = m.id
+    )""",
+    ),
+    MCN_ANCHOR_SOURCE_SELECTS.format(
+        detail_table='formtable_main_38_dt1',
+        contract_expr="''",
+        fee_code_expr="''",
+        fee_name_expr="''",
+        amount_expr='COALESCE(d.dkje, d.yfje, d.skje)',
+        detail_filter="""
+    WHERE NOT EXISTS (
+        SELECT 1 FROM formtable_main_38_dt4 x WHERE x.mainid = m.id
+    )
+      AND NOT EXISTS (
+        SELECT 1 FROM formtable_main_38_dt2 x WHERE x.mainid = m.id
+    )""",
+    ),
+    MCN_ANCHOR_SOURCE_SELECTS.format(
+        detail_table='formtable_main_38_dt3',
+        contract_expr="''",
+        fee_code_expr="''",
+        fee_name_expr="''",
+        amount_expr='COALESCE(d.dkje, d.yfje, d.skje)',
+        detail_filter="""
+    WHERE NOT EXISTS (
+        SELECT 1 FROM formtable_main_38_dt4 x WHERE x.mainid = m.id
+    )
+      AND NOT EXISTS (
+        SELECT 1 FROM formtable_main_38_dt2 x WHERE x.mainid = m.id
+    )
+      AND NOT EXISTS (
+        SELECT 1 FROM formtable_main_38_dt1 x WHERE x.mainid = m.id
+    )""",
+    ),
+]
 
 MCN_ANCHOR_PREPAYMENT_SOURCE_SQL = """
 SELECT * FROM (
 """ + "\nUNION ALL\n".join([
-    MCN_ANCHOR_SOURCE_SELECTS.format(detail_table='formtable_main_38_dt4', amount_expr='COALESCE(d.dkje, d.yfuje, d.skje, d.yfaje)'),
+    *MCN_ANCHOR_DETAIL_SELECTS,
 ]) + """
 ) x
 WHERE x.`是否预付ID` = %(prepayment_yes_code)s
@@ -628,7 +727,7 @@ ORDER BY x.`ID`, x.`明细ID`
 MCN_ANCHOR_PLATFORM_SOURCE_SQL = """
 SELECT * FROM (
 """ + "\nUNION ALL\n".join([
-    MCN_ANCHOR_SOURCE_SELECTS.format(detail_table='formtable_main_38_dt4', amount_expr='COALESCE(d.dkje, d.yfuje, d.skje, d.yfaje)'),
+    *MCN_ANCHOR_DETAIL_SELECTS,
 ]) + """
 ) x
 WHERE x.`是否预付ID` = %(prepayment_no_code)s
@@ -642,6 +741,18 @@ WHERE x.`是否预付ID` = %(prepayment_no_code)s
       )
   )
 ORDER BY x.`ID`, x.`明细ID`
+"""
+
+MCN_ANCHOR_FEE_USAGE_SQL = """
+SELECT
+    v.requestid AS `RequestID`,
+    v.szxm AS `项目编号ID`,
+    v.fkje AS `金额`,
+    y.fjxh AS `费用项编码`,
+    y.fyx AS `费用项名称`
+FROM view_xmfyqkb_dwfkjs v
+LEFT JOIN uf_yskm y ON y.id = v.fyx
+WHERE v.requestid IN %(request_ids)s
 """
 
 MCN_OUTBOUND_FEE_SOURCE_SQL = """
@@ -824,6 +935,48 @@ SELECT * FROM (
     LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
     LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx
     WHERE (m.fkpt IS NULL OR CAST(m.fkpt AS CHAR) <> %(direct_payment_code)s)
+    UNION ALL
+    SELECT
+        'MCN对外付款流程（订单）' AS `来源流程`,
+        m.id AS `ID`,
+        m.requestid AS `RequestID`,
+        d.id AS `明细ID`,
+        m.lcbh AS `流程编号`,
+        rb.REQUESTNAME AS `标题`,
+        m.sqrq AS `申请日期`,
+        m.sqr AS `申请人ID`,
+        COALESCE(m.gszt, m.szgs) AS `公司主体ID`,
+        m.cbzx AS `成本中心ID`,
+        cc.bh AS `成本中心编号`,
+        m.dfgsmc AS `平台供应商ID`,
+        m.yhzh AS `平台银行账号ID`,
+        m.fkht AS `主表合同ID`,
+        d.szht AS `明细合同ID`,
+        d.szxm AS `项目编号ID`,
+        '' AS `项目名称`,
+        d.fjxh AS `费用项编码`,
+        d.fyx AS `费用项名称`,
+        d.je AS `金额`,
+        NULL AS `泛微订单编号`,
+        NULL AS `主播房间号`,
+        NULL AS `主播昵称`
+    FROM formtable_main_66 m
+    JOIN formtable_main_66_dt1 d ON d.mainid = m.id
+    LEFT JOIN workflow_requestbase rb ON rb.REQUESTID = m.requestid
+    LEFT JOIN uf_cbzx cc ON cc.id = m.cbzx
+    WHERE (m.fkpt IS NULL OR CAST(m.fkpt AS CHAR) <> %(direct_payment_code)s)
+      AND NOT EXISTS (
+          SELECT 1 FROM formtable_main_66_dt3 x WHERE x.mainid = m.id
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM formtable_main_66_dt4 x WHERE x.mainid = m.id
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM formtable_main_66_dt5 x WHERE x.mainid = m.id
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM formtable_main_66_dt6 x WHERE x.mainid = m.id
+      )
 ) x
 WHERE (
       x.`项目编号ID` IN %(project_ids)s
@@ -865,6 +1018,21 @@ GROUP BY m.yfklc, d.szxm, d.fjxh
 MCN_PREPAYMENT_ORDER_OFFSET_SQL = """
 SELECT `关联流程ID`, `项目编号ID`, `费用项编码`, SUM(`金额`) AS `已到票核销金额`
 FROM (
+    SELECT m.yfklc AS `关联流程ID`, d.szxm AS `项目编号ID`, d.fjxh AS `费用项编码`, ABS(COALESCE(d.hsje, 0)) AS `金额`
+    FROM formtable_main_82 m JOIN formtable_main_82_dt1 d ON d.mainid = m.id
+    WHERE NOT EXISTS (
+        SELECT 1 FROM formtable_main_82_dt2 x WHERE x.mainid = m.id
+    )
+      AND NOT EXISTS (
+        SELECT 1 FROM formtable_main_82_dt3 x WHERE x.mainid = m.id
+    )
+      AND NOT EXISTS (
+        SELECT 1 FROM formtable_main_82_dt4 x WHERE x.mainid = m.id
+    )
+      AND NOT EXISTS (
+        SELECT 1 FROM formtable_main_82_dt6 x WHERE x.mainid = m.id
+    )
+    UNION ALL
     SELECT m.yfklc AS `关联流程ID`, d.szxm AS `项目编号ID`, d.fjxh AS `费用项编码`, ABS(COALESCE(d.ddje, 0)) AS `金额`
     FROM formtable_main_82 m JOIN formtable_main_82_dt2 d ON d.mainid = m.id
     UNION ALL
@@ -1039,6 +1207,75 @@ def _chunks(values, size=SQL_BATCH_SIZE):
     values = list(values)
     for start in range(0, len(values), size):
         yield values[start:start + size]
+
+
+def _amount_match_key(value):
+    if pd.isna(value):
+        return ''
+    try:
+        return f'{round(float(value), 2):.2f}'
+    except (TypeError, ValueError):
+        return _text(value)
+
+
+def _apply_mcn_anchor_fee_usage(source_df):
+    """MCN 主播 dt1/dt2/dt3 兜底行没有费用项字段,按页面费用使用视图回填。"""
+    if source_df.empty or '费用项编码' not in source_df.columns:
+        return source_df
+
+    result = source_df.copy()
+    flow_mask = result['来源流程'].map(_text).eq('MCN主播相关付款流程')
+    missing_fee_mask = result['费用项编码'].map(_text).eq('')
+    request_keys = result['RequestID'].map(c.format_code)
+    target_mask = flow_mask & missing_fee_mask & request_keys.ne('')
+    if not target_mask.any():
+        return result
+
+    fee_parts = []
+    for batch in _chunks(sorted(request_keys[target_mask].unique())):
+        fee_parts.append(_query_fw(MCN_ANCHOR_FEE_USAGE_SQL, {'request_ids': tuple(batch)}))
+    fee_df = pd.concat(fee_parts, ignore_index=True) if fee_parts else pd.DataFrame()
+    if fee_df.empty:
+        return result
+
+    fee_df['_request_key'] = fee_df['RequestID'].map(c.format_code)
+    fee_df['_project_key'] = fee_df['项目编号ID'].map(c.format_code)
+    fee_df['_amount_key'] = fee_df['金额'].map(_amount_match_key)
+    fee_df['_fee_code'] = fee_df['费用项编码'].map(_text)
+    fee_df['_fee_name'] = fee_df['费用项名称'].map(_text)
+    fee_df = fee_df[fee_df['_fee_code'].ne('') | fee_df['_fee_name'].ne('')]
+    if fee_df.empty:
+        return result
+
+    exact_amount_map = {}
+    for key, group in fee_df.groupby(['_request_key', '_project_key', '_amount_key'], dropna=False):
+        if len(group) == 1:
+            row = group.iloc[0]
+            exact_amount_map[key] = (row['_fee_code'], row['_fee_name'])
+
+    project_unique_map = {}
+    for key, group in fee_df.groupby(['_request_key', '_project_key'], dropna=False):
+        if len(group) == 1:
+            row = group.iloc[0]
+            project_unique_map[key] = (row['_fee_code'], row['_fee_name'])
+
+    filled = 0
+    for index in result.index[target_mask]:
+        request_key = c.format_code(result.at[index, 'RequestID'])
+        project_key = c.format_code(result.at[index, '项目编号ID'])
+        amount_key = _amount_match_key(result.at[index, '金额'])
+        fee_item = exact_amount_map.get(
+            (request_key, project_key, amount_key)
+        ) or project_unique_map.get((request_key, project_key))
+        if not fee_item:
+            continue
+        result.at[index, '费用项编码'] = fee_item[0]
+        result.at[index, '费用项名称'] = fee_item[1]
+        filled += 1
+
+    if filled:
+        print(f'[预付期初-MCN主播相关付款流程] 项目费用使用情况回填费用项 {filled} 行')
+    return result
 
 
 _PROJECT_FILTER_CACHE = None
@@ -2484,6 +2721,7 @@ def read_mcn_supplier_sources():
             source_df, '项目编号ID', MCN_PROJECT_SHEET, MCN_PROJECT_TABLES,
             f'预付期初-{sheet_name}',
         )
+        source_df = _apply_mcn_anchor_fee_usage(source_df)
         source_df = resolve_mcn_common_values(source_df)
         if not source_df.empty:
             source_df = apply_mcn_offset_amounts(source_df, _query_fw(offset_sql, params), link_column)
@@ -2550,6 +2788,7 @@ def read_mcn_gig_sources():
         anchor_df, '项目编号ID', MCN_PROJECT_SHEET, MCN_PROJECT_TABLES,
         f'预付期初-{SHEET_MCN_ANCHOR_PLATFORM_PREPAYMENT}',
     )
+    anchor_df = _apply_mcn_anchor_fee_usage(anchor_df)
     anchor_df = resolve_mcn_common_values(anchor_df)
     if not anchor_df.empty:
         anchor_df['预付款金额分摊'] = anchor_df['金额']
