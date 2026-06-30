@@ -104,6 +104,10 @@ OUTPUT_COLUMNS = [
     '泛微项目编号',
     '泛微费用项目编码',
 ]
+BATCH_OUTPUT_COLUMNS = [
+    '是否确认',
+    *[column for column in OUTPUT_COLUMNS if column not in ('当前节点', '当前状况')],
+]
 
 # ====== 以下从已删除的 ap_payment_opening_db 内联(赛事对公付款的原 base 口径),逻辑保持不变 ======
 # 当前任务只取对公付款和个人劳务付款;预付款、零工平台付款等来源走其他任务。
@@ -116,6 +120,7 @@ PAYMENT_STATUS_MEANINGS = {
 BASE_OUTPUT_COLUMNS = [column for column in OUTPUT_COLUMNS if column not in ('泛微项目编号', '身份证号')]
 
 BATCH_ISSUE_SOURCE_FIELDS = {
+    '是否确认': '是否确认',
     '申请人工号': '申请人',
     '收款方编码': '供应商',
     '核算主体编号': '公司主体',
@@ -200,6 +205,7 @@ SELECT
     d.yslx AS `核算模块ID`,
     COALESCE(NULLIF(d.bz, ''), NULLIF(m.pcbz, ''), NULLIF(m.fypcbz, ''), NULLIF(m.fypcmc, '')) AS `备注`,
     m.dwfkdw AS `供应商ID`,
+    d.sfqr AS `是否确认ID`,
     d.je AS `金额`,
     COALESCE(d.yskm, d.fyxh) AS `预算科目ID`
 FROM uf_plfy m
@@ -1291,7 +1297,8 @@ def _apply_fee_item_fix_rule(df):
 
 
 def _apply_order_project_columns(
-        output_df, source_df, table_order=EVENT_PROJECT_TABLES, use_fixed_order_mapping=False):
+        output_df, source_df, table_order=EVENT_PROJECT_TABLES, use_fixed_order_mapping=False,
+        output_columns=OUTPUT_COLUMNS):
     """按预付期初口径补充泛微项目编号,并用订单申请初始化导入表映射订单字段。"""
     df = output_df.copy()
     project_source_df = _with_resolved_project_fields(source_df, table_order=table_order)
@@ -1325,7 +1332,7 @@ def _apply_order_project_columns(
     df = _apply_payment_vendor_fix_rule(df)
     df = c.apply_order_multi_mapping_fix(df)
     df = _apply_fee_item_fix_rule(df)
-    return df[OUTPUT_COLUMNS]
+    return df[output_columns]
 
 
 def _add_fanwei_order_code_column(output_df, source_df):
@@ -1550,6 +1557,8 @@ def _copy_template_sheet(workbook, target_sheet_name):
 def _fill_sheet(worksheet, output_df):
     for col_idx, column_name in enumerate(output_df.columns, start=1):
         worksheet.cell(row=1, column=col_idx).value = column_name
+    for col_idx in range(len(output_df.columns) + 1, worksheet.max_column + 1):
+        worksheet.cell(row=1, column=col_idx).value = None
     if worksheet.max_row > 1:
         worksheet.delete_rows(2, worksheet.max_row)
     for _, row in output_df.iterrows():
@@ -1856,7 +1865,7 @@ def read_batch_source():
         '应付期初-批量费用流程',
     )
     print('[应付期初-批量费用流程] SQL明细行数:', len(source_df))
-    return attach_workflow_states(resolve_batch_values(source_df), doc_no_col='流程编号')
+    return resolve_batch_values(source_df)
 
 
 def resolve_batch_values(source_df):
@@ -1865,12 +1874,14 @@ def resolve_batch_values(source_df):
     company_map = c.build_fw_company_name_map_for_ids(df['公司主体ID'])
     cost_center_map = c.build_fw_cost_center_map_for_ids(df['成本中心ID'])
     supplier_status_map = c.build_fw_supplier_status_map(df['供应商ID'])
+    confirm_map = c.build_fw_select_option_map('uf_plfy', 'sfqr')
 
     df['申请人'] = df['申请人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
     df['申请人工号'] = df['申请人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
     df['公司主体'] = df['公司主体ID'].map(lambda value: company_map.get(c.format_code(value), ''))
     df['成本中心'] = df['成本中心ID'].map(lambda value: _first_browser_value(cost_center_map, value))
     df['供应商'] = df['供应商ID'].map(lambda value: _supplier_name(value, supplier_status_map))
+    df['是否确认'] = df['是否确认ID'].map(lambda value: confirm_map.get(c.format_code(value), ''))
     df = _with_resolved_project_fields(df, '项目编号ID')
     df['预算科目'] = _resolve_subject_paths(df['预算科目ID'])
     return df
@@ -1892,11 +1903,9 @@ def build_batch_output(source_df):
         return vendor_info_map.get(index, {}).get(field, '')
 
     output_df = pd.DataFrame(index=source_df.index)
+    output_df['是否确认'] = source_df.get(
+        '是否确认', pd.Series('', index=source_df.index)).map(_text)
     output_df['来源系统'] = SOURCE_SYSTEM
-    output_df['当前节点'] = source_df.get(
-        '当前节点', pd.Series('', index=source_df.index)).map(_text)
-    output_df['当前状况'] = source_df.get(
-        '当前状况', pd.Series('', index=source_df.index)).map(_text)
     output_df['来源单据编号'] = source_df['流程编号']
     output_df['申请日期'] = source_df['申请日期'].map(c.format_date)
     output_df['单据类型'] = DOCUMENT_TYPE
@@ -1927,6 +1936,7 @@ def build_batch_output(source_df):
         output_df,
         source_df,
         use_fixed_order_mapping=True,
+        output_columns=BATCH_OUTPUT_COLUMNS,
     )
 
 
@@ -2392,10 +2402,14 @@ def run():
 
     # 3. 填充率
     required_cols = c.required_columns(RULE_SHEET, RULE_TABLE)
+    batch_required_cols = [
+        column for column in required_cols
+        if column not in ('当前节点', '当前状况')
+    ]
     print('— 期初对公付款单导入 填充率 —')
     c.report_fill(base_output_df, required_cols)
     print('— 批量费用流程 填充率 —')
-    c.report_fill(batch_output_df, required_cols)
+    c.report_fill(batch_output_df, batch_required_cols)
     print('— 只转入外部成本 填充率 —')
     c.report_fill(external_output_df, required_cols)
     for sheet_name, output_df in mcn_output_dfs.items():
@@ -2453,9 +2467,9 @@ def run():
         exception_sheets.update({f'{sheet_name}_{name}': df for name, df in mcn_sheets.items()})
 
     batch_sheets = {'必输字段未达100%': c.fill_summary(
-        batch_output_df, required_cols, RULE_SHEET, RULE_TABLE)}
+        batch_output_df, batch_required_cols, RULE_SHEET, RULE_TABLE)}
     batch_sheets.update(c.collect_field_issues(
-        batch_output_df, batch_source_df, required_cols, BATCH_ISSUE_SOURCE_FIELDS))
+        batch_output_df, batch_source_df, batch_required_cols, BATCH_ISSUE_SOURCE_FIELDS))
     batch_bank_issues = c.collect_hand_vendor_bank_account_issues(batch_output_df)
     if not batch_bank_issues.empty:
         batch_sheets['银行账号_校验异常'] = batch_bank_issues
