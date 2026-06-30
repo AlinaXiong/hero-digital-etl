@@ -9,11 +9,14 @@
 
 跑法:在项目根执行  python run.py ar_invoice_opening_db
 """
+import os
 import sys
 import re
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+from openpyxl import load_workbook
 
 if __package__ is None or __package__ == '':
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -23,6 +26,8 @@ from etl.process.ap_prepayment_opening_db import (
     build_fw_project_code_map_for_ids,
     project_filter_codes,
     EVENT_PROJECT_SHEET,
+    MCN_PROJECT_SHEET,
+    MCN_PROJECT_TABLES,
 )
 
 # ============================ 文件 / 模板 ============================
@@ -34,8 +39,11 @@ DATE_SUFFIX = c.today_suffix()
 TEMPLATE_FILE = TEMPLATE_DIR / '应收报账单期初数据导入模板.xlsx'
 OUTPUT_FILE = OUTPUT_DIR / f'英雄应收报账单期初数据导入_应收期初_{DATE_SUFFIX}.xlsx'
 EXCEPTION_FILE = OUTPUT_DIR / f'未匹配清单_应收期初_{DATE_SUFFIX}.xlsx'
+ISSUE_FIX_ENV = 'AR_INVOICE_ISSUE_FIX_XLSX'
+DEFAULT_ISSUE_FIX_FILE = c.RULES_DIR / '问题处理-应收.xlsx'
 
 TEMPLATE_SHEET = '应收报账单期初数据导入'
+MCN_TEMPLATE_SHEET = '应收报账单期初数据导入-MCN'
 RULE_SHEET = '应收期初'
 RULE_TABLE = '应收报账单期初数据导入'
 DOCUMENT_TYPE = 'OPEN10'
@@ -45,6 +53,8 @@ INCOME_ITEM = '项目收款'
 BUSINESS_TYPE_LOV = 'HERO.BUSINESS_TYPE'
 INVOICE_TYPE_LOV = 'HERO.INVOICE_TYPE'
 CONTRACT_INVOICE_MEANING = '合同'
+PUBLIC_INVOICE_MEANING = '对公开票'
+PLATFORM_PRE_INVOICE_MEANING = '平台预开票'
 OUTPUT_COLUMNS = [
     '来源单据号',
     '应收报账单类型',
@@ -105,6 +115,10 @@ ISSUE_SOURCE_FIELD_MAP = {
 FW_INVOICE_TABLE = 'uf_xtyykp'
 FW_RECEIPT_TABLE = 'uf_skdj'
 INVOICE_NUMBER_SEPARATOR_RE = re.compile(r'[,，、;；|\s]+')
+ORDER_FIX_SHEET = '订单映射_多候选'
+TAX_FIX_SHEET = '缺失_税率类型'
+_ISSUE_ORDER_FIX_CACHE = None
+_ISSUE_TAX_FIX_CACHE = None
 
 
 # ============================ 枚举 / 过滤口径 ============================
@@ -140,7 +154,23 @@ TAX_PREFERRED_DESCRIPTIONS = {
     0.13: ['13%税率(价外)', '13%销项税，中国', '13%'],
 }
 
+MCN_TAX_PREFERRED_DESCRIPTIONS = {
+    0.00: ['0%销项税，中国', '0%税率', '0%'],
+    0.01: ['1%税率(价外)', '1%'],
+    0.03: ['3%税率(价外)', '3%'],
+    0.06: ['6%销项税，中国', '6%税率', '6%'],
+    0.09: ['9%销项税，中国', '9%税率(价内)', '9%'],
+    0.13: ['13%销项税，中国', '13%税率(价外)', '13%'],
+}
+
 VOID_CODE = 0
+COMPLETE_NODE_TYPE = 3
+
+MCN_INVOICE_TABLE = 'formtable_main_28'
+MCN_INVOICE_DETAIL_TABLE = 'formtable_main_28_dt1'
+MCN_ORDER_INVOICE_TABLE = 'formtable_main_72'
+MCN_ORDER_WORKFLOW_IDS = (73, 89, 336)
+MCN_INVOICE_WORKFLOW_IDS = (50, 335)
 
 
 # ============================ 泛微源 SQL ============================
@@ -232,6 +262,248 @@ EXPECTED_RECEIPT_FIELDS = {
     },
 }
 
+EXPECTED_MCN_INVOICE_FIELDS = {
+    '': {
+        'kpdh': '开票单号',
+        'sqr': '申请人',
+        'sqrbm': '申请人部门',
+        'sqrq': '申请日期',
+        'kptt': '公司主体',
+        'kplx': '开票类型',
+        'kh': '客户',
+        'kpht': '开票合同',
+        'pt': '平台',
+    },
+    MCN_INVOICE_DETAIL_TABLE: {
+        'xmbh': '项目编号',
+        'kpje': '开票金额',
+        'sl': '税率',
+        'se': '税额',
+        'bhsje': '不含税金额',
+    },
+}
+
+EXPECTED_MCN_ORDER_INVOICE_FIELDS = {
+    '': {
+        'kpdh': '开票单号',
+        'sqr': '申请人',
+        'sqrbm': '申请人部门',
+        'sqrq': '申请日期',
+        'gszt': '公司主体',
+        'kplx': '开票类型',
+        'kh': '客户',
+        'kpht': '开票合同',
+    },
+    'formtable_main_72_dt4': {
+        'szxm': '所属项目',
+        'ddje': '开票金额',
+        'pt': '平台',
+        'sl': '税率',
+        'se': '税额',
+        'bhsje': '不含税金额',
+    },
+    'formtable_main_72_dt5': {
+        'szxm': '所属项目',
+        'ddje': '开票金额',
+        'pt': '平台',
+        'sl': '税率',
+        'se': '税额',
+        'bhsje': '不含税金额',
+    },
+    'formtable_main_72_dt6': {
+        'szxm': '所属项目',
+        'ddje': '开票金额',
+        'pt': '平台',
+        'sl': '税率',
+        'se': '税额',
+        'bhsje': '不含税金额',
+    },
+    'formtable_main_72_dt7': {
+        'szxm': '所属项目',
+        'dkje': '开票金额',
+        'pt': '平台',
+        'sl': '税率',
+        'se': '税额',
+        'bhsje': '不含税金额',
+    },
+}
+
+
+MCN_SOURCE_SQL = """
+SELECT
+    '开票申请流程' AS `来源流程`,
+    'formtable_main_28_dt1' AS `明细来源`,
+    m.id AS `ID`,
+    d.id AS `明细ID`,
+    m.requestid AS `requestid`,
+    rb.workflowid AS `workflowid`,
+    m.kpdh AS `开票单号`,
+    m.sqr AS `申请人ID`,
+    m.sqrbm AS `申请人部门ID`,
+    m.sqrq AS `申请日期`,
+    m.kptt AS `公司主体ID`,
+    m.kh AS `客户ID`,
+    NULL AS `明细客户ID`,
+    m.kpht AS `开票合同ID`,
+    m.kplx AS `开票类型ID`,
+    m.pt AS `平台ID`,
+    d.xmbh AS `项目编号ID`,
+    d.xmmc AS `项目名称`,
+    d.kpje AS `开票金额`,
+    d.sl AS `税率`,
+    d.se AS `税额`,
+    d.bhsje AS `不含税金额`,
+    d.cbzx AS `成本中心ID`,
+    m.bz AS `开票备注`
+FROM formtable_main_28 m
+JOIN workflow_requestbase rb ON rb.requestid = m.requestid
+JOIN formtable_main_28_dt1 d ON d.mainid = m.id
+WHERE rb.currentnodetype = %(complete_node_type)s
+  AND rb.workflowid IN %(mcn_invoice_workflow_ids)s
+
+UNION ALL
+
+SELECT
+    '开票申请流程（订单）' AS `来源流程`,
+    'formtable_main_72_dt4' AS `明细来源`,
+    m.id AS `ID`,
+    d.id AS `明细ID`,
+    m.requestid AS `requestid`,
+    rb.workflowid AS `workflowid`,
+    m.kpdh AS `开票单号`,
+    m.sqr AS `申请人ID`,
+    m.sqrbm AS `申请人部门ID`,
+    m.sqrq AS `申请日期`,
+    m.gszt AS `公司主体ID`,
+    m.kh AS `客户ID`,
+    d.khmc AS `明细客户ID`,
+    m.kpht AS `开票合同ID`,
+    m.kplx AS `开票类型ID`,
+    d.pt AS `平台ID`,
+    d.szxm AS `项目编号ID`,
+    d.xmmc AS `项目名称`,
+    d.ddje AS `开票金额`,
+    d.sl AS `税率`,
+    d.se AS `税额`,
+    d.bhsje AS `不含税金额`,
+    m.cbzx AS `成本中心ID`,
+    m.bz AS `开票备注`
+FROM formtable_main_72 m
+JOIN workflow_requestbase rb ON rb.requestid = m.requestid
+JOIN formtable_main_72_dt4 d ON d.mainid = m.id
+WHERE rb.currentnodetype = %(complete_node_type)s
+  AND rb.workflowid IN %(mcn_order_workflow_ids)s
+
+UNION ALL
+
+SELECT
+    '开票申请流程（订单）' AS `来源流程`,
+    'formtable_main_72_dt5' AS `明细来源`,
+    m.id AS `ID`,
+    d.id AS `明细ID`,
+    m.requestid AS `requestid`,
+    rb.workflowid AS `workflowid`,
+    m.kpdh AS `开票单号`,
+    m.sqr AS `申请人ID`,
+    m.sqrbm AS `申请人部门ID`,
+    m.sqrq AS `申请日期`,
+    m.gszt AS `公司主体ID`,
+    m.kh AS `客户ID`,
+    d.khmc AS `明细客户ID`,
+    m.kpht AS `开票合同ID`,
+    m.kplx AS `开票类型ID`,
+    d.pt AS `平台ID`,
+    d.szxm AS `项目编号ID`,
+    d.xmmc AS `项目名称`,
+    d.ddje AS `开票金额`,
+    d.sl AS `税率`,
+    d.se AS `税额`,
+    d.bhsje AS `不含税金额`,
+    m.cbzx AS `成本中心ID`,
+    m.bz AS `开票备注`
+FROM formtable_main_72 m
+JOIN workflow_requestbase rb ON rb.requestid = m.requestid
+JOIN formtable_main_72_dt5 d ON d.mainid = m.id
+WHERE rb.currentnodetype = %(complete_node_type)s
+  AND rb.workflowid IN %(mcn_order_workflow_ids)s
+
+UNION ALL
+
+SELECT
+    '开票申请流程（订单）' AS `来源流程`,
+    'formtable_main_72_dt6' AS `明细来源`,
+    m.id AS `ID`,
+    d.id AS `明细ID`,
+    m.requestid AS `requestid`,
+    rb.workflowid AS `workflowid`,
+    m.kpdh AS `开票单号`,
+    m.sqr AS `申请人ID`,
+    m.sqrbm AS `申请人部门ID`,
+    m.sqrq AS `申请日期`,
+    m.gszt AS `公司主体ID`,
+    m.kh AS `客户ID`,
+    d.khmc AS `明细客户ID`,
+    m.kpht AS `开票合同ID`,
+    m.kplx AS `开票类型ID`,
+    d.pt AS `平台ID`,
+    d.szxm AS `项目编号ID`,
+    d.xmmc AS `项目名称`,
+    d.ddje AS `开票金额`,
+    d.sl AS `税率`,
+    d.se AS `税额`,
+    d.bhsje AS `不含税金额`,
+    m.cbzx AS `成本中心ID`,
+    m.bz AS `开票备注`
+FROM formtable_main_72 m
+JOIN workflow_requestbase rb ON rb.requestid = m.requestid
+JOIN formtable_main_72_dt6 d ON d.mainid = m.id
+WHERE rb.currentnodetype = %(complete_node_type)s
+  AND rb.workflowid IN %(mcn_order_workflow_ids)s
+
+UNION ALL
+
+SELECT
+    '开票申请流程（订单）' AS `来源流程`,
+    'formtable_main_72_dt7' AS `明细来源`,
+    m.id AS `ID`,
+    d.id AS `明细ID`,
+    m.requestid AS `requestid`,
+    rb.workflowid AS `workflowid`,
+    m.kpdh AS `开票单号`,
+    m.sqr AS `申请人ID`,
+    m.sqrbm AS `申请人部门ID`,
+    m.sqrq AS `申请日期`,
+    m.gszt AS `公司主体ID`,
+    m.kh AS `客户ID`,
+    d.khmc AS `明细客户ID`,
+    m.kpht AS `开票合同ID`,
+    m.kplx AS `开票类型ID`,
+    d.pt AS `平台ID`,
+    d.szxm AS `项目编号ID`,
+    d.xmmc AS `项目名称`,
+    d.dkje AS `开票金额`,
+    d.sl AS `税率`,
+    d.se AS `税额`,
+    d.bhsje AS `不含税金额`,
+    m.cbzx AS `成本中心ID`,
+    m.bz AS `开票备注`
+FROM formtable_main_72 m
+JOIN workflow_requestbase rb ON rb.requestid = m.requestid
+JOIN formtable_main_72_dt7 d ON d.mainid = m.id
+WHERE rb.currentnodetype = %(complete_node_type)s
+  AND rb.workflowid IN %(mcn_order_workflow_ids)s
+"""
+
+MCN_RECEIPT_SQL = """
+SELECT
+    kpysdh AS `开票单号`,
+    SUM(COALESCE(bfqrjehj, 0)) AS `收款登记已收款金额`
+FROM uf_skdj
+WHERE kpysdh IS NOT NULL
+  AND TRIM(kpysdh) <> ''
+GROUP BY kpysdh
+"""
+
 
 # ============================ DB 查询小工具 ============================
 def _query_fw(sql):
@@ -260,6 +532,113 @@ def _lookup_first_browser_value(mapping, value):
         if mapped:
             return mapped
     return ''
+
+
+def _chunks(values, size=1000):
+    values = list(values)
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+def _issue_fix_file():
+    configured = os.getenv(ISSUE_FIX_ENV, '').strip()
+    path = Path(configured) if configured else DEFAULT_ISSUE_FIX_FILE
+    if path.exists():
+        return path
+    print(f'[应收期初-问题处理] 未找到问题处理文件: {path}')
+    return None
+
+
+def _read_issue_fix_sheet(sheet_name, required_columns):
+    path = _issue_fix_file()
+    if path is None:
+        return pd.DataFrame(columns=list(required_columns))
+    try:
+        sheet_df = pd.read_excel(
+            path,
+            sheet_name=sheet_name,
+            dtype=str,
+            keep_default_na=False,
+            engine='openpyxl',
+        )
+    except ValueError:
+        print(f'[应收期初-问题处理] {path} 不存在 sheet: {sheet_name}')
+        return pd.DataFrame(columns=list(required_columns))
+    missing = set(required_columns) - set(sheet_df.columns)
+    if missing:
+        raise ValueError(f'{path.name}/{sheet_name} 缺少列: {sorted(missing)}')
+    return sheet_df
+
+
+def _load_issue_order_fix():
+    """读取《问题处理-应收》订单多候选人工指定结果。"""
+    global _ISSUE_ORDER_FIX_CACHE
+    if _ISSUE_ORDER_FIX_CACHE is not None:
+        return _ISSUE_ORDER_FIX_CACHE
+
+    columns = ['来源单据编号', '泛微项目编号', '指定订单编号']
+    sheet_df = _read_issue_fix_sheet(ORDER_FIX_SHEET, columns)
+    rows = []
+    for _, row in sheet_df.iterrows():
+        doc_no = _text(row.get('来源单据编号'))
+        project_code = _text(row.get('泛微项目编号'))
+        order_code = _text(row.get('指定订单编号'))
+        if doc_no and project_code and order_code:
+            rows.append({
+                '来源单据编号': doc_no,
+                '泛微项目编号': project_code,
+                '指定订单编号': order_code,
+            })
+    if rows:
+        fix_df = pd.DataFrame(rows, columns=columns).drop_duplicates()
+        conflict = (
+            fix_df.groupby(['来源单据编号', '泛微项目编号'])['指定订单编号']
+            .nunique()
+            .reset_index(name='指定订单数')
+        )
+        conflict = conflict[conflict['指定订单数'] > 1]
+        if len(conflict) > 0:
+            raise ValueError(f'{ORDER_FIX_SHEET} 存在同一单据+项目指定多个订单: {conflict.head(10).to_dict("records")}')
+        fix_df = fix_df.drop_duplicates(['来源单据编号', '泛微项目编号'], keep='first')
+    else:
+        fix_df = pd.DataFrame(columns=columns)
+
+    print(f'[应收期初-问题处理] {ORDER_FIX_SHEET} 指定订单记录数: {len(fix_df)}')
+    _ISSUE_ORDER_FIX_CACHE = fix_df
+    return _ISSUE_ORDER_FIX_CACHE
+
+
+def _load_issue_tax_fix():
+    """读取《问题处理-应收》税率类型人工指定结果。"""
+    global _ISSUE_TAX_FIX_CACHE
+    if _ISSUE_TAX_FIX_CACHE is not None:
+        return _ISSUE_TAX_FIX_CACHE
+
+    columns = ['来源单据号', '指定税率类型']
+    sheet_df = _read_issue_fix_sheet(TAX_FIX_SHEET, columns)
+    rows = []
+    for _, row in sheet_df.iterrows():
+        doc_no = _text(row.get('来源单据号'))
+        tax_type = _text(row.get('指定税率类型'))
+        if doc_no and tax_type:
+            rows.append({'来源单据号': doc_no, '指定税率类型': tax_type})
+    if rows:
+        fix_df = pd.DataFrame(rows, columns=columns).drop_duplicates()
+        conflict = (
+            fix_df.groupby('来源单据号')['指定税率类型']
+            .nunique()
+            .reset_index(name='指定税率类型数')
+        )
+        conflict = conflict[conflict['指定税率类型数'] > 1]
+        if len(conflict) > 0:
+            raise ValueError(f'{TAX_FIX_SHEET} 存在同一单据指定多个税率类型: {conflict.head(10).to_dict("records")}')
+        fix_df = fix_df.drop_duplicates('来源单据号', keep='first')
+    else:
+        fix_df = pd.DataFrame(columns=columns)
+
+    print(f'[应收期初-问题处理] {TAX_FIX_SHEET} 指定税率类型记录数: {len(fix_df)}')
+    _ISSUE_TAX_FIX_CACHE = fix_df
+    return _ISSUE_TAX_FIX_CACHE
 
 
 def _invoice_numbers_text(value):
@@ -327,6 +706,51 @@ def resolve_source_values(source_df):
     return df
 
 
+def resolve_mcn_source_values(source_df):
+    """基于 MCN 开票旧流程明细补充输出需要的展示值。"""
+    df = source_df.copy()
+    if df.empty:
+        df['申请人'] = ''
+        df['申请人工号'] = ''
+        df['申请人部门'] = ''
+        df['公司主体'] = ''
+        df['客户'] = ''
+        df['开票合同'] = ''
+        df['项目编号'] = ''
+        df['开票类型'] = ''
+        df['平台'] = ''
+        df['成本中心'] = ''
+        return df
+
+    employee_map = c.build_fw_employee_info_map_for_ids(df['申请人ID'])
+    department_map = c.build_fw_department_name_map_for_ids(df['申请人部门ID'])
+    company_map = c.build_fw_company_name_map_for_ids(df['公司主体ID'])
+    customer_map = c.build_fw_customer_name_map_for_ids(
+        pd.concat([df['客户ID'], df['明细客户ID']], ignore_index=True))
+    contract_map = _mcn_contract_code_map(df['开票合同ID'])
+    project_map = build_fw_project_code_map_for_ids(df['项目编号ID'], MCN_PROJECT_TABLES)
+    cost_center_map = c.build_fw_cost_center_map_for_ids(df['成本中心ID'])
+    option_maps = c.build_fw_select_option_maps(MCN_INVOICE_TABLE, ['kplx', 'pt'])
+
+    df['申请人'] = df['申请人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('name', ''))
+    df['申请人工号'] = df['申请人ID'].map(lambda value: employee_map.get(c.format_code(value), {}).get('code', ''))
+    df['申请人部门'] = df['申请人部门ID'].map(lambda value: department_map.get(c.format_code(value), ''))
+    df['公司主体'] = df['公司主体ID'].map(
+        lambda value: _lookup_first_browser_value(company_map, value) or company_map.get(c.format_code(value), ''))
+    df['客户'] = [
+        _lookup_first_browser_value(customer_map, customer_value)
+        or _lookup_first_browser_value(customer_map, detail_customer_value)
+        for customer_value, detail_customer_value in zip(df['客户ID'], df['明细客户ID'])
+    ]
+    df['开票合同'] = df['开票合同ID'].map(lambda value: _lookup_first_browser_value(contract_map, value))
+    df['项目编号'] = df['项目编号ID'].map(
+        lambda value: _lookup_first_browser_value(project_map, value) or _text(value))
+    df['开票类型'] = df['开票类型ID'].map(lambda value: option_maps.get('kplx', {}).get(c.format_code(value), ''))
+    df['平台'] = df['平台ID'].map(lambda value: option_maps.get('pt', {}).get(c.format_code(value), ''))
+    df['成本中心'] = df['成本中心ID'].map(lambda value: _lookup_first_browser_value(cost_center_map, value))
+    return df
+
+
 # ============================ 模板输出 ============================
 def _lookup_by_name(mapping, value):
     return '' if pd.isna(value) else mapping.get(c.normalize_name(value), '')
@@ -357,6 +781,131 @@ def _tax_description(value, tax_description_map):
     if rate is None:
         return ''
     return tax_description_map.get(rate, '')
+
+
+def _mcn_invoice_type_code(value, invoice_type_map):
+    """MCN 开票类型 -> 汉得 HERO.INVOICE_TYPE 编码。
+
+    规则表口径:合同开票/订单开票按合同开票;平台预开票/平台结算单按平台预开票。
+    泛微旧表里「平台订单」即订单开票口径。
+    """
+    meaning = _text(value)
+    if meaning in ('平台预开票', '平台结算单'):
+        return invoice_type_map.get(PLATFORM_PRE_INVOICE_MEANING, '')
+    if meaning in ('合同开票', '订单开票', '平台订单'):
+        return invoice_type_map.get(CONTRACT_INVOICE_MEANING, '')
+    return invoice_type_map.get(CONTRACT_INVOICE_MEANING, '')
+
+
+def _mcn_contract_code_map(contract_values):
+    """MCN 合同浏览框 ID -> 合同编号。
+
+    MCN 开票旧流程的 browser.ktl 主要落 uf_htk;历史/协同数据兜底查 uf_htsp。
+    """
+    contract_ids = c.clean_codes(
+        contract_id
+        for value in contract_values
+        for contract_id in c.parse_browser_ids(value)
+    )
+    if not contract_ids:
+        return {}
+
+    result = {}
+    for table in ('uf_htk', 'uf_htsp'):
+        remaining = [contract_id for contract_id in contract_ids if contract_id not in result]
+        if not remaining:
+            break
+        for batch in _chunks(remaining):
+            try:
+                contract_df = c.query_db(
+                    'FW',
+                    'vspn_xtyy',
+                    f'SELECT id, htbh AS contract_code FROM {table} '
+                    f'WHERE id IN ({c.in_placeholders(batch)})',
+                    batch,
+                )
+            except Exception:
+                continue
+            for _, row in contract_df.iterrows():
+                contract_id = c.format_code(row['id'])
+                contract_code = _text(row['contract_code'])
+                if contract_id and contract_code and contract_id not in result:
+                    result[contract_id] = contract_code
+    return result
+
+
+def _apply_issue_order_fix(output_df):
+    if output_df.empty:
+        return output_df
+    required = {'来源单据号', '泛微项目编号', '订单'}
+    if not required.issubset(output_df.columns):
+        return output_df
+    fix_df = _load_issue_order_fix()
+    if fix_df.empty:
+        return output_df
+
+    result = output_df.copy()
+    keys = pd.DataFrame({
+        '_row_pos': range(len(result)),
+        '来源单据编号': result['来源单据号'].map(_text),
+        '泛微项目编号': result['泛微项目编号'].map(_text),
+    })
+    merged = keys.merge(
+        fix_df[['来源单据编号', '泛微项目编号', '指定订单编号']],
+        on=['来源单据编号', '泛微项目编号'],
+        how='left',
+        sort=False,
+    )
+    matched = merged['指定订单编号'].map(_text) != ''
+    if matched.any():
+        row_positions = merged.loc[matched, '_row_pos'].astype(int).to_numpy()
+        result.iloc[row_positions, result.columns.get_loc('订单')] = merged.loc[matched, '指定订单编号'].to_numpy()
+        print(f'[应收期初-问题处理] 覆盖赛事订单编号 {int(matched.sum())} 行')
+    return result
+
+
+def _apply_issue_tax_fix(output_df):
+    if output_df.empty or not {'来源单据号', '税率类型'}.issubset(output_df.columns):
+        return output_df
+    fix_df = _load_issue_tax_fix()
+    if fix_df.empty:
+        return output_df
+
+    result = output_df.copy()
+    tax_map = {
+        _text(row['来源单据号']): _text(row['指定税率类型'])
+        for _, row in fix_df.iterrows()
+    }
+    fixed_values = result['来源单据号'].map(lambda value: tax_map.get(_text(value), ''))
+    matched = fixed_values.map(_text) != ''
+    if matched.any():
+        result.loc[matched, '税率类型'] = fixed_values.loc[matched]
+        print(f'[应收期初-问题处理] 覆盖赛事税率类型 {int(matched.sum())} 行')
+    return result
+
+
+def _apply_event_issue_fixes(output_df):
+    result = _apply_issue_order_fix(output_df)
+    result = _apply_issue_tax_fix(result)
+    return result
+
+
+def _drop_fixed_order_issue_rows(sheets):
+    fix_df = _load_issue_order_fix()
+    issue_df = sheets.get('订单映射_多候选')
+    if fix_df.empty or issue_df is None or issue_df.empty:
+        return sheets
+
+    fixed_keys = set(zip(fix_df['来源单据编号'].map(_text), fix_df['泛微项目编号'].map(_text)))
+    keep_mask = [
+        (_text(doc_no), _text(project_code)) not in fixed_keys
+        for doc_no, project_code in zip(issue_df['来源单据编号'], issue_df['泛微项目编号'])
+    ]
+    removed = len(issue_df) - sum(keep_mask)
+    if removed:
+        sheets['订单映射_多候选'] = issue_df.loc[keep_mask].reset_index(drop=True)
+        print(f'[应收期初-问题处理] 订单多候选清单剔除已指定 {removed} 行')
+    return sheets
 
 
 def build_output(invoice_df):
@@ -441,6 +990,74 @@ def build_output(invoice_df):
     output_df['泛微项目编号'] = project_codes
 
     # write_to_template 按 DataFrame 顺序写入模板,这里显式固定列序。
+    output_df = output_df[OUTPUT_COLUMNS]
+    return _apply_event_issue_fixes(output_df)
+
+
+def build_mcn_output(invoice_df):
+    """MCN 开票旧流程明细 -> 应收报账单期初导入模板 73 列。"""
+    entity_map = c.build_accounting_entity_map_for_names(invoice_df['公司主体'])
+    customer_map = c.build_customer_map_for_names(invoice_df['客户'])
+    business_type_map = c.build_lov_meaning_map(BUSINESS_TYPE_LOV)
+    invoice_type_map = c.build_lov_meaning_map(INVOICE_TYPE_LOV)
+    public_invoice_code = business_type_map.get(PUBLIC_INVOICE_MEANING, '')
+    tax_description_map = c.build_tax_type_description_map(MCN_TAX_PREFERRED_DESCRIPTIONS)
+
+    output_df = pd.DataFrame(index=invoice_df.index)
+
+    # 固定值。
+    output_df['应收报账单类型'] = DOCUMENT_TYPE
+    output_df['管理公司'] = MANAGEMENT_COMPANY
+    output_df['支付币种'] = 'CNY'
+    output_df['付款对象类型'] = PAYER_TYPE
+    output_df['业务类型编码'] = public_invoice_code
+    output_df['收入项目'] = INCOME_ITEM
+
+    # 泛微 MCN 开票申请流程/开票申请流程（订单）直取或解析字段。
+    output_df['来源单据号'] = invoice_df['开票单号']
+    output_df['部门'] = invoice_df['申请人部门']
+    output_df['岗位'] = ''                                             # 不涉及
+    output_df['申请人'] = invoice_df['申请人工号']
+    output_df['申请日期'] = invoice_df['申请日期'].map(c.format_date)
+    output_df['合同编号'] = invoice_df['开票合同'].where(invoice_df['开票合同'].notna(), '')
+    output_df['平台'] = invoice_df['平台'].map(_text)
+
+    # 规则表备注为「不涉及」或当前无 MCN 源字段的列留空。
+    output_df['里程碑阶段'] = ''
+    output_df['头备注'] = ''
+    output_df['发票号'] = ''
+    output_df['自审批'] = ''
+    output_df['自审核'] = ''
+    output_df['凭证推送'] = ''
+    output_df['凭证日期'] = ''
+    output_df['行号'] = ''
+    output_df['收入分类'] = ''
+    output_df['数量'] = ''
+    output_df['单价'] = ''
+    output_df['行备注'] = ''
+
+    # 跨系统映射字段。
+    output_df['核算主体'] = invoice_df['公司主体'].map(lambda value: _lookup_by_name(entity_map, value))
+    output_df['付款对象'] = invoice_df['客户'].map(lambda value: _lookup_by_name(customer_map, value))
+    output_df['开票类型编码'] = invoice_df['开票类型'].map(
+        lambda value: _mcn_invoice_type_code(value, invoice_type_map))
+
+    # 金额和税率。
+    output_df['核销金额'] = pd.to_numeric(
+        invoice_df['收款登记已收款金额'], errors='coerce').fillna(0).map(c.round_amount)
+    output_df['金额'] = pd.to_numeric(invoice_df['开票金额'], errors='coerce').map(c.round_amount)
+    output_df['税率类型'] = invoice_df['税率'].map(lambda value: _tax_description(value, tax_description_map))
+    output_df['税额'] = pd.to_numeric(invoice_df['税额'], errors='coerce').map(c.round_amount)
+
+    for column in [f'头维度{i}' for i in range(1, 21)]:
+        output_df[column] = ''
+    project_codes = invoice_df['项目编号'].map(_text)
+    output_df['项目'] = project_codes.map(lambda value: c.project_order_mapping_value(value, '项目编号'))
+    output_df['订单'] = project_codes.map(lambda value: c.project_order_mapping_value(value, '订单编号'))
+    for column in [f'行维度{i}' for i in range(3, 21)]:
+        output_df[column] = ''
+    output_df['泛微项目编号'] = project_codes
+
     return output_df[OUTPUT_COLUMNS]
 
 
@@ -479,29 +1096,118 @@ def read_invoice_source():
     return invoice_df
 
 
-def run():
-    # 1. SQL 直接查过滤后的开票记录 + 收款登记汇总金额
-    invoice_df = read_invoice_source()
+def read_mcn_invoice_source():
+    """从 DB 读取流程完成的 MCN 开票申请明细,解析后按 MCN 项目白名单过滤。"""
+    c.validate_fw_fields(MCN_INVOICE_TABLE, EXPECTED_MCN_INVOICE_FIELDS)
+    c.validate_fw_fields(MCN_ORDER_INVOICE_TABLE, EXPECTED_MCN_ORDER_INVOICE_FIELDS)
+    c.validate_fw_fields(FW_RECEIPT_TABLE, EXPECTED_RECEIPT_FIELDS)
 
-    # 2. 构建输出
-    output_df = build_output(invoice_df)
-    print('[应收期初-应收报账单-DB] 输出明细行数:', len(output_df))
+    params = {
+        'complete_node_type': COMPLETE_NODE_TYPE,
+        'mcn_invoice_workflow_ids': MCN_INVOICE_WORKFLOW_IDS,
+        'mcn_order_workflow_ids': MCN_ORDER_WORKFLOW_IDS,
+    }
+    print('[应收期初-MCN开票-DB] SQL过滤: 仅保留开票申请流程/开票申请流程（订单）且流程完成')
+    source_df = c.query_db('FW', 'vspn_xtyy', MCN_SOURCE_SQL, params)
+    print('[应收期初-MCN开票-DB] 流程完成开票明细行数:', len(source_df))
 
-    # 3. 填充率(必输字段以规则表「是否必填」=Y 为准)
-    required_cols = c.required_columns(RULE_SHEET, RULE_TABLE)
+    receipt_df = c.query_db('FW', 'vspn_xtyy', MCN_RECEIPT_SQL)
+    if not receipt_df.empty:
+        source_df = source_df.merge(receipt_df, on='开票单号', how='left')
+    else:
+        source_df['收款登记已收款金额'] = 0
+    source_df['收款登记已收款金额'] = source_df['收款登记已收款金额'].fillna(0)
+
+    invoice_df = resolve_mcn_source_values(source_df)
+    invoice_df = _filter_by_project_whitelist(invoice_df, MCN_PROJECT_SHEET)
+    return invoice_df
+
+
+def write_output_workbook(event_output_df, mcn_output_df):
+    """一次写出赛事原 sheet 和新增 MCN sheet,保留模板表头/下拉页。"""
+    workbook = load_workbook(TEMPLATE_FILE)
+    source_sheet = workbook[TEMPLATE_SHEET]
+    if MCN_TEMPLATE_SHEET in workbook.sheetnames:
+        del workbook[MCN_TEMPLATE_SHEET]
+    mcn_sheet = workbook.copy_worksheet(source_sheet)
+    mcn_sheet.title = MCN_TEMPLATE_SHEET
+
+    c._fill_sheet(source_sheet, event_output_df)
+    c._fill_sheet(mcn_sheet, mcn_output_df)
+
+    front_sheets = [TEMPLATE_SHEET, MCN_TEMPLATE_SHEET]
+    front_set = set(front_sheets)
+    workbook._sheets = [workbook[name] for name in front_sheets] + [
+        sheet for sheet in workbook.worksheets if sheet.title not in front_set
+    ]
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        workbook.save(OUTPUT_FILE)
+        return OUTPUT_FILE
+    except PermissionError:
+        fallback_file = OUTPUT_FILE.with_name(
+            f'{OUTPUT_FILE.stem}_{datetime.now().strftime("%H%M%S")}{OUTPUT_FILE.suffix}'
+        )
+        print(f'[应收期初] 输出文件被占用，已改写到: {fallback_file}')
+        workbook.save(fallback_file)
+        return fallback_file
+
+
+def _prefixed_sheets(prefix, sheets):
+    result = {}
+    for sheet_name, sheet_df in sheets.items():
+        prefixed = f'{prefix}_{sheet_name}'
+        result[prefixed[:31]] = sheet_df
+    return result
+
+
+def _safe_report_fill(label, output_df, required_cols):
+    print(label)
+    if output_df.empty:
+        print('  (输出 0 行,跳过填充率计算)')
+        return
     c.report_fill(output_df, required_cols)
 
-    # 4. 写模版
-    c.write_to_template(output_df, TEMPLATE_FILE, OUTPUT_FILE, TEMPLATE_SHEET)
-    print('已写出:', OUTPUT_FILE)
 
-    # 5. 问题清单
-    sheets = {'必输字段未达100%': c.fill_summary(output_df, required_cols, RULE_SHEET, RULE_TABLE)}
-    sheets.update(c.collect_field_issues(
+def run():
+    # 1. SQL 直接查过滤后的赛事开票记录 + 收款登记汇总金额
+    invoice_df = read_invoice_source()
+    # 2. SQL 读取 MCN 开票申请流程/开票申请流程（订单）明细
+    mcn_invoice_df = read_mcn_invoice_source()
+
+    # 3. 构建输出
+    output_df = build_output(invoice_df)
+    mcn_output_df = build_mcn_output(mcn_invoice_df)
+    print('[应收期初-应收报账单-DB] 赛事输出明细行数:', len(output_df))
+    print('[应收期初-MCN开票-DB] MCN输出明细行数:', len(mcn_output_df))
+
+    # 4. 填充率(必输字段以规则表「是否必填」=Y 为准)
+    required_cols = c.required_columns(RULE_SHEET, RULE_TABLE)
+    _safe_report_fill('[应收期初-应收报账单-DB] 赛事必输字段填充率:', output_df, required_cols)
+    _safe_report_fill('[应收期初-MCN开票-DB] MCN必输字段填充率:', mcn_output_df, required_cols)
+
+    # 5. 写模版
+    output_path = write_output_workbook(output_df, mcn_output_df)
+    print('已写出:', output_path)
+
+    # 6. 问题清单
+    event_sheets = {'必输字段未达100%': c.fill_summary(output_df, required_cols, RULE_SHEET, RULE_TABLE)}
+    event_sheets.update(c.collect_field_issues(
         output_df, invoice_df, required_cols, ISSUE_SOURCE_FIELD_MAP, doc_col='来源单据号'))
-    sheets.update(c.collect_order_mapping_issues(invoice_df))
+    event_sheets.update(c.collect_order_mapping_issues(invoice_df))
+    _drop_fixed_order_issue_rows(event_sheets)
     # 给各未匹配清单补「成本中心」「预算项」两列(应收有成本中心,无预算科目则预算项留空)。
-    c.attach_budget_issue_columns(sheets, c.build_budget_issue_map(invoice_df))
+    c.attach_budget_issue_columns(event_sheets, c.build_budget_issue_map(invoice_df))
+
+    mcn_sheets = {'必输字段未达100%': c.fill_summary(mcn_output_df, required_cols, RULE_SHEET, RULE_TABLE)}
+    mcn_sheets.update(c.collect_field_issues(
+        mcn_output_df, mcn_invoice_df, required_cols, ISSUE_SOURCE_FIELD_MAP, doc_col='来源单据号'))
+    mcn_sheets.update(c.collect_order_mapping_issues(mcn_invoice_df, doc_col='开票单号'))
+    c.attach_budget_issue_columns(mcn_sheets, c.build_budget_issue_map(mcn_invoice_df, doc_col='开票单号'))
+
+    sheets = {}
+    sheets.update(_prefixed_sheets('赛事', event_sheets))
+    sheets.update(_prefixed_sheets('MCN', mcn_sheets))
     c.write_exceptions(EXCEPTION_FILE, sheets)
     print('已写出:', EXCEPTION_FILE, '| 各清单条数:', {
         sheet_name: len(sheet_df) for sheet_name, sheet_df in sheets.items()
