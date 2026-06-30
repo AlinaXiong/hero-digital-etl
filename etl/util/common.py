@@ -1752,11 +1752,25 @@ def build_attachment_referer(base_url, imagefileid, docid):
     return f'{base_url.rstrip("/")}/docs/pdfview3.x/web/pdfViewer.jsp?&{query}'
 
 
+def _windows_long_path(path):
+    path = Path(path)
+    if os.name != 'nt':
+        return path
+    text = str(path if path.is_absolute() else path.resolve())
+    if text.startswith('\\\\?\\'):
+        return Path(text)
+    text = text.replace('/', '\\')
+    if text.startswith('\\\\'):
+        return Path('\\\\?\\UNC\\' + text.lstrip('\\'))
+    return Path('\\\\?\\' + text)
+
+
 def _download_attachment_file(meta, cookie, log_prefix='附件下载'):
     target_path = Path(meta['target_path'])
-    if target_path.exists() and target_path.stat().st_size > 0:
+    target_fs_path = _windows_long_path(target_path)
+    if target_fs_path.exists() and target_fs_path.stat().st_size > 0:
         return 'skipped_exists', ''
-    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_fs_path.parent.mkdir(parents=True, exist_ok=True)
     base_url = os.getenv(ATTACHMENT_BASE_URL_ENV, DEFAULT_ATTACHMENT_BASE_URL)
     url = f'{base_url.rstrip("/")}/weaver/weaver.file.FileDownload?fileid={meta["imagefileid"]}'
     headers = {
@@ -1772,6 +1786,7 @@ def _download_attachment_file(meta, cookie, log_prefix='附件下载'):
         'Referer': build_attachment_referer(base_url, meta['imagefileid'], meta['docid']),
     }
     temp_path = target_path.with_suffix(target_path.suffix + '.part')
+    temp_fs_path = _windows_long_path(temp_path)
     max_attempts = attachment_download_retries()
     last_error = ''
     for attempt in range(1, max_attempts + 1):
@@ -1786,9 +1801,9 @@ def _download_attachment_file(meta, cookie, log_prefix='附件下载'):
                 if 'text/html' in content_type.lower() and not _cell_text(meta.get('attachment_name')).lower().endswith(('.html', '.htm')):
                     snippet = data[:200].decode('utf-8', errors='ignore')
                     raise RuntimeError(f'返回 HTML,疑似无权限或会话失效: {snippet}')
-                with open(temp_path, 'wb') as file:
+                with open(temp_fs_path, 'wb') as file:
                     file.write(data)
-            os.replace(temp_path, target_path)
+            os.replace(temp_fs_path, target_fs_path)
             return ('downloaded', '') if attempt == 1 else ('downloaded', f'重试成功: 第{attempt}次')
         except urllib.error.HTTPError as exc:
             last_error = str(exc)
@@ -1797,12 +1812,12 @@ def _download_attachment_file(meta, cookie, log_prefix='附件下载'):
             last_error = str(exc)
             retryable = True
         except RuntimeError as exc:
-            if temp_path.exists():
-                temp_path.unlink(missing_ok=True)
+            if temp_fs_path.exists():
+                temp_fs_path.unlink(missing_ok=True)
             return 'failed', str(exc)
 
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
+        if temp_fs_path.exists():
+            temp_fs_path.unlink(missing_ok=True)
         if not retryable or attempt >= max_attempts:
             break
         print(

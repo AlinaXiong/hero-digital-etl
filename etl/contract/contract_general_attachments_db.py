@@ -11,6 +11,7 @@ from etl.contract import contract_general_db as base
 
 TASK_NAME = 'contract_general_attachments_db'
 MANIFEST_FILE = base.OUTPUT_DIR / f'一般流程合同附件下载清单_{base.DATE_SUFFIX}.xlsx'
+RETENTION_MODE = 'main_archive'
 
 
 def _download_enabled(cookie):
@@ -22,7 +23,10 @@ def _download_enabled(cookie):
 
 def run():
     source_df = base.read_source()
-    manifest_df, missing_df = base.build_contract_attachment_manifest(source_df)
+    manifest_df, missing_df = base.build_contract_attachment_manifest(
+        source_df,
+        retention_mode=RETENTION_MODE,
+    )
     download_root = base._attachment_download_root()
     cookie = os.getenv(base.ATTACHMENT_COOKIE_ENV, '').strip()
 
@@ -59,4 +63,3 @@ def run():
         '合同附件DOCID_缺失映射': missing_df,
     })
     print('已写出:', output_file)
-

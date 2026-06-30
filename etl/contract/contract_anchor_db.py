@@ -2877,10 +2877,8 @@ def build_contract_attachment_manifest(source_df):
         target_sheet = _text(row.get('attachment_sheet')) or SHEET_OTHER_ATTACHMENT
         target_dir = download_root / contract_dir / base._sanitize_path_part(target_sheet, target_sheet)
         target_name = base._build_target_filename(row.get('attachment_name'), row.get('imagefileid'))
-        target_path = target_dir / target_name
-        if target_path in used_paths:
-            target_path = target_dir / f'{target_path.stem}_{row.get("imagefileid")}{target_path.suffix}'
-        used_paths.add(target_path)
+        target_path = base._unique_attachment_path_preserve_name(
+            target_dir, target_name, row.get('imagefileid'), used_paths)
         manifest_df.at[index, 'target_path'] = str(target_path)
     return manifest_df, missing_df
 
