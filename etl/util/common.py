@@ -170,19 +170,44 @@ def _db_endpoint(prefix, config):
     )
     tunnel = _SSH_TUNNELS.get(tunnel_key)
     if tunnel is None or not tunnel.is_active:
-        tunnel = SSHTunnelForwarder(
-            (tunnel_config['ssh_host'], tunnel_config['ssh_port']),
-            ssh_username=tunnel_config['ssh_user'],
-            ssh_password=tunnel_config['ssh_pass'],
-            remote_bind_address=(config['host'], config['port']),
-            local_bind_address=('127.0.0.1', 0),
-        )
-        tunnel.start()
-        _SSH_TUNNELS[tunnel_key] = tunnel
-        print(
-            f'[数据库连接] {prefix} SSH 隧道: '
-            f'127.0.0.1:{tunnel.local_bind_port} -> {config["host"]}:{config["port"]}'
-        )
+        last_error = None
+        for attempt in range(1, 4):
+            tunnel = SSHTunnelForwarder(
+                (tunnel_config['ssh_host'], tunnel_config['ssh_port']),
+                ssh_username=tunnel_config['ssh_user'],
+                ssh_password=tunnel_config['ssh_pass'],
+                remote_bind_address=(config['host'], config['port']),
+                local_bind_address=('127.0.0.1', 0),
+            )
+            try:
+                tunnel.start()
+            except Exception as exc:
+                last_error = exc
+                try:
+                    tunnel.stop()
+                except Exception:
+                    pass
+                if attempt >= 3:
+                    raise RuntimeError(
+                        f'{prefix} SSH tunnel failed after 3 attempts; '
+                        f'please check gateway {tunnel_config["ssh_host"]}:'
+                        f'{tunnel_config["ssh_port"]}'
+                    ) from exc
+                wait_seconds = attempt * 2
+                print(
+                    f'[DB] {prefix} SSH tunnel start failed ({attempt}/3): '
+                    f'{exc}; retry in {wait_seconds}s'
+                )
+                time.sleep(wait_seconds)
+                continue
+            _SSH_TUNNELS[tunnel_key] = tunnel
+            print(
+                f'[数据库连接] {prefix} SSH 隧道: '
+                f'127.0.0.1:{tunnel.local_bind_port} -> {config["host"]}:{config["port"]}'
+            )
+            break
+        if last_error is not None and (tunnel is None or not tunnel.is_active):
+            raise RuntimeError(f'{prefix} SSH tunnel failed') from last_error
     return '127.0.0.1', tunnel.local_bind_port
 
 
@@ -2180,7 +2205,6 @@ def load_order_multi_mapping_fix():
     fix_file = _find_order_multi_mapping_fix_file()
     columns = ['来源单据编号', '泛微项目编号', '指定订单编号', '来源Sheet']
     if fix_file is None:
-        print('[订单多映射指定] 未找到问题表,多候选订单编号保持为空。')
         _ORDER_MULTI_MAPPING_FIX_CACHE = pd.DataFrame(columns=columns)
         return _ORDER_MULTI_MAPPING_FIX_CACHE
 
