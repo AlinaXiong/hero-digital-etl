@@ -56,6 +56,8 @@ CONTRACT_INVOICE_MEANING = '合同'
 PUBLIC_INVOICE_MEANING = '对公开票'
 PLATFORM_PRE_INVOICE_MEANING = '平台预开票'
 OUTPUT_COLUMNS = [
+    '当前节点',
+    '当前状况',
     '来源单据号',
     '应收报账单类型',
     '核算主体',
@@ -183,6 +185,7 @@ MCN_INVOICE_WORKFLOW_IDS = (50, 335)
 SOURCE_SQL = """
 SELECT
     m.id AS `ID`,
+    rb.requestid AS `requestid`,
     m.lcbh AS `流程编号`,
     m.sqr AS `申请人ID`,
     m.sqrbm AS `申请人部门ID`,
@@ -206,6 +209,7 @@ SELECT
     m.slmx AS `税率（明细）`,
     COALESCE(r.receipt_amount, 0) AS `收款登记已收款金额`
 FROM uf_xtyykp m
+LEFT JOIN workflow_requestbase rb ON rb.requestmark = m.lcbh
 LEFT JOIN (
     SELECT
         kpysdh,
@@ -527,6 +531,23 @@ WHERE kpysdh IS NOT NULL
 GROUP BY kpysdh
 """
 
+WORKFLOW_STATE_SQL = """
+SELECT
+    rb.requestid AS `requestid`,
+    nb.nodename AS `当前节点`,
+    rb.status AS `当前状况`
+FROM workflow_requestbase rb
+LEFT JOIN (
+    SELECT requestid, MAX(nownodeid) AS nownodeid
+    FROM workflow_nownode
+    WHERE requestid IN %(requestids)s
+    GROUP BY requestid
+) nn ON nn.requestid = rb.requestid
+LEFT JOIN workflow_nodebase nb
+    ON nb.id = COALESCE(nn.nownodeid, rb.currentnodeid, rb.lastnodeid)
+WHERE rb.requestid IN %(requestids)s
+"""
+
 
 # ============================ DB 查询小工具 ============================
 def _query_fw(sql):
@@ -561,6 +582,48 @@ def _chunks(values, size=1000):
     values = list(values)
     for start in range(0, len(values), size):
         yield values[start:start + size]
+
+
+def attach_workflow_states(source_df):
+    """按 requestid 补当前节点和当前状况，当前节点取 MAX(nownodeid) 对应名称。"""
+    df = source_df.copy()
+    if df.empty or 'requestid' not in df.columns:
+        df['当前节点'] = ''
+        df['当前状况'] = ''
+        return df
+
+    request_ids = sorted({
+        c.format_code(value)
+        for value in df['requestid']
+        if c.format_code(value)
+    })
+    if not request_ids:
+        df['当前节点'] = ''
+        df['当前状况'] = ''
+        return df
+
+    state_frames = []
+    for chunk in _chunks(request_ids):
+        state_frames.append(c.query_db(
+            'FW',
+            'vspn_xtyy',
+            WORKFLOW_STATE_SQL,
+            {'requestids': tuple(chunk)},
+        ))
+    state_df = pd.concat(state_frames, ignore_index=True) if state_frames else pd.DataFrame()
+    if state_df.empty:
+        df['当前节点'] = ''
+        df['当前状况'] = ''
+        return df
+
+    state_df['requestid_key'] = state_df['requestid'].map(c.format_code)
+    state_df = state_df.drop_duplicates('requestid_key', keep='last')
+    node_map = state_df.set_index('requestid_key')['当前节点'].map(c.clean_fw_select_name).to_dict()
+    status_map = state_df.set_index('requestid_key')['当前状况'].map(_text).to_dict()
+    request_keys = df['requestid'].map(c.format_code)
+    df['当前节点'] = request_keys.map(node_map).fillna('')
+    df['当前状况'] = request_keys.map(status_map).fillna('')
+    return df
 
 
 def _issue_fix_file():
@@ -932,7 +995,7 @@ def _drop_fixed_order_issue_rows(sheets):
 
 
 def build_output(invoice_df):
-    """DB 源数据 -> 应收报账单期初导入模板 73 列。
+    """DB 源数据 -> 应收报账单期初导入模板 75 列。
     能从泛微 DB 原始字段/ID 直接取得的字段直接取;跨系统编码再查中台/值集。
     """
     # 核算主体: [开票表] gszt -> 公司主体名称 -> Hand hfac_accounting_entity.acc_entity_code。
@@ -961,6 +1024,10 @@ def build_output(invoice_df):
     output_df['收入项目'] = INCOME_ITEM
 
     # 泛微开票表直取/解析字段。
+    output_df['当前节点'] = invoice_df.get(
+        '当前节点', pd.Series('', index=invoice_df.index)).map(_text)
+    output_df['当前状况'] = invoice_df.get(
+        '当前状况', pd.Series('', index=invoice_df.index)).map(_text)
     output_df['来源单据号'] = invoice_df['流程编号']                  # [开票表] lcbh
     output_df['部门'] = invoice_df['申请人部门']                      # [开票表] sqrbm -> hrmdepartment
     output_df['岗位'] = ''                                           # 不涉及
@@ -1053,7 +1120,7 @@ def _mcn_receipt_allocations(invoice_df, line_amounts):
 
 
 def build_mcn_output(invoice_df):
-    """MCN 开票旧流程明细 -> 应收报账单期初导入模板 73 列。"""
+    """MCN 开票旧流程明细 -> 应收报账单期初导入模板 75 列。"""
     entity_map = c.build_accounting_entity_map_for_names(invoice_df['公司主体'])
     customer_map = c.build_customer_map_for_names(invoice_df['客户'])
     business_type_map = c.build_lov_meaning_map(BUSINESS_TYPE_LOV)
@@ -1072,6 +1139,10 @@ def build_mcn_output(invoice_df):
     output_df['收入项目'] = INCOME_ITEM
 
     # 泛微 MCN 开票申请流程/开票申请流程（订单）直取或解析字段。
+    output_df['当前节点'] = invoice_df.get(
+        '当前节点', pd.Series('', index=invoice_df.index)).map(_text)
+    output_df['当前状况'] = invoice_df.get(
+        '当前状况', pd.Series('', index=invoice_df.index)).map(_text)
     output_df['来源单据号'] = invoice_df['开票单号']
     output_df['部门'] = invoice_df['申请人部门']
     output_df['岗位'] = ''                                             # 不涉及
@@ -1150,7 +1221,8 @@ def read_invoice_source():
           f"剔除作废 {int(stats['void_count'] or 0)} 行; "
           f"SQL保留(未作废) {int(stats['kept_count'] or 0)} 行")
 
-    invoice_df = resolve_source_values(_query_fw(SOURCE_SQL))
+    source_df = attach_workflow_states(_query_fw(SOURCE_SQL))
+    invoice_df = resolve_source_values(source_df)
     print('[应收期初-应收报账单-DB] 未作废开票记录行数:', len(invoice_df))
     # 应收期初当前仅处理赛事,只按赛事白名单过滤;MCN 部分后续单独按 MCN sheet 处理。
     invoice_df = _filter_by_project_whitelist(invoice_df, EVENT_PROJECT_SHEET)
@@ -1171,6 +1243,7 @@ def read_mcn_invoice_source():
     print('[应收期初-MCN开票-DB] SQL过滤: 仅保留开票申请流程/开票申请流程（订单）且流程完成')
     source_df = c.query_db('FW', 'vspn_xtyy', MCN_SOURCE_SQL, params)
     print('[应收期初-MCN开票-DB] 流程完成开票明细行数:', len(source_df))
+    source_df = attach_workflow_states(source_df)
 
     receipt_df = c.query_db('FW', 'vspn_xtyy', MCN_RECEIPT_SQL)
     if not receipt_df.empty:
