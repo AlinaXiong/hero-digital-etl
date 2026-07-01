@@ -352,6 +352,7 @@ SELECT
     rb.REQUESTNAME AS `标题`,
     m.kpdh AS `开票单号`,
     NULL AS `泛微订单编号`,
+    NULL AS `泛微订单编号ID`,
     m.sqr AS `申请人ID`,
     m.sqrbm AS `申请人部门ID`,
     m.sqrq AS `申请日期`,
@@ -386,7 +387,8 @@ SELECT
     rb.workflowid AS `workflowid`,
     rb.REQUESTNAME AS `标题`,
     m.kpdh AS `开票单号`,
-    COALESCE(od.ddbh, d.ddbh) AS `泛微订单编号`,
+    COALESCE(NULLIF(od.ddbh, ''), d.ddbh) AS `泛微订单编号`,
+    d.ddbh AS `泛微订单编号ID`,
     m.sqr AS `申请人ID`,
     m.sqrbm AS `申请人部门ID`,
     m.sqrq AS `申请日期`,
@@ -422,7 +424,8 @@ SELECT
     rb.workflowid AS `workflowid`,
     rb.REQUESTNAME AS `标题`,
     m.kpdh AS `开票单号`,
-    COALESCE(od.ddbh, d.ptpqh) AS `泛微订单编号`,
+    COALESCE(NULLIF(od.ddbh, ''), d.ptpqh) AS `泛微订单编号`,
+    d.ptpqh AS `泛微订单编号ID`,
     m.sqr AS `申请人ID`,
     m.sqrbm AS `申请人部门ID`,
     m.sqrq AS `申请日期`,
@@ -443,7 +446,7 @@ SELECT
 FROM formtable_main_72 m
 JOIN workflow_requestbase rb ON rb.requestid = m.requestid
 JOIN formtable_main_72_dt5 d ON d.mainid = m.id
-LEFT JOIN formtable_main_79_dt2 od ON od.id = d.ptpqh
+LEFT JOIN formtable_main_76_dt2 od ON od.id = d.ptpqh
 WHERE rb.currentnodetype = %(complete_node_type)s
   AND rb.workflowid IN %(mcn_order_workflow_ids)s
 
@@ -458,7 +461,8 @@ SELECT
     rb.workflowid AS `workflowid`,
     rb.REQUESTNAME AS `标题`,
     m.kpdh AS `开票单号`,
-    COALESCE(od.ddbh, d.ptpqh) AS `泛微订单编号`,
+    COALESCE(NULLIF(od.ddbh, ''), d.ptpqh) AS `泛微订单编号`,
+    d.ptpqh AS `泛微订单编号ID`,
     m.sqr AS `申请人ID`,
     m.sqrbm AS `申请人部门ID`,
     m.sqrq AS `申请日期`,
@@ -479,7 +483,7 @@ SELECT
 FROM formtable_main_72 m
 JOIN workflow_requestbase rb ON rb.requestid = m.requestid
 JOIN formtable_main_72_dt6 d ON d.mainid = m.id
-LEFT JOIN formtable_main_76_dt2 od ON od.id = d.ptpqh
+LEFT JOIN formtable_main_79_dt2 od ON od.id = d.ptpqh
 WHERE rb.currentnodetype = %(complete_node_type)s
   AND rb.workflowid IN %(mcn_order_workflow_ids)s
 
@@ -494,7 +498,8 @@ SELECT
     rb.workflowid AS `workflowid`,
     rb.REQUESTNAME AS `标题`,
     m.kpdh AS `开票单号`,
-    COALESCE(od.ddbh, d.ddh) AS `泛微订单编号`,
+    COALESCE(NULLIF(od.ddbh, ''), d.ddh) AS `泛微订单编号`,
+    d.ddh AS `泛微订单编号ID`,
     m.sqr AS `申请人ID`,
     m.sqrbm AS `申请人部门ID`,
     m.sqrq AS `申请日期`,
@@ -582,6 +587,80 @@ def _chunks(values, size=1000):
     values = list(values)
     for start in range(0, len(values), size):
         yield values[start:start + size]
+
+
+def _looks_like_browser_id_list(value):
+    text = _text(value)
+    if not text:
+        return False
+    ids = c.parse_browser_ids(text)
+    return bool(ids) and all(item_id.isdigit() for item_id in ids)
+
+
+def _build_mcn_order_code_map(table_name, order_ids):
+    order_ids = c.clean_codes(
+        item_id
+        for value in order_ids
+        for item_id in c.parse_browser_ids(value)
+        if item_id.isdigit()
+    )
+    if not order_ids:
+        return {}
+
+    result = {}
+    for batch in _chunks(order_ids):
+        order_df = c.query_db(
+            'FW',
+            'vspn_xtyy',
+            f'SELECT id, ddbh AS order_code FROM {table_name} '
+            f'WHERE id IN ({c.in_placeholders(batch)})',
+            batch,
+        )
+        for _, row in order_df.iterrows():
+            order_id = c.format_code(row['id'])
+            order_code = _text(row['order_code'])
+            if order_id and order_code:
+                result[order_id] = order_code
+    return result
+
+
+def _lookup_mcn_order_codes(order_map, value):
+    order_codes = [
+        _text(order_map.get(item_id, ''))
+        for item_id in c.parse_browser_ids(value)
+    ]
+    return ','.join(order_code for order_code in order_codes if order_code)
+
+
+def _resolve_mcn_order_numbers(df):
+    """MCN 订单流程明细里的订单字段存 ID,输出列必须展示订单编号。"""
+    if df.empty or '泛微订单编号' not in df.columns:
+        return pd.Series('', index=df.index)
+
+    display_values = df['泛微订单编号'].map(_text)
+    raw_ids = df.get('泛微订单编号ID', pd.Series('', index=df.index)).map(_text)
+    detail_sources = df.get('明细来源', pd.Series('', index=df.index)).map(_text)
+    resolved_values = pd.Series('', index=df.index)
+
+    source_table_map = {
+        'formtable_main_72_dt4': 'uf_ddk',
+        'formtable_main_72_dt5': 'formtable_main_76_dt2',
+        'formtable_main_72_dt6': 'formtable_main_79_dt2',
+        'formtable_main_72_dt7': 'formtable_main_76_dt2',
+    }
+    for detail_source, table_name in source_table_map.items():
+        mask = detail_sources == detail_source
+        if not mask.any():
+            continue
+        order_map = _build_mcn_order_code_map(table_name, raw_ids.loc[mask])
+        if order_map:
+            resolved_values.loc[mask] = raw_ids.loc[mask].map(
+                lambda value: _lookup_mcn_order_codes(order_map, value))
+
+    return pd.Series([
+        resolved if resolved else ('' if _looks_like_browser_id_list(display) else display)
+        for display, resolved in zip(display_values, resolved_values)
+    ], index=df.index)
 
 
 def attach_workflow_states(source_df):
@@ -834,6 +913,7 @@ def resolve_mcn_source_values(source_df):
     df['开票类型'] = df['开票类型ID'].map(lambda value: option_maps.get('kplx', {}).get(c.format_code(value), ''))
     df['平台'] = df['平台ID'].map(lambda value: option_maps.get('pt', {}).get(c.format_code(value), ''))
     df['成本中心'] = df['成本中心ID'].map(lambda value: _lookup_first_browser_value(cost_center_map, value))
+    df['泛微订单编号'] = _resolve_mcn_order_numbers(df)
     return df
 
 
