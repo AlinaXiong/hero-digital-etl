@@ -240,6 +240,16 @@
     "handTaxpayerName": "上海起浪市场营销有限公司"
   },
   {
+    "供应商泛微Id": "3839",
+    "供应商名称": "上海东仁文化传播有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "1609",
+    "handVendorCode": "V-C-CN-SP-TPS-0006",
+    "handVendorName": "上海东仁文化传播有限公司",
+    "handTaxpayerName": "上海东仁文化传播有限公司"
+  },
+  {
     "供应商泛微Id": "5957",
     "供应商名称": "上饶市天同文化传播有限公司",
     "泛微状态": "1",
@@ -258,6 +268,36 @@
     "handVendorCode": "V-C-CN-OT-OTH-0260",
     "handVendorName": "上海竞综文化传媒有限公司",
     "handTaxpayerName": "上海竞综文化传媒有限公司"
+  },
+  {
+    "供应商泛微Id": "6428",
+    "供应商名称": "上海骅博文化传播有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "1672",
+    "handVendorCode": "V-C-CN-SP-TPS-0007",
+    "handVendorName": "上海骅博文化传播有限公司",
+    "handTaxpayerName": "上海骅博文化传播有限公司"
+  },
+  {
+    "供应商泛微Id": "6461",
+    "供应商名称": "上海大鹅文化传播有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "822",
+    "handVendorCode": "V-C-CN-OT-OTH-0099",
+    "handVendorName": "上海大鹅文化传播有限公司",
+    "handTaxpayerName": "上海大鹅文化传播有限公司"
+  },
+  {
+    "供应商泛微Id": "707",
+    "供应商名称": "西藏福禄网络科技有限公司",
+    "泛微状态": "1",
+    "匹配方式": "禁用供应商按名称匹配汉得供应商",
+    "handVendorId": "1064",
+    "handVendorCode": "V-C-CN-OT-OTH-0179",
+    "handVendorName": "西藏福禄网络科技有限公司",
+    "handTaxpayerName": "西藏福禄网络科技有限公司"
   },
   {
     "供应商泛微Id": "786",

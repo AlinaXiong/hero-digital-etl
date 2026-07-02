@@ -4,24 +4,53 @@
 
 ## 可执行任务
 
-查看当前所有任务：`python run.py --list`
+查看当前所有任务：
 
-| 任务名 | 业务含义 | 数据源 | 产出模板 |
+```powershell
+python run.py --list
+```
+
+常用可执行命令：
+
+```powershell
+python run.py all
+python run.py contract_all
+python run.py contract_all_with_attachments
+python run.py ap_payment_opening_extra_db
+python run.py ap_prepayment_opening_db
+python run.py ar_invoice_opening_db
+python run.py invoice_info_db
+python run.py contract_general_db
+python run.py contract_general_special_db
+python run.py contract_general_specail_db
+python run.py contract_general_attachments_db
+python run.py contract_anchor_db
+python run.py contract_anchor_attachments_db
+python run.py contract_anti_bribery_db
+python run.py contract_anti_bribery_attachments_db
+python run.py anti_bribery_signers_db
+python run.py export_feishu_employees
+```
+
+| 执行命令 | 业务含义 | 数据源 | 产出模板 |
 | --- | --- | --- | --- |
-| `ap_payment_opening_extra_db` | 应付期初 - 对公付款单(含批量费用 / 只转入外部成本 / MCN 多 tab)(DB直连版) | 泛微 `uf_dgfktz` / `uf_dgfktz_dt1` + `uf_plfy` / `uf_plfy_dt1` + `uf_xtyynbsz` / `uf_xtyynbsz_dt10` / `view_costlist_ys` | 英雄期初对公付款单导入模版 |
-| `ap_prepayment_opening_db` | 预付期初 - 供应商预付款单 + 零工预付款单(DB直连版) | 泛微 `uf_yfkxx` + `uf_yfkxx_dt1` + `uf_dgfktz_dt2`；`uf_lgptfk` + `formtable_main_279` + `formtable_main_279_dt3` + `formtable_main_279_dt4` | 英雄期初预付款单导入模版 |
-| `ar_invoice_opening_db` | 应收期初 - 应收报账单(DB直连版) | 泛微 `uf_xtyykp` + `uf_skdj` | 应收报账单期初数据导入模板 |
-| `contract_general_db` | 合同迁移 - 一般流程 Excel 导出 | 泛微 `uf_htk` + 订单申请初始化导入表 | 智书合同字段-一般流程 |
-| `contract_general_attachments_db` | 合同迁移 - 一般流程附件下载 | 泛微合同稿件字段 + `workflow_docshareinfo` / `docimagefile` | 一般流程合同附件 + 下载清单 |
-| `contract_anchor_db` | 合同迁移 - 主播流程 Excel 导出 | 泛微 `uf_htk` + `uf_zbkp` / `uf_zbkp_dt1` + Hand 主播档案 | 智书合同字段-主播流程 |
-| `contract_anchor_attachments_db` | 合同迁移 - 主播流程附件下载 | 主播合同清洗口径 + 泛微合同稿件字段 | 主播流程合同附件 + 下载清单 |
-| `contract_anti_bribery_db` | 合同迁移 - 反商业贿赂协议 Excel 导出 | 泛微一般合同/赛事合同 + 反贿赂模板 | 反商业贿赂协议清洗结果 |
-| `contract_anti_bribery_attachments_db` | 合同迁移 - 反商业贿赂协议附件下载 | 反贿赂合同清洗口径 + 泛微合同稿件字段 | 反贿赂合同附件 + 下载清单 |
-| `export_feishu_employees` | 飞书全量员工信息导出（合同相关辅助任务） | 飞书 CoreHR 员工接口 | 飞书员工信息 Excel |
-| `invoice_info_db` | 发票信息(DB直连版) | 泛微 `fnainvoiceledger` + `fnainvoiceledgerdtl` | 发票信息清洗导入表 |
-| `all` | 一次跑核心 DB 导入任务 | 依次执行 `ap_payment_opening_extra_db`、`ap_prepayment_opening_db`、`ar_invoice_opening_db`、`invoice_info_db` | 多个模板/清洗表 |
-| `contract_all` | 一次跑所有合同任务(不含附件下载) | 依次执行 `contract_general_db`、`contract_anchor_db`、`contract_anti_bribery_db` | 智书合同各模板 |
-| `contract_all_with_attachments` | 一次跑所有合同任务(含附件下载) | `contract_all` 三个任务 + `contract_general_attachments_db`、`contract_anchor_attachments_db`、`contract_anti_bribery_attachments_db` | 智书合同各模板 + 合同附件 |
+| `python run.py ap_payment_opening_extra_db` | 应付期初 - 对公付款单(含批量费用 / 只转入外部成本 / MCN 多 tab)(DB直连版) | 泛微 `uf_dgfktz` / `uf_dgfktz_dt1` + `uf_plfy` / `uf_plfy_dt1` + `uf_xtyynbsz` / `uf_xtyynbsz_dt10` / `view_costlist_ys` | 英雄期初对公付款单导入模版 |
+| `python run.py ap_prepayment_opening_db` | 预付期初 - 供应商预付款单 + 零工预付款单(DB直连版) | 泛微 `uf_yfkxx` + `uf_yfkxx_dt1` + `uf_dgfktz_dt2`；`uf_lgptfk` + `formtable_main_279` + `formtable_main_279_dt3` + `formtable_main_279_dt4` | 英雄期初预付款单导入模版 |
+| `python run.py ar_invoice_opening_db` | 应收期初 - 应收报账单(DB直连版) | 泛微 `uf_xtyykp` + `uf_skdj` | 应收报账单期初数据导入模板 |
+| `python run.py invoice_info_db` | 发票信息(DB直连版) | 泛微 `fnainvoiceledger` + `fnainvoiceledgerdtl` | 发票信息清洗导入表 |
+| `python run.py contract_general_db` | 合同迁移 - 一般流程 Excel 导出 | 泛微 `uf_htk` + 订单申请初始化导入表 | 智书合同字段-一般流程 |
+| `python run.py contract_general_special_db` | 合同迁移 - 一般流程 special，关闭过滤 | 泛微 `uf_htk` / `uf_htsp` + 订单申请初始化导入表 | 智书合同字段-一般流程 + 导入任务标记 |
+| `python run.py contract_general_specail_db` | 合同迁移 - 一般流程 special，关闭过滤(兼容旧拼写) | 泛微 `uf_htk` / `uf_htsp` + 订单申请初始化导入表 | 智书合同字段-一般流程 + 导入任务标记 |
+| `python run.py contract_general_attachments_db` | 合同迁移 - 一般流程附件下载 | 泛微合同稿件字段 + `workflow_docshareinfo` / `docimagefile` | 一般流程合同附件 + 下载清单 |
+| `python run.py contract_anchor_db` | 合同迁移 - 主播流程 Excel 导出 | 泛微 `uf_htk` + `uf_zbkp` / `uf_zbkp_dt1` + Hand 主播档案 | 智书合同字段-主播流程 |
+| `python run.py contract_anchor_attachments_db` | 合同迁移 - 主播流程附件下载 | 主播合同清洗口径 + 泛微合同稿件字段 | 主播流程合同附件 + 下载清单 |
+| `python run.py contract_anti_bribery_db` | 合同迁移 - 反商业贿赂协议 Excel 导出 | 泛微一般合同/赛事合同 + 反贿赂模板 | 反商业贿赂协议清洗结果 |
+| `python run.py contract_anti_bribery_attachments_db` | 合同迁移 - 反商业贿赂协议附件下载 | 反贿赂合同清洗口径 + 泛微合同稿件字段 | 反贿赂合同附件 + 下载清单 |
+| `python run.py anti_bribery_signers_db` | 反商业贿赂协议签署情况补登 | 泛微 `uf_htk` / `uf_htsp` + 签署情况底稿 | 反商业贿赂协议签署情况 |
+| `python run.py export_feishu_employees` | 飞书全量员工信息导出（合同相关辅助任务） | 飞书 CoreHR 员工接口 | 飞书员工信息 Excel |
+| `python run.py all` | 一次跑核心 DB 导入任务 | 依次执行 `ap_payment_opening_extra_db`、`ap_prepayment_opening_db`、`ar_invoice_opening_db`、`invoice_info_db` | 多个模板/清洗表 |
+| `python run.py contract_all` | 一次跑所有合同任务(不含附件下载) | 依次执行 `contract_general_db`、`contract_anchor_db`、`contract_anti_bribery_db` | 智书合同各模板 |
+| `python run.py contract_all_with_attachments` | 一次跑所有合同任务(含附件下载) | `contract_all` 三个任务 + `contract_general_attachments_db`、`contract_anchor_attachments_db`、`contract_anti_bribery_attachments_db` | 智书合同各模板 + 合同附件 |
 
 ### all（一键执行核心 DB 任务）
 
@@ -34,7 +63,7 @@
 
 执行命令：
 
-```bash
+```powershell
 python run.py all
 ```
 
@@ -62,10 +91,10 @@ python run.py all
 
 执行命令：
 
-```bash
-python run.py contract_all                    # 不含附件下载
-python run.py contract_all_with_attachments   # 含附件下载
-python run.py export_feishu_employees          # 单独导出飞书全量员工信息
+```powershell
+python run.py contract_all
+python run.py contract_all_with_attachments
+python run.py export_feishu_employees
 ```
 
 ### ap_payment_opening_extra_db（应付期初 - 对公付款单补充三 tab DB 直连版）
@@ -122,8 +151,26 @@ DB 直连版源数据不读 Excel；供应商预付从泛微 `uf_yfkxx` / `uf_yf
 - **行过滤**：排除合同类型=主播协议，保留合同签署状态 ∈ {审批完成, 已归档}。
 - **输出 sheet**：`字段模板`、`关联合同`、`相关单据-订单信息`、`采购申请`、`订单信息明细`、`对方信息`、`我方主体列表`、`付款计划`、`收款计划`、`合同附件`、`其他附件`；`选项` 和 `DropdownOptions` 保留模板原样。
 - **关键映射**：合同二级分类按《合同数据迁移-二级分类映射规则》由合同编号前缀、项目/标题关键词和主体信息推导；合同执行人取工号；对方/我方主体映射到中台编码；订单字段按订单申请初始化导入表一对一回填。
-- **合同附件**：`合同附件` sheet 只写附件名称，不执行文件下载；附件下载单独运行 `python run.py contract_general_attachments_db`。
+- **合同附件**：`合同附件` sheet 只写附件名称，不执行文件下载；附件下载单独运行：
+
+```powershell
+python run.py contract_general_attachments_db
+```
 - **产出**：`output/contract_general_db/智书合同字段_一般流程_<YYYYMMDD>.xlsx`。
+
+### contract_general_special_db（一般流程 special）
+
+复用 `contract_general_db` 主逻辑，但关闭源数据和后续行过滤，原来有多少合同就保留多少合同继续生成导入模板。
+
+- **跑法**：
+
+```powershell
+python run.py contract_general_special_db
+python run.py contract_general_specail_db
+```
+- **标记**：输出 Excel 的第一个 `字段模板` sheet 会追加 `已导入任务` 和 `导入标记说明` 两列；被 `contract_anti_bribery_db.py` 导入的标 `反贿赂`，被 `contract_general_db.py` 导入的标 `一般流程`。
+- **错误清单**：special 任务不生成未匹配/错误清单。
+- **产出**：`output/contract_general_special_db/智书合同字段_一般流程_special_<YYYYMMDD>.xlsx`。
 
 ### contract_general_attachments_db（一般流程合同附件下载 DB 直连版）
 
@@ -170,7 +217,11 @@ AR日常运营费用/AR4日常运营费用/AR47办公杂费
 
 ### 应付期初 - 对公付款单补充三 tab
 
-- **执行命令**：`python run.py ap_payment_opening_extra_db`
+- **执行命令**：
+
+```powershell
+python run.py ap_payment_opening_extra_db
+```
 - **输出结果**：同一个 Excel 写入 `期初对公付款单导入`、`批量费用流程`、`只转入外部成本` 三个 tab
 - **订单映射结果**：
   - 期初对公付款单导入：订单编号已填 3163/5192
@@ -182,7 +233,11 @@ AR日常运营费用/AR4日常运营费用/AR47办公杂费
 
 ### 预付期初 - 供应商预付款 / 零工预付款 DB
 
-- **执行命令**：`python run.py ap_prepayment_opening_db`
+- **执行命令**：
+
+```powershell
+python run.py ap_prepayment_opening_db
+```
 - **供应商预付款订单映射**：订单编号已填 1181/7718
 - **零工预付款订单映射**：订单编号已填 1653/13690
 - **产出文件**：`output/ap_prepayment_opening_db/英雄期初预付款单导入_预付期初_20260620.xlsx`
@@ -190,7 +245,11 @@ AR日常运营费用/AR4日常运营费用/AR47办公杂费
 
 ### 应收期初 - 应收报账单
 
-- **执行命令**：`python run.py ar_invoice_opening_db`
+- **执行命令**：
+
+```powershell
+python run.py ar_invoice_opening_db
+```
 - **项目订单清单**：多候选 84 条，未匹配 307 条
 - **产出**：`output/ar_invoice_opening_db/英雄应收报账单期初数据导入_应收期初_20260620.xlsx`
 
@@ -234,7 +293,7 @@ hero-digital-etl/
 
 ## 快速开始
 
-```bash
+```powershell
 pip install -r requirements.txt
 copy .env.example .env                  # 填入真实数据库账密
 python run.py all                       # 一次跑核心 DB 导入任务
@@ -246,11 +305,15 @@ python run.py ap_payment_opening_extra_db
 
 数据库访问统一走 SQLAlchemy。调试时可打印已代入参数、可直接复制到 MySQL 执行的 SQL：
 
-```bash
-SQL_ECHO=1 python run.py ap_payment_opening_extra_db
+```powershell
+$env:SQL_ECHO='1'; python run.py ap_payment_opening_extra_db
 ```
 
-如需 SQLAlchemy 原生日志，可使用 `SQLALCHEMY_ECHO=1`。
+如需 SQLAlchemy 原生日志：
+
+```powershell
+$env:SQLALCHEMY_ECHO='1'; python run.py ap_payment_opening_extra_db
+```
 
 ## 泛微字段含义查询
 

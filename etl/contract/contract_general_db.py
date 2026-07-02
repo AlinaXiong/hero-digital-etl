@@ -229,6 +229,13 @@ WHERE (h.htlx <> %(anchor_contract_type_code)s OR h.htlx IS NULL)
 ORDER BY h.htbh, h.id
 """
 
+SOURCE_SQL_ALL = SOURCE_SQL.replace(
+    """WHERE (h.htlx <> %(anchor_contract_type_code)s OR h.htlx IS NULL)
+  AND h.htzt IN %(migration_status_codes)s
+""",
+    "",
+)
+
 FORCED_GENERAL_CONTRACT_SOURCE_SQL = SOURCE_SQL.replace(
     """WHERE (h.htlx <> %(anchor_contract_type_code)s OR h.htlx IS NULL)
   AND h.htzt IN %(migration_status_codes)s""",
@@ -315,6 +322,11 @@ LEFT JOIN workflow_nodebase nb ON nb.id = COALESCE(rb.currentnodeid, nn.nownodei
 WHERE h.htzt IN %(htsp_status_codes)s
 ORDER BY h.htbh, h.id
 """
+
+SOURCE_SQL_HTSP_ALL = SOURCE_SQL_HTSP.replace(
+    "WHERE h.htzt IN %(htsp_status_codes)s\n",
+    "",
+)
 
 EXPECTED_FW_FIELDS = {
     '': {
@@ -2659,36 +2671,114 @@ def read_forced_general_contract_source():
     return df
 
 
-def read_source():
+def _source_status_in(series, codes):
+    code_set = {c.format_code(code) for code in codes}
+    return series.map(lambda value: c.format_code(value) in code_set)
+
+
+def _mark_general_imported_for_special(source_df):
+    if source_df.empty:
+        source_df['contract_general_db已导入'] = ''
+        source_df['contract_general_db导入口径'] = ''
+        source_df['已导入任务'] = ''
+        source_df['导入标记说明'] = ''
+        return source_df
+
+    result = source_df.copy()
+    source_name = result.get('数据来源', pd.Series('', index=result.index)).map(_text)
+    contract_keys = result.get('合同编号', pd.Series('', index=result.index)).map(_contract_number_key)
+    anti_keys = load_anti_bribery_contract_number_keys()
+    force_mask = _force_include_mask(result)
+
+    mcn_source_mask = source_name.eq('泛微(MCN)')
+    mcn_base_mask = (
+        mcn_source_mask
+        & ~_source_status_in(result.get('合同类型ID', pd.Series('', index=result.index)), (ANCHOR_CONTRACT_TYPE_CODE,))
+        & _source_status_in(result.get('合同签署状态ID', pd.Series('', index=result.index)), MIGRATION_STATUS_CODES)
+    )
+    mcn_base_mask = (mcn_base_mask & ~contract_keys.isin(anti_keys)) | force_mask
+
+    mcn_normal_keys = set(contract_keys.loc[mcn_base_mask & ~force_mask])
+    mcn_normal_keys.discard('')
+    htsp_source_mask = source_name.eq('泛微(赛事)')
+    htsp_base_mask = (
+        htsp_source_mask
+        & _source_status_in(result.get('合同签署状态ID', pd.Series('', index=result.index)), HTSP_MIGRATION_STATUS_CODES)
+        & ~contract_keys.isin(anti_keys)
+        & ~contract_keys.isin(mcn_normal_keys)
+    )
+
+    original_candidate = result.loc[mcn_base_mask | htsp_base_mask].copy()
+    if original_candidate.empty:
+        imported_keys = set()
+    else:
+        original_candidate, _ = _filter_by_contract_project_whitelist(original_candidate)
+        original_candidate, _ = _filter_by_approval_status(original_candidate)
+        imported_keys = set(original_candidate['合同编号'].map(_contract_number_key))
+        imported_keys.discard('')
+
+    result['contract_general_db已导入'] = contract_keys.map(lambda key: 'Y' if key in imported_keys else 'N')
+    result['contract_general_db导入口径'] = result['contract_general_db已导入'].map(
+        lambda value: '已被contract_general_db.py导入' if value == 'Y' else '未被contract_general_db.py导入'
+    )
+    result['已导入任务'] = contract_keys.map(
+        lambda key: '反贿赂' if key in anti_keys else ('一般流程' if key in imported_keys else '')
+    )
+    result['导入标记说明'] = result['已导入任务'].map({
+        '反贿赂': '被contract_anti_bribery_db.py导入',
+        '一般流程': '被contract_general_db.py导入',
+    }).fillna('')
+    print(
+        '[合同迁移-一般流程] special导入任务标记:',
+        f'一般流程 {len(imported_keys)} 个合同编号;',
+        f'反贿赂 {len(anti_keys)} 个合同编号',
+    )
+    return result
+
+
+def read_source(skip_project_whitelist=False, mark_general_imported=False, disable_filters=False):
     # ---- 源1: MCN 合同库 uf_htk ----
     c.validate_fw_fields(FW_TABLE, EXPECTED_FW_FIELDS)
-    stats = _query_fw(STATS_SQL).iloc[0]
-    print('[合同迁移-一般流程] MCN(uf_htk) 过滤: 合同类型<>主播协议 且 合同签署状态∈(审批完成, 已归档)')
-    print(f"  合同库总数 {int(stats['all_count'] or 0)} 条; "
-          f"主播协议排除 {int(stats['anchor_type_count'] or 0)} 条; "
-          f"一般流程保留 {int(stats['kept_count'] or 0)} 条; "
-          f"一般流程排除其他状态 {int(stats['excluded_status_count'] or 0)} 条")
-    mcn_df = _timed('read_source/MCN取数(uf_htk)', lambda: _query_fw(SOURCE_SQL))
+    if disable_filters:
+        print('[合同迁移-一般流程] special任务: MCN(uf_htk) 全量取数,不按合同类型/签署状态过滤')
+        mcn_df = _timed('read_source/MCN全量取数(uf_htk)', lambda: _query_fw(SOURCE_SQL_ALL))
+    else:
+        stats = _query_fw(STATS_SQL).iloc[0]
+        print('[合同迁移-一般流程] MCN(uf_htk) 过滤: 合同类型<>主播协议 且 合同签署状态∈(审批完成, 已归档)')
+        print(f"  合同库总数 {int(stats['all_count'] or 0)} 条; "
+              f"主播协议排除 {int(stats['anchor_type_count'] or 0)} 条; "
+              f"一般流程保留 {int(stats['kept_count'] or 0)} 条; "
+              f"一般流程排除其他状态 {int(stats['excluded_status_count'] or 0)} 条")
+        mcn_df = _timed('read_source/MCN取数(uf_htk)', lambda: _query_fw(SOURCE_SQL))
     mcn_df['数据来源'] = '泛微(MCN)'
     mcn_df['强制追加导出'] = ''
     print('[合同迁移-一般流程] MCN 主表行数:', len(mcn_df))
-    forced_mcn_df = _timed('read_source/强制追加一般合同(uf_htk)', read_forced_general_contract_source)
-    forced_keys = set(forced_mcn_df.get('合同编号', pd.Series(dtype=object)).map(_contract_number_key))
-    if forced_keys:
-        before_mcn = len(mcn_df)
-        mcn_df = mcn_df[~mcn_df['合同编号'].map(lambda value: _contract_number_key(value) in forced_keys)].copy()
-        print(f'[合同迁移-一般流程] 普通MCN结果剔除强制追加重复: {before_mcn - len(mcn_df)} 条')
+    if disable_filters:
+        forced_mcn_df = pd.DataFrame()
+    else:
+        forced_mcn_df = _timed('read_source/强制追加一般合同(uf_htk)', read_forced_general_contract_source)
+        forced_keys = set(forced_mcn_df.get('合同编号', pd.Series(dtype=object)).map(_contract_number_key))
+        if forced_keys:
+            before_mcn = len(mcn_df)
+            mcn_df = mcn_df[~mcn_df['合同编号'].map(lambda value: _contract_number_key(value) in forced_keys)].copy()
+            print(f'[合同迁移-一般流程] 普通MCN结果剔除强制追加重复: {before_mcn - len(mcn_df)} 条')
 
     # ---- 源2: 赛事 合同审批台账 uf_htsp(htzt=0/1 审批中/归档); 与 MCN 重叠的编号让位给 MCN ----
-    htsp_df = _timed('read_source/赛事取数(uf_htsp)', lambda: c.query_db(
-        'FW', 'vspn_xtyy', SOURCE_SQL_HTSP, {'htsp_status_codes': HTSP_MIGRATION_STATUS_CODES}))
+    htsp_sql = SOURCE_SQL_HTSP_ALL if disable_filters else SOURCE_SQL_HTSP
+    htsp_label = 'read_source/赛事全量取数(uf_htsp)' if disable_filters else 'read_source/赛事取数(uf_htsp)'
+    htsp_df = _timed(htsp_label, lambda: c.query_db(
+        'FW', 'vspn_xtyy', htsp_sql, {'htsp_status_codes': HTSP_MIGRATION_STATUS_CODES}))
     htsp_df['数据来源'] = '泛微(赛事)'
     htsp_df['强制追加导出'] = ''
-    mcn_df, htsp_df, anti_bribery_excluded_df = _exclude_anti_bribery_contracts(mcn_df, htsp_df)
-    mcn_codes = set(mcn_df['合同编号'].map(_text))
-    before = len(htsp_df)
-    htsp_df = htsp_df[~htsp_df['合同编号'].map(_text).isin(mcn_codes)].copy()
-    print(f'[合同迁移-一般流程] 赛事(uf_htsp) 反贿赂排除后行数 {before}; 去重(MCN优先)后 {len(htsp_df)}')
+    if disable_filters:
+        anti_bribery_excluded_df = pd.DataFrame()
+        print(f'[合同迁移-一般流程] special任务: 赛事(uf_htsp) 全量保留 {len(htsp_df)} 行,不做反贿赂排除/MCN优先去重')
+    else:
+        mcn_df, htsp_df, anti_bribery_excluded_df = _exclude_anti_bribery_contracts(mcn_df, htsp_df)
+        mcn_codes = set(mcn_df['合同编号'].map(_text))
+        before = len(htsp_df)
+        htsp_df = htsp_df[~htsp_df['合同编号'].map(_text).isin(mcn_codes)].copy()
+        print(f'[合同迁移-一般流程] 赛事(uf_htsp) 反贿赂排除后行数 {before}; 去重(MCN优先)后 {len(htsp_df)}')
 
     resolved_mcn = _timed('read_source/解析MCN(%d行)' % len(mcn_df),
                           lambda: resolve_source_values(mcn_df, option_table=FW_TABLE))
@@ -2704,14 +2794,37 @@ def read_source():
     )
 
     merged = pd.concat([resolved_mcn, resolved_htsp, resolved_forced_mcn], ignore_index=True)
-    merged, project_filter_excluded_df = _timed(
-        'read_source/泛微项目编码白名单过滤',
-        lambda: _filter_by_contract_project_whitelist(merged),
-    )
-    merged, approval_status_excluded_df = _timed(
-        'read_source/合同审批状态过滤',
-        lambda: _filter_by_approval_status(merged),
-    )
+    if disable_filters:
+        merged = _timed('read_source/contract_general_db已导入标记', lambda: _mark_general_imported_for_special(merged))
+        project_filter_excluded_df = pd.DataFrame()
+        approval_status_excluded_df = pd.DataFrame()
+        print(f'[合同迁移-一般流程] special任务跳过全部过滤: 保留 {len(merged)} 行')
+    elif skip_project_whitelist:
+        original_filtered_df, project_filter_excluded_df = _timed(
+            'read_source/contract_general_db项目白名单标记',
+            lambda: _filter_by_contract_project_whitelist(merged),
+        )
+        general_imported_keys = set(original_filtered_df['合同编号'].map(_contract_number_key))
+        merged = merged.copy()
+        merged['contract_general_db已导入'] = merged['合同编号'].map(
+            lambda value: 'Y' if _contract_number_key(value) in general_imported_keys else 'N')
+        merged['contract_general_db项目白名单结果'] = merged['contract_general_db已导入'].map(
+            lambda value: '通过原项目白名单' if value == 'Y' else '未通过原项目白名单')
+        print(f'[合同迁移-一般流程] special任务跳过项目白名单过滤: 保留 {len(merged)} 行')
+    else:
+        merged, project_filter_excluded_df = _timed(
+            'read_source/泛微项目编码白名单过滤',
+            lambda: _filter_by_contract_project_whitelist(merged),
+        )
+        if mark_general_imported:
+            merged = merged.copy()
+            merged['contract_general_db已导入'] = 'Y'
+            merged['contract_general_db项目白名单结果'] = '通过原项目白名单'
+    if not disable_filters:
+        merged, approval_status_excluded_df = _timed(
+            'read_source/合同审批状态过滤',
+            lambda: _filter_by_approval_status(merged),
+        )
     _merge_attrs(merged, [resolved_mcn, resolved_htsp, resolved_forced_mcn])
     merged.attrs['anti_bribery_excluded'] = anti_bribery_excluded_df
     merged.attrs['project_filter_excluded'] = project_filter_excluded_df
@@ -3320,6 +3433,39 @@ def build_project_filter_excluded_df(source_df):
     return _audit_df(excluded, columns)
 
 
+def build_general_import_marker_df(source_df):
+    columns = [
+        '数据来源', '合同编号', '合同标题', '合同签署状态ID', '合同签署状态', '合同审批状态',
+        '泛微项目编号', '泛微项目名称', '项目编号', '项目名称',
+        'contract_general_db已导入', 'contract_general_db项目白名单结果',
+    ]
+    if source_df.empty:
+        return pd.DataFrame(columns=columns)
+    marker = _audit_df(source_df, columns)
+    if 'contract_general_db已导入' not in source_df.columns:
+        marker['contract_general_db已导入'] = 'Y'
+    if 'contract_general_db项目白名单结果' not in source_df.columns:
+        marker['contract_general_db项目白名单结果'] = '通过原项目白名单'
+    return marker.reindex(columns=columns)
+
+
+def append_general_import_marker_columns(main_output_df, source_df):
+    if main_output_df.empty:
+        main_output_df['已导入任务'] = ''
+        main_output_df['导入标记说明'] = ''
+        return main_output_df
+    output_df = main_output_df.copy()
+    output_df['已导入任务'] = source_df.get(
+        '已导入任务',
+        pd.Series('', index=source_df.index),
+    ).map(_text).to_numpy()
+    output_df['导入标记说明'] = source_df.get(
+        '导入标记说明',
+        pd.Series('', index=source_df.index),
+    ).map(_text).to_numpy()
+    return output_df
+
+
 def build_approval_status_excluded_df(source_df):
     excluded = source_df.attrs.get('approval_status_excluded')
     columns = [
@@ -3372,14 +3518,32 @@ def build_supplement_amount_backtest_df(source_df):
     return pd.DataFrame(rows)
 
 
-def run():
+def run(
+    task_label='合同迁移-一般流程',
+    output_file=OUTPUT_FILE,
+    exception_file=EXCEPTION_FILE,
+    skip_project_whitelist=False,
+    disable_filters=False,
+    include_general_import_marker=False,
+    marker_in_main_sheet=False,
+    write_exception_file=True,
+):
     headers_by_sheet = _template_headers()
     required_by_sheet, remarks_by_sheet = _read_general_required_rules(headers_by_sheet)
 
-    source_df = _timed('阶段1: read_source(读数+解析+合并)', read_source)
+    source_df = _timed(
+        '阶段1: read_source(读数+解析+合并)',
+        lambda: read_source(
+            skip_project_whitelist=skip_project_whitelist,
+            mark_general_imported=include_general_import_marker,
+            disable_filters=disable_filters,
+        ),
+    )
 
     print('[计时] === 阶段2: 构建各 sheet ===', flush=True)
     main_output_df = _timed('build 字段模板', lambda: build_main_output(source_df, headers_by_sheet[SHEET_MAIN]))
+    if marker_in_main_sheet:
+        main_output_df = append_general_import_marker_columns(main_output_df, source_df)
     relation_output_df, relation_source_df = _timed(
         'build 关联合同', lambda: build_relation_output(source_df, headers_by_sheet[SHEET_RELATION]))
     related_order_output_df = _timed(
@@ -3424,8 +3588,15 @@ def run():
     print('[计时] === 阶段3: 写出 Excel ===', flush=True)
     cat_audit = _timed('build 合同分类核对', lambda: build_category_audit_df(source_df))
     ord_audit = _timed('build 订单映射核对', lambda: build_order_audit_df(source_df))
-    output_file = _timed('写出导入Excel(单次load/save)', lambda: _write_template_sheets_with_fallback(
-        TEMPLATE_FILE, OUTPUT_FILE, {
+    extra_sheets = {
+        '合同分类核对': cat_audit,
+        '订单映射核对': ord_audit,
+    }
+    if include_general_import_marker and not marker_in_main_sheet:
+        extra_sheets['contract_general_db已导入标记'] = build_general_import_marker_df(source_df)
+
+    output_path = _timed('写出导入Excel(单次load/save)', lambda: _write_template_sheets_with_fallback(
+        TEMPLATE_FILE, output_file, {
             SHEET_MAIN: main_output_df,
             SHEET_RELATION: relation_output_df,
             SHEET_RELATED_ORDER: related_order_output_df,
@@ -3437,8 +3608,12 @@ def run():
             SHEET_COLLECTION_PLAN: collection_plan_output_df,
             SHEET_CONTRACT_ATTACHMENT: contract_attachment_output_df,
             SHEET_OTHER_ATTACHMENT: other_attachment_output_df,
-        }, extra_sheets={'合同分类核对': cat_audit, '订单映射核对': ord_audit}))
-    print('已写出:', output_file)
+        }, extra_sheets=extra_sheets))
+    print('已写出:', output_path)
+
+    if not write_exception_file:
+        print(f'[{task_label}] 跳过未匹配/错误清单输出')
+        return output_path
 
     exception_sheets = {
         '过滤状态分布': build_status_breakdown(),
@@ -3537,9 +3712,9 @@ def run():
         project_name_col='项目名称',
     ))
 
-    exception_file = _write_exceptions_with_fallback(EXCEPTION_FILE, exception_sheets)
-    if exception_file:
-        print('已写出:', exception_file)
+    exception_path = _write_exceptions_with_fallback(exception_file, exception_sheets)
+    if exception_path:
+        print('已写出:', exception_path)
 
 
 if __name__ == '__main__':
