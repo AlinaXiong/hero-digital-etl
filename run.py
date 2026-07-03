@@ -25,6 +25,7 @@ from etl.contract import (
     contract_general_db,
     contract_general_special_db,
     contract_mixed_add,
+    contract_mixed_add_attachments_db,
 )
 from etl.process import (
     ap_payment_opening_extra_db,
@@ -50,6 +51,7 @@ TASKS = {
     'contract_general_special_db': contract_general_special_db.run,  # 合同迁移 一般流程special:关闭过滤
     'contract_general_specail_db': contract_general_special_db.run,  # 兼容 specail 拼写
     'contract_mixed_add': contract_mixed_add.run,  # 混合合同清单增补:主播走主播流程,其余走一般流程
+    'contract_mixed_add_attachments_db': contract_mixed_add_attachments_db.run,  # 混合合同清单增补附件下载
     'invoice_info_db': invoice_info_db.run,               # 发票信息(DB直连版)
     'export_feishu_employees': export_feishu_employees.run,  # 飞书全量员工信息导出Excel
 }
