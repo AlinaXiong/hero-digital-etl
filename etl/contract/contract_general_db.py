@@ -27,7 +27,11 @@ if __package__ is None or __package__ == '':
 
 from etl.util import common as c
 from etl.lark import feishu
-from etl.process.ap_prepayment_opening_db import build_fw_project_code_map_for_ids
+from etl.process.ap_prepayment_opening_db import (
+    EVENT_PROJECT_TABLES,
+    MCN_PROJECT_TABLES,
+    build_fw_project_code_map_for_ids,
+)
 
 
 # ============================ 文件 / 模板 ============================
@@ -2384,7 +2388,12 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
     company_info_map = _timed('  ├─我方主体映射', lambda: build_fw_company_info_map_for_values(df['合同用印范围ID']))
     customer_info_map = _timed('  ├─客户映射', lambda: build_customer_info_map_for_values(df['合同客户ID']))
     supplier_info_map = _timed('  ├─供应商映射(汉得匹配)', lambda: build_supplier_info_map_for_values(df['合同供应商ID']))
-    project_map = _timed('  ├─项目映射', lambda: build_fw_project_code_map_for_ids(df['合同所属项目编号ID']))
+    # MCN 与赛事项目台账存在同 ID 不同项目编号的情况,必须按源表选择浏览框解析顺序。
+    project_table_order = MCN_PROJECT_TABLES if option_table == FW_TABLE else EVENT_PROJECT_TABLES
+    project_map = _timed(
+        '  ├─项目映射',
+        lambda: build_fw_project_code_map_for_ids(df['合同所属项目编号ID'], project_table_order),
+    )
     relation_info_map = _timed(
         '  ├─关联框架映射',
         lambda: build_contract_info_map_for_ids(df['关联框架协议ID'], option_table=option_table),
