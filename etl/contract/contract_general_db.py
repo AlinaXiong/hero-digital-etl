@@ -537,6 +537,9 @@ def load_saishi_order_init_mapping():
             '申请人员工编码': _text(row.get('申请人员工编码')),
             '项目编号': _text(row.get('项目编号')),
             '项目名称': _text(row.get('项目名称')),
+            '成本中心': _text(row.get('成本中心')),
+            '订单开始日': c.format_date(row.get('订单开始日')),
+            '订单结束日': c.format_date(row.get('订单结束日')),
             '映射来源': ORDER_INIT_MAPPING_SOURCE,
         }
         for oa_code in oa_codes:
@@ -568,14 +571,11 @@ def _saishi_order_init_items_for_source(row):
     return []
 
 
-def _order_init_items_for_source(row):
-    if _is_saishi_source(row):
-        return _saishi_order_init_items_for_source(row)
-
+def _order_items_from_lookup(row, lookup_func, default_mapping_source):
     items = []
     seen_orders = set()
-    for project_code in (row.get('项目编号'), row.get('泛微项目编号'), row.get('清洗后项目编号')):
-        for info in c.cleanable_order_infos_for_project(project_code):
+    for project_code in (row.get('泛微项目编号'), row.get('项目编号'), row.get('清洗后项目编号')):
+        for info in lookup_func(project_code):
             order_code = _text(info.get('订单编号'))
             if not order_code or order_code in seen_orders:
                 continue
@@ -583,16 +583,39 @@ def _order_init_items_for_source(row):
             items.append({
                 '订单编号': order_code,
                 '订单标题': _text(info.get('订单标题')),
-                '申请人员工编码': '',
+                '申请人员工编码': _text(info.get('申请人员工编码')),
                 '项目编号': _first_non_blank(*(info.get('项目编号候选') or [])),
                 '项目名称': '',
-                '映射来源': _text(info.get('映射来源')) or ORDER_INIT_MAPPING_SOURCE,
+                '成本中心': _text(info.get('成本中心')),
+                '订单开始日': c.format_date(info.get('订单开始日')),
+                '订单结束日': c.format_date(info.get('订单结束日')),
+                '映射来源': _text(info.get('映射来源')) or default_mapping_source,
             })
     return items
 
 
-def _join_order_item_field(items, field):
-    return ';'.join(c.clean_text_values(item.get(field, '') for item in items))
+def _hand_order_items_for_source(row):
+    return _order_items_from_lookup(row, c.hand_order_infos_for_project, c.HAND_ORDER_MAPPING_SOURCE)
+
+
+def _local_order_init_items_for_source(row):
+    return _order_items_from_lookup(row, c.cleanable_order_infos_for_project, ORDER_INIT_MAPPING_SOURCE)
+
+
+def _order_init_items_for_source(row):
+    hand_items = _hand_order_items_for_source(row)
+    if hand_items:
+        return hand_items
+    if _is_saishi_source(row):
+        return _saishi_order_init_items_for_source(row)
+    return _local_order_init_items_for_source(row)
+
+
+def _join_order_item_field(items, field, unique=False):
+    values = [_text(item.get(field, '')) for item in items]
+    if unique:
+        values = c.clean_text_values(values)
+    return ';'.join(value for value in values if value)
 
 
 def _number(value, default=0.0):
@@ -1768,7 +1791,7 @@ def _cleanable_order_infos_for_source(row):
             ]
         infos = []
         for code in _split_multi_values(order_code):
-            info = c.cleanable_order_info_for_order(code)
+            info = c.hand_order_info_for_order(code) or c.cleanable_order_info_for_order(code)
             if info:
                 infos.append(info)
         if infos:
@@ -1777,7 +1800,15 @@ def _cleanable_order_infos_for_source(row):
         return []
     infos = []
     seen_orders = set()
-    for project_code in (row.get('项目编号'), row.get('泛微项目编号'), row.get('清洗后项目编号')):
+    for project_code in (row.get('泛微项目编号'), row.get('项目编号'), row.get('清洗后项目编号')):
+        for info in c.hand_order_infos_for_project(project_code):
+            order = _text(info.get('订单编号'))
+            if order and order not in seen_orders:
+                seen_orders.add(order)
+                infos.append(info)
+    if infos:
+        return infos
+    for project_code in (row.get('泛微项目编号'), row.get('项目编号'), row.get('清洗后项目编号')):
         for info in c.cleanable_order_infos_for_project(project_code):
             order = _text(info.get('订单编号'))
             if order and order not in seen_orders:
@@ -2400,9 +2431,14 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
     )
     currency_name_map = _timed('  ├─收支币种映射', lambda: c.build_fw_currency_name_map_for_ids(
         pd.concat([df['收入币种ID'], df['支出币种ID']], ignore_index=True)))
+    cost_center_name_map = _timed('  ├─成本中心名称映射',
+                                  lambda: c.build_fw_cost_center_map_for_ids(
+                                      df.get('成本中心ID', pd.Series(dtype=object))))
     cost_center_platform_map = _timed('  └─成本中心平台映射',
                                       lambda: build_cost_center_platform_map(df.get('成本中心ID', pd.Series(dtype=object))))
 
+    df['成本中心'] = df.get('成本中心ID', pd.Series('', index=df.index)).map(
+        lambda value: _lookup_first_browser_value(cost_center_name_map, value))
     df['成本中心平台'] = df.get('成本中心ID', pd.Series('', index=df.index)).map(
         lambda value: _lookup_first_browser_value(cost_center_platform_map, value))
     df['合同类型'] = df['合同类型ID'].map(lambda value: option_maps.get('htlx', {}).get(c.format_code(value), ''))
@@ -2505,6 +2541,9 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
     has_order_init_items = order_init_items.map(bool)
     df['订单编号'] = ''
     df['订单名称'] = ''
+    df['订单成本中心'] = ''
+    df['订单开始日'] = ''
+    df['订单结束日'] = ''
     df['订单映射来源'] = ''
     df['订单申请人员工编码'] = ''
     if bool(has_order_init_items.any()):
@@ -2512,10 +2551,16 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
             lambda items: _join_order_item_field(items, '订单编号'))
         df.loc[has_order_init_items, '订单名称'] = order_init_items[has_order_init_items].map(
             lambda items: _join_order_item_field(items, '订单标题'))
+        df.loc[has_order_init_items, '订单成本中心'] = order_init_items[has_order_init_items].map(
+            lambda items: _join_order_item_field(items, '成本中心'))
+        df.loc[has_order_init_items, '订单开始日'] = order_init_items[has_order_init_items].map(
+            lambda items: _join_order_item_field(items, '订单开始日'))
+        df.loc[has_order_init_items, '订单结束日'] = order_init_items[has_order_init_items].map(
+            lambda items: _join_order_item_field(items, '订单结束日'))
         df.loc[has_order_init_items, '订单申请人员工编码'] = order_init_items[has_order_init_items].map(
             lambda items: _join_order_item_field(items, '申请人员工编码'))
         df.loc[has_order_init_items, '订单映射来源'] = order_init_items[has_order_init_items].map(
-            lambda items: _join_order_item_field(items, '映射来源'))
+            lambda items: _join_order_item_field(items, '映射来源', unique=True))
     saishi_mask = df['数据来源'].map(_text).eq('泛微(赛事)')
     saishi_has_order = saishi_mask & has_order_init_items
     if bool(saishi_mask.any()):
@@ -2969,6 +3014,9 @@ def build_relation_output(source_df, headers):
 def _order_entries_for_source(source):
     order_codes = _split_multi_values(source.get('订单编号'))
     order_names = _split_joined_field(source.get('订单名称'))
+    order_cost_centers = _split_joined_field(source.get('订单成本中心'))
+    order_start_dates = _split_joined_field(source.get('订单开始日'))
+    order_end_dates = _split_joined_field(source.get('订单结束日'))
     entries = []
     seen = set()
     for index, order_code in enumerate(order_codes):
@@ -2978,9 +3026,18 @@ def _order_entries_for_source(source):
         entries.append({
             '订单编号': order_code,
             '订单名称': order_names[index] if index < len(order_names) else '',
+            '成本中心': order_cost_centers[index] if index < len(order_cost_centers) else '',
+            '订单开始日': order_start_dates[index] if index < len(order_start_dates) else '',
+            '订单结束日': order_end_dates[index] if index < len(order_end_dates) else '',
         })
     if not entries and order_names:
-        entries.append({'订单编号': '', '订单名称': order_names[0]})
+        entries.append({
+            '订单编号': '',
+            '订单名称': order_names[0],
+            '成本中心': order_cost_centers[0] if order_cost_centers else '',
+            '订单开始日': order_start_dates[0] if order_start_dates else '',
+            '订单结束日': order_end_dates[0] if order_end_dates else '',
+        })
     return entries
 
 
@@ -3026,12 +3083,16 @@ def build_order_detail_output(source_df, headers):
             _set(row, 'contract_number（合同编码）', _text(source['合同编号']))
             _set(row, 'custom_1_5549b19faea641eeac924deada603c11（订单名称）', order_name)
             _set(row, 'custom_1_7f977c0d30064dd199434f706470c669（订单编号）', order_code)
-            _set(row, 'custom_16_3171b080033943c9a98380f20e0895a8（成本中心）', '')
-            start_date = c.format_date(source['合同有效期起始时间'])
-            end_date = c.format_date(source['合同有效期截止时间'])
-            period = f'{start_date}~{end_date}'.strip('~')
+            _set(row, 'custom_16_3171b080033943c9a98380f20e0895a8（成本中心）',
+                 _first_non_blank(entry.get('成本中心'), source.get('成本中心')))
+            order_start_date = c.format_date(entry.get('订单开始日'))
+            order_end_date = c.format_date(entry.get('订单结束日'))
+            order_period = f'{order_start_date}~{order_end_date}'.strip('~')
+            contract_start_date = c.format_date(source['合同有效期起始时间'])
+            contract_end_date = c.format_date(source['合同有效期截止时间'])
+            contract_period = f'{contract_start_date}~{contract_end_date}'.strip('~')
             _set(row, 'custom_12_d67e0d9472134b1cba5187e192bb2670（订单周期）',
-                 _first_non_blank(period, c.format_date(source['合同签订日期'])))
+                 _first_non_blank(order_period, contract_period, c.format_date(source['合同签订日期'])))
             _set(row, 'custom_1001_b193503253664cf28b2ca1c3f57b68b3（项目经理）飞书user_id', '')
             _set(row, 'custom_1001_0a61d360dcad4265a68d2555d17e896e（日常费用组）飞书user_id', '')
             _set(row, 'custom_1001_f8f9114f511346f9adc7fabae012f17a（项目验收岗）飞书user_id', '')
@@ -3042,6 +3103,9 @@ def build_order_detail_output(source_df, headers):
             source_row = dict(source)
             source_row['订单编号'] = order_code
             source_row['订单名称'] = order_name
+            source_row['订单成本中心'] = _text(entry.get('成本中心'))
+            source_row['订单开始日'] = _text(entry.get('订单开始日'))
+            source_row['订单结束日'] = _text(entry.get('订单结束日'))
             source_rows.append(source_row)
     return pd.DataFrame(rows, columns=headers), pd.DataFrame(source_rows)
 

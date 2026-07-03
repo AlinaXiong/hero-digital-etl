@@ -1,18 +1,18 @@
 param(
-  [string]$Url = "http://api.link.heroesports.com/hfbs/v1/0/system-vender?page=0&size=10",
+  [string]$Url = "http://api.link.heroesports.com/hfins/v2/0/anchor/anchor-profiles/list-records?page=0&size=10",
   [int]$DelayMs = 200,
   [int]$TimeoutSeconds = 10,
   [string]$TokenUrl = "http://api.link.heroesports.com/oauth/oauth/token",
   [string]$GrantType = "client_credentials",
   [string]$ClientId = "interface",
   [string]$ClientSecret = "pN2fD7vK4bM9",
-  [string]$BearerToken = "e96e10f1-f67e-4fdf-87ed-a20e3eb199d1",
+  [string]$BearerToken = "cd93af67-4f48-4e9e-845d-1a43fb5640e3",
   [string]$Cookie = "",
   [string]$LogPath = ""
 )
 
 if ([string]::IsNullOrWhiteSpace($LogPath)) {
-  $LogPath = Join-Path $PSScriptRoot ("continuous-request-hfbs-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+  $LogPath = Join-Path $PSScriptRoot ("continuous-request-hfins-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
 }
 
 $total = 0

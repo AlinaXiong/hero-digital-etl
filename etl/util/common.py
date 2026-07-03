@@ -41,6 +41,7 @@ PROJECT_ORDER_MAPPING_ENV = 'PROJECT_ORDER_MAPPING_XLSX'
 PROJECT_ORDER_MAPPING_XLSX_NAME = '订单申请初始化导入-基础信息+财务信息.xlsx'
 PROJECT_ORDER_INIT_SHEET = '基础信息+财务信息'
 PROJECT_ORDER_INIT_KEY_COLUMN = 'OA编号'
+HAND_ORDER_MAPPING_SOURCE = '汉得DB:hfins.prj_order_dim_value.oa_number'
 AP_PROJECT_ORDER_FIXED_OVERRIDES = {
     'V-303': {
         '订单编号': 'A04-2026-0151-M001',
@@ -80,6 +81,7 @@ _PROJECT_ORDER_MAPPING_CACHE = None
 _ORDER_MULTI_MAPPING_FIX_CACHE = None
 _CLEANED_PROJECT_MAPPING_CACHE = None
 _CLEANABLE_ORDER_INFO_CACHE = None
+_HAND_ORDER_INFO_CACHE = None
 
 ATTACHMENT_COOKIE_ENV = 'WEAVER_CONTRACT_ATTACHMENT_COOKIE'
 ATTACHMENT_BASE_URL_ENV = 'WEAVER_CONTRACT_ATTACHMENT_BASE_URL'
@@ -2038,6 +2040,9 @@ def _build_order_init_candidates(mapping_file):
                 '订单标题': _cell_text(order_row.get('订单标题', '')),
                 '项目编号': project_code,
                 '项目名称': _cell_text(order_row.get('项目名称', '')),
+                '成本中心': _cell_text(order_row.get('成本中心', '')),
+                '订单开始日': _cell_text(order_row.get('订单开始日', '')),
+                '订单结束日': _cell_text(order_row.get('订单结束日', '')),
                 '映射来源': source_label,
             })
 
@@ -2045,7 +2050,10 @@ def _build_order_init_candidates(mapping_file):
         return _empty_order_candidates_df()
     return pd.DataFrame(
         rows,
-        columns=['泛微项目编号', '订单编号', '订单标题', '项目编号', '项目名称', '映射来源'],
+        columns=[
+            '泛微项目编号', '订单编号', '订单标题', '项目编号', '项目名称',
+            '成本中心', '订单开始日', '订单结束日', '映射来源',
+        ],
     ).drop_duplicates()
 
 
@@ -2061,6 +2069,9 @@ def _build_order_info_maps_from_candidates(mapping_df, mapping_file, log_label):
             '订单编号': order_code,
             '订单标题': _cell_text(row.get('订单标题')),
             '项目编号候选': project_codes,
+            '成本中心': _cell_text(row.get('成本中心')),
+            '订单开始日': _cell_text(row.get('订单开始日')),
+            '订单结束日': _cell_text(row.get('订单结束日')),
             '项目经理A': '',
             '项目经理B': '',
             '项目经理候选': [],
@@ -2087,6 +2098,99 @@ def _build_order_info_maps_from_candidates(mapping_df, mapping_file, log_label):
         f'项目 {len(by_project)} 个',
     )
     return by_order, by_project
+
+
+def _build_hand_order_candidates():
+    """从汉得订单维值表读取 OA编号 -> 订单信息候选。"""
+    mapping_df = query_db(
+        'HAND',
+        'hfins',
+        '''
+        SELECT
+            d.oa_number AS `泛微项目编号`,
+            d.prj_dim_order_value AS `订单编号`,
+            COALESCE(NULLIF(h.order_title, ''), d.order_name) AS `订单标题`,
+            COALESCE(NULLIF(h.prj_dim_value, ''), d.prj_dim_value) AS `项目编号`,
+            h.project_name AS `项目名称`,
+            h.cost_center AS `成本中心编码`,
+            cost_center.responsibility_center_name AS `成本中心`,
+            h.order_start_date AS `订单开始日`,
+            h.order_end_date AS `订单结束日`
+        FROM prj_order_dim_value d
+        LEFT JOIN prj_requisition_order_header h
+          ON h.order_header_id = d.order_header_id
+        LEFT JOIN hfins_base_account.hfac_sob_resp_center cost_center
+          ON cost_center.responsibility_center_code = h.cost_center
+         AND cost_center.set_of_books_code = '0001'
+        WHERE d.oa_number IS NOT NULL
+          AND TRIM(d.oa_number) <> ''
+          AND d.prj_dim_order_value IS NOT NULL
+          AND TRIM(d.prj_dim_order_value) <> ''
+        ORDER BY d.oa_number, d.prj_dim_order_value
+        ''',
+    )
+    rows = []
+    for _, order_row in mapping_df.iterrows():
+        fanwei_projects = split_fanwei_project_codes(order_row.get('泛微项目编号', ''))
+        order_code = _cell_text(order_row.get('订单编号', ''))
+        if not fanwei_projects or not order_code:
+            continue
+        for fanwei_project in fanwei_projects:
+            rows.append({
+                '泛微项目编号': fanwei_project,
+                '订单编号': order_code,
+                '订单标题': _cell_text(order_row.get('订单标题', '')),
+                '项目编号': _cell_text(order_row.get('项目编号', '')),
+                '项目名称': _cell_text(order_row.get('项目名称', '')),
+                '成本中心': (
+                    _cell_text(order_row.get('成本中心', ''))
+                    or _cell_text(order_row.get('成本中心编码', ''))
+                ),
+                '订单开始日': format_date(order_row.get('订单开始日')),
+                '订单结束日': format_date(order_row.get('订单结束日')),
+                '映射来源': HAND_ORDER_MAPPING_SOURCE,
+            })
+
+    if not rows:
+        return _empty_order_candidates_df()
+    return pd.DataFrame(
+        rows,
+        columns=[
+            '泛微项目编号', '订单编号', '订单标题', '项目编号', '项目名称',
+            '成本中心', '订单开始日', '订单结束日', '映射来源',
+        ],
+    ).drop_duplicates()
+
+
+def load_hand_order_info():
+    """读取汉得订单:按 OA编号(旧泛微项目编号) 建立订单/项目候选。"""
+    global _HAND_ORDER_INFO_CACHE
+    if _HAND_ORDER_INFO_CACHE is not None:
+        return _HAND_ORDER_INFO_CACHE
+    try:
+        mapping_df = _build_hand_order_candidates()
+    except Exception as error:
+        print(f'[汉得订单映射] 读取汉得订单失败,将回退到本地订单初始化表: {error}')
+        _HAND_ORDER_INFO_CACHE = ({}, {}, HAND_ORDER_MAPPING_SOURCE)
+        return _HAND_ORDER_INFO_CACHE
+
+    by_order, by_project = _build_order_info_maps_from_candidates(
+        mapping_df,
+        HAND_ORDER_MAPPING_SOURCE,
+        '汉得订单维值表:',
+    )
+    _HAND_ORDER_INFO_CACHE = (by_order, by_project, HAND_ORDER_MAPPING_SOURCE)
+    return _HAND_ORDER_INFO_CACHE
+
+
+def hand_order_info_for_order(order_code):
+    by_order, _, _ = load_hand_order_info()
+    return by_order.get(_cell_text(order_code), {})
+
+
+def hand_order_infos_for_project(project_code):
+    _, by_project, _ = load_hand_order_info()
+    return by_project.get(_cell_text(project_code), [])
 
 
 def load_cleaned_project_mapping():
@@ -2116,7 +2220,7 @@ def split_person_names(value):
 
 
 def _merge_cleanable_order_info(target, incoming):
-    for field in ('订单编号', '订单标题', '映射来源'):
+    for field in ('订单编号', '订单标题', '成本中心', '订单开始日', '订单结束日', '映射来源'):
         if not target.get(field) and incoming.get(field):
             target[field] = incoming[field]
     for field in ('项目经理A', '项目经理B'):
@@ -2183,7 +2287,10 @@ def _empty_order_presence_df():
 
 
 def _empty_order_candidates_df():
-    return pd.DataFrame(columns=['泛微项目编号', '订单编号', '订单标题', '项目编号', '项目名称', '映射来源'])
+    return pd.DataFrame(columns=[
+        '泛微项目编号', '订单编号', '订单标题', '项目编号', '项目名称',
+        '成本中心', '订单开始日', '订单结束日', '映射来源',
+    ])
 
 
 def _build_project_order_presence(mapping_file):
@@ -2198,7 +2305,10 @@ def _build_project_order_candidates(mapping_file):
     mapping_df = _build_order_init_candidates(mapping_file)
     print(f'[项目订单映射] 订单申请初始化导入表: {len(mapping_df)} 行,不按 Y 过滤')
     return mapping_df[
-        ['泛微项目编号', '订单编号', '订单标题', '项目编号', '项目名称', '映射来源']
+        [
+            '泛微项目编号', '订单编号', '订单标题', '项目编号', '项目名称',
+            '成本中心', '订单开始日', '订单结束日', '映射来源',
+        ]
     ]
 
 
@@ -2227,6 +2337,9 @@ def load_project_order_mapping():
                 '订单标题': row['订单标题'],
                 '项目编号': row['项目编号'],
                 '项目名称': row['项目名称'],
+                '成本中心': row.get('成本中心', ''),
+                '订单开始日': row.get('订单开始日', ''),
+                '订单结束日': row.get('订单结束日', ''),
                 '映射来源': row['映射来源'],
             }
         else:
