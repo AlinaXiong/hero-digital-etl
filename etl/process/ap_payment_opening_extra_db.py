@@ -2205,7 +2205,7 @@ def _build_external_side_rows(source_df, side):
 
 def build_external_cost_output(source_df):
     if source_df.empty:
-        return pd.DataFrame(columns=OUTPUT_COLUMNS)
+        return pd.DataFrame(columns=OUTPUT_COLUMNS), source_df.copy()
 
     expanded_df = pd.concat([
         _build_external_side_rows(source_df, 'in'),

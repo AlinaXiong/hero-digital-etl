@@ -3,9 +3,10 @@
 
 同一份业务清单里可能同时包含一般流程合同和主播流程合同。本任务只负责:
 
-1. 读取清单并剔除已导入/已由 contract_general_add 处理/重复编号;
+1. 读取清单并剔除已导入/重复编号;
 2. 按 Excel 智书合同类型或泛微合同类型分流:主播类走 contract_anchor_db,其余走 contract_general_db;
-3. 复用两个主任务的解析与导出 builder,分别生成主播/一般流程导入 Excel。
+3. 复用两个主任务的解析与导出 builder,生成一个混合导入 Excel:一般流程占前 9 个 sheet,
+   主播流程占后 4 个 sheet。
 
 运行方式::
 
@@ -19,10 +20,13 @@ from __future__ import annotations
 
 import os
 import re
+import json
+from copy import copy
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+from openpyxl import load_workbook
 
 from etl.contract import contract_anchor_db as anchor
 from etl.contract import contract_general_add as general_add
@@ -41,7 +45,48 @@ INPUT_FILE = Path(os.getenv(
 DATE_SUFFIX = general.DATE_SUFFIX
 GENERAL_OUTPUT_FILE = OUTPUT_DIR / f'智书合同字段_一般流程_混合增补_{DATE_SUFFIX}.xlsx'
 ANCHOR_OUTPUT_FILE = OUTPUT_DIR / f'智书合同字段_主播流程_混合增补_{DATE_SUFFIX}.xlsx'
+MIXED_OUTPUT_FILE = OUTPUT_DIR / f'智书合同字段_混合增补_{DATE_SUFFIX}.xlsx'
+MIXED_ATTACHMENT_ROOT = OUTPUT_DIR / f'混合增补合同附件_{DATE_SUFFIX}'
+ARCHIVED_REQUEST_FILE = OUTPUT_DIR / f'智书合同同步请求_归档_9_{DATE_SUFFIX}.json'
+OTHER_REQUEST_FILE = OUTPUT_DIR / f'智书合同同步请求_其他_0_{DATE_SUFFIX}.json'
 AUDIT_FILE = OUTPUT_DIR / f'混合增补处理清单_{DATE_SUFFIX}.xlsx'
+
+# ZhiShuSynServiceImpl.SheetRole uses fixed workbook indexes instead of sheet names.
+# Keep these slots synchronized with the Java enum: general 0-8, anchor 9-12.
+JAVA_GENERAL_SHEET_NAMES = (
+    '一般流程主表',
+    '关联合同',
+    '相关订单-订单信息',
+    '采购申请',
+    '订单信息明细',
+    '对方信息',
+    '我方主体列表',
+    '付款计划',
+    '收款计划',
+)
+JAVA_ANCHOR_SHEET_NAMES = (
+    '主播流程主表',
+    '主播流程_对方信息',
+    '主播流程_我方信息',
+    '主播流程_费用明细',
+)
+GENERAL_SOURCE_TO_JAVA_SHEET_NAMES = {
+    general.SHEET_MAIN: JAVA_GENERAL_SHEET_NAMES[0],
+    general.SHEET_RELATION: JAVA_GENERAL_SHEET_NAMES[1],
+    general.SHEET_RELATED_ORDER: JAVA_GENERAL_SHEET_NAMES[2],
+    general.SHEET_PURCHASE_REQUEST: JAVA_GENERAL_SHEET_NAMES[3],
+    general.SHEET_ORDER_DETAIL: JAVA_GENERAL_SHEET_NAMES[4],
+    general.SHEET_COUNTERPARTY: JAVA_GENERAL_SHEET_NAMES[5],
+    general.SHEET_OUR_PARTY: JAVA_GENERAL_SHEET_NAMES[6],
+    general.SHEET_PAYMENT_PLAN: JAVA_GENERAL_SHEET_NAMES[7],
+    general.SHEET_COLLECTION_PLAN: JAVA_GENERAL_SHEET_NAMES[8],
+}
+ANCHOR_SOURCE_TO_JAVA_SHEET_NAMES = {
+    anchor.SHEET_MAIN: JAVA_ANCHOR_SHEET_NAMES[0],
+    anchor.SHEET_COUNTERPARTY: JAVA_ANCHOR_SHEET_NAMES[1],
+    anchor.SHEET_OUR_PARTY: JAVA_ANCHOR_SHEET_NAMES[2],
+    anchor.SHEET_FEE_DETAIL: JAVA_ANCHOR_SHEET_NAMES[3],
+}
 
 GENERAL_ADD_SOURCE_FILES = (
     general_add.MISSING_INPUT_FILE,
@@ -55,6 +100,55 @@ STATUS_COLUMN_CANDIDATES = ('导入状态', '状态', '是否导入', '导入标
 TYPE_COLUMN_CANDIDATES = ('智书合同类型', '合同类型', 'contractCategory(智书框架合同类型)')
 ORDER_COLUMN_CANDIDATES = ('关联业财订单', '订单编号')
 OLD_CODE_COLUMN_CANDIDATES = ('老泛微编码', '泛微编码', 'OA编号')
+
+EXCLUDED_CONTRACT_NUMBERS = frozenset({
+    'H-DF2025070326',
+    'H-DF2025080282',
+    'H-DF2025090217',
+    'H-DF2025100218',
+    'H-DF2025110097',
+    'H-DF2025110417',
+    'H-DF2025110418',
+    'H-DF2025120085',
+    'H-DF2025120203',
+    'H-DF2025120221',
+    'H-DF2025120227',
+    'H-DF2025120228',
+    'H-DF2025120229',
+    'H-DF2026030454',
+    'H-DS2024120042',
+    'H-KF2023040006',
+    'H-KF2026030029',
+    'H-KS2024080001',
+    'H-OF2025100064',
+    'H-OF2025100071',
+    'H-OF2026010010',
+    'H-OF2026010043',
+    'H-OF2026010064',
+    'H-OF2026010065',
+    'H-OF2026020005',
+    'H-OF2026020009',
+    'H-OF2026030008',
+    'H-OF2026030009',
+    'H-OF2026030010',
+    'H-OF2026030014',
+    'H-OF2026030028',
+    'H-OF2026030049',
+    'H-OF2026030072',
+    'H-OF2026040005',
+    'H-OF2026040017',
+    'H-OF2026040033',
+    'H-OF2026040047',
+    'H-OF2026050001',
+    'H-OF2026050006',
+    'H-OF2026060001',
+    'H-OF2026060015',
+    'H-OF2026060043',
+    'H-OF2026060047',
+    'H-S201804001',
+    'H-S201905003',
+    'H-S202003039-S01',
+})
 
 
 def _text(value):
@@ -88,6 +182,8 @@ def _read_mixed_input(path):
     if not path.exists():
         raise FileNotFoundError(f'混合增补输入文件不存在: {path}')
 
+    # 输入清单的「创建人」仅是业务备注，禁止参与导入值映射。
+    # 合同创建人必须由 general/anchor 原流程从泛微源数据解析并执行离职替换规则。
     sheets = pd.read_excel(path, sheet_name=None, dtype=object)
     rows = []
     skipped_sheets = []
@@ -178,17 +274,17 @@ def _load_general_add_processed_keys():
     return processed_keys, exclude_df
 
 
-def _apply_input_exclusions(input_df, general_add_keys):
+def _apply_input_exclusions(input_df, _general_add_keys):
     result = input_df.copy()
     reasons = [[] for _ in range(len(result))]
     marked = result['导入状态'].map(lambda value: '已导入' in _text(value))
-    in_general_add = result['合同key'].isin(general_add_keys)
+    explicitly_excluded = result['合同key'].isin(EXCLUDED_CONTRACT_NUMBERS)
     for pos, is_marked in enumerate(marked):
         if is_marked:
             reasons[pos].append('表格导入状态标注已导入')
-    for pos, is_in_add in enumerate(in_general_add):
-        if is_in_add:
-            reasons[pos].append('属于contract_general_add.py已处理范围')
+    for pos, is_excluded in enumerate(explicitly_excluded):
+        if is_excluded:
+            reasons[pos].append('用户指定不处理')
 
     result['排除原因'] = ['; '.join(items) for items in reasons]
     processable_mask = result['排除原因'].eq('')
@@ -375,6 +471,256 @@ def _write_template_sheets_with_fallback(template_file, output_file, sheet_to_df
         return c.write_template_sheets(template_file, fallback, sheet_to_df, extra_sheets=extra_sheets)
 
 
+def _ensure_placeholder_sheets(workbook, sheet_names):
+    for sheet_name in sheet_names:
+        if sheet_name not in workbook.sheetnames:
+            workbook.create_sheet(sheet_name)
+
+
+def _move_sheet_to_index(workbook, sheet_name, target_index):
+    worksheet = workbook[sheet_name]
+    current_index = workbook.index(worksheet)
+    if current_index != target_index:
+        workbook.move_sheet(worksheet, offset=target_index - current_index)
+
+
+def _rename_general_sheets_for_sync(workbook):
+    for source_name, target_name in GENERAL_SOURCE_TO_JAVA_SHEET_NAMES.items():
+        if target_name not in workbook.sheetnames and source_name in workbook.sheetnames:
+            workbook[source_name].title = target_name
+
+
+def _rename_anchor_sheets_for_sync(workbook):
+    for source_name, target_name in ANCHOR_SOURCE_TO_JAVA_SHEET_NAMES.items():
+        if target_name not in workbook.sheetnames and source_name in workbook.sheetnames:
+            workbook[source_name].title = target_name
+
+
+def _align_sheet_order_for_zhishu_sync(output_file, flow_name):
+    """Align workbook slots with ZhiShuSynServiceImpl.SheetRole indexes."""
+    path = Path(output_file)
+    workbook = load_workbook(path)
+    if flow_name == '一般流程':
+        _rename_general_sheets_for_sync(workbook)
+        required_names = JAVA_GENERAL_SHEET_NAMES
+        placeholder_names = JAVA_ANCHOR_SHEET_NAMES
+        ordered_names = required_names + placeholder_names
+        active_index = 0
+    elif flow_name == '主播流程':
+        _rename_anchor_sheets_for_sync(workbook)
+        required_names = JAVA_ANCHOR_SHEET_NAMES
+        placeholder_names = JAVA_GENERAL_SHEET_NAMES
+        ordered_names = placeholder_names + required_names
+        active_index = 9
+    elif flow_name == '混合流程':
+        _rename_general_sheets_for_sync(workbook)
+        _rename_anchor_sheets_for_sync(workbook)
+        required_names = JAVA_GENERAL_SHEET_NAMES + JAVA_ANCHOR_SHEET_NAMES
+        placeholder_names = ()
+        ordered_names = required_names
+        active_index = 0
+    else:
+        raise ValueError(f'不支持的智书同步流程: {flow_name}')
+
+    missing_names = [name for name in required_names if name not in workbook.sheetnames]
+    if missing_names:
+        raise KeyError(f'{flow_name}输出缺少必需sheet: {missing_names}')
+
+    _ensure_placeholder_sheets(workbook, placeholder_names)
+    for target_index, sheet_name in enumerate(ordered_names):
+        _move_sheet_to_index(workbook, sheet_name, target_index)
+    for worksheet in list(workbook.worksheets):
+        if worksheet.title not in ordered_names:
+            workbook.remove(worksheet)
+    workbook.active = active_index
+    workbook.save(path)
+    print(f'[合同混合增补] 已按Java SheetRole顺序整理{flow_name}文件: {path}')
+    return path
+
+
+def _build_general_sheet_frames(source_df):
+    headers = general._template_headers()
+    if source_df.empty:
+        return headers, {
+            sheet_name: pd.DataFrame(columns=headers[sheet_name])
+            for sheet_name in GENERAL_SOURCE_TO_JAVA_SHEET_NAMES
+        }
+
+    relation_df, _ = general.build_relation_output(source_df, headers[general.SHEET_RELATION])
+    order_detail_df, _ = general.build_order_detail_output(source_df, headers[general.SHEET_ORDER_DETAIL])
+    counterparty_df, _ = general.build_counterparty_output(source_df, headers[general.SHEET_COUNTERPARTY])
+    our_party_df, _ = general.build_our_party_output(source_df, headers[general.SHEET_OUR_PARTY])
+    return headers, {
+        general.SHEET_MAIN: general.build_main_output(source_df, headers[general.SHEET_MAIN]),
+        general.SHEET_RELATION: relation_df,
+        general.SHEET_RELATED_ORDER: general.build_related_order_output(
+            source_df, headers[general.SHEET_RELATED_ORDER]),
+        general.SHEET_PURCHASE_REQUEST: general.build_purchase_request_output(
+            source_df, headers[general.SHEET_PURCHASE_REQUEST]),
+        general.SHEET_ORDER_DETAIL: order_detail_df,
+        general.SHEET_COUNTERPARTY: counterparty_df,
+        general.SHEET_OUR_PARTY: our_party_df,
+        general.SHEET_PAYMENT_PLAN: general.build_payment_plan_output(
+            source_df, headers[general.SHEET_PAYMENT_PLAN]),
+        general.SHEET_COLLECTION_PLAN: general.build_collection_plan_output(
+            source_df, headers[general.SHEET_COLLECTION_PLAN]),
+    }
+
+
+def _build_anchor_sheet_frames(source_df):
+    headers = anchor._template_headers()
+    if source_df.empty:
+        return headers, {
+            sheet_name: pd.DataFrame(columns=headers[sheet_name])
+            for sheet_name in ANCHOR_SOURCE_TO_JAVA_SHEET_NAMES
+        }
+
+    counterparty_df, _ = anchor.build_counterparty_output(source_df, headers[anchor.SHEET_COUNTERPARTY])
+    our_party_df, _ = anchor.build_our_party_output(source_df, headers[anchor.SHEET_OUR_PARTY])
+    fee_detail_df, _ = anchor.build_fee_detail_output(source_df, headers[anchor.SHEET_FEE_DETAIL])
+    return headers, {
+        anchor.SHEET_MAIN: anchor.build_main_output(source_df, headers[anchor.SHEET_MAIN]),
+        anchor.SHEET_COUNTERPARTY: counterparty_df,
+        anchor.SHEET_OUR_PARTY: our_party_df,
+        anchor.SHEET_FEE_DETAIL: fee_detail_df,
+    }
+
+
+def _build_attachment_audit(source_df, flow_module, headers):
+    if source_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    old_output_dir = flow_module.OUTPUT_DIR
+    try:
+        flow_module.OUTPUT_DIR = OUTPUT_DIR
+        _, _, manifest_df, missing_df = flow_module.build_contract_attachment_output(
+            source_df,
+            headers[flow_module.SHEET_CONTRACT_ATTACHMENT],
+            headers[flow_module.SHEET_OTHER_ATTACHMENT],
+        )
+    finally:
+        flow_module.OUTPUT_DIR = old_output_dir
+    return manifest_df, missing_df
+
+
+def _apply_anchor_template_layout(output_file):
+    """Copy the four anchor-sheet header layouts into the combined workbook."""
+    workbook = load_workbook(output_file)
+    template = load_workbook(anchor.TEMPLATE_FILE)
+    for source_name, target_name in ANCHOR_SOURCE_TO_JAVA_SHEET_NAMES.items():
+        source = template[source_name]
+        target = workbook[target_name]
+        target.freeze_panes = source.freeze_panes
+        target.sheet_view.showGridLines = source.sheet_view.showGridLines
+        target.sheet_format.defaultColWidth = source.sheet_format.defaultColWidth
+        target.sheet_format.defaultRowHeight = source.sheet_format.defaultRowHeight
+
+        for column_name, dimension in source.column_dimensions.items():
+            target_dimension = target.column_dimensions[column_name]
+            target_dimension.width = dimension.width
+            target_dimension.hidden = dimension.hidden
+            target_dimension.outlineLevel = dimension.outlineLevel
+        if 1 in source.row_dimensions:
+            target.row_dimensions[1].height = source.row_dimensions[1].height
+
+        for source_cell in source[1]:
+            target_cell = target.cell(row=1, column=source_cell.column)
+            if source_cell.has_style:
+                target_cell._style = copy(source_cell._style)
+            if source_cell.hyperlink:
+                target_cell._hyperlink = copy(source_cell.hyperlink)
+            if source_cell.comment:
+                target_cell.comment = copy(source_cell.comment)
+    workbook.save(output_file)
+
+
+def _write_mixed_workbook(general_source_df, anchor_source_df):
+    general_headers, general_sheets = _build_general_sheet_frames(general_source_df)
+    anchor_headers, anchor_sheets = _build_anchor_sheet_frames(anchor_source_df)
+    general_manifest_df, general_missing_df = _build_attachment_audit(
+        general_source_df, general, general_headers)
+    anchor_manifest_df, anchor_missing_df = _build_attachment_audit(
+        anchor_source_df, anchor, anchor_headers)
+
+    anchor_java_sheets = {
+        ANCHOR_SOURCE_TO_JAVA_SHEET_NAMES[source_name]: output_df
+        for source_name, output_df in anchor_sheets.items()
+    }
+    path = _write_template_sheets_with_fallback(
+        general.TEMPLATE_FILE,
+        MIXED_OUTPUT_FILE,
+        general_sheets,
+        extra_sheets=anchor_java_sheets,
+    )
+    _apply_anchor_template_layout(path)
+    path = _align_sheet_order_for_zhishu_sync(path, '混合流程')
+    print(f'[合同混合增补] 已生成混合导入文件: {path}')
+    return (
+        path,
+        general_manifest_df,
+        general_missing_df,
+        anchor_manifest_df,
+        anchor_missing_df,
+    )
+
+
+def _contract_numbers_by_archive_status(general_source_df, anchor_source_df):
+    status_by_contract = {}
+    for source_df in (general_source_df, anchor_source_df):
+        if source_df.empty:
+            continue
+        for _, row in source_df.iterrows():
+            contract_number = _text(row.get('合同编号'))
+            if contract_number and contract_number not in status_by_contract:
+                status_by_contract[contract_number] = _text(row.get('合同审批状态'))
+    archived = [
+        contract_number
+        for contract_number, status in status_by_contract.items()
+        if status == '归档'
+    ]
+    other = [
+        contract_number
+        for contract_number, status in status_by_contract.items()
+        if status != '归档'
+    ]
+    return archived, other
+
+
+def _write_json_file(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('w', encoding='utf-8') as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2)
+        file.write('\n')
+    return path
+
+
+def _write_sync_request_files(general_source_df, anchor_source_df, mixed_path):
+    archived, other = _contract_numbers_by_archive_status(general_source_df, anchor_source_df)
+    file_path = Path(mixed_path).resolve().as_posix()
+    fallback_root = MIXED_ATTACHMENT_ROOT.resolve().as_posix()
+    archived_path = _write_json_file(ARCHIVED_REQUEST_FILE, {
+        'filePath': file_path,
+        'contractNumbers': archived,
+        'contractFileFallbackRoot': fallback_root,
+        'contractStatusCode': '9',
+        'threadCount': 5,
+        'batchSize': 10,
+    })
+    other_path = _write_json_file(OTHER_REQUEST_FILE, {
+        'filePath': file_path,
+        'contractNumbers': other,
+        'contractFileFallbackRoot': fallback_root,
+        'contractStatusCode': '0',
+        'threadCount': 5,
+        'batchSize': 10,
+    })
+    print(
+        '[合同混合增补] 已生成同步请求:',
+        f'归档(9) {len(archived)} 个 -> {archived_path};',
+        f'其他(0) {len(other)} 个 -> {other_path}',
+    )
+    return archived_path, other_path
+
+
 def _flow_scope_summary(flow_name, source_df, input_df, output_file):
     return pd.DataFrame([
         {'项目': '流程', '值': flow_name},
@@ -436,8 +782,9 @@ def _write_general_workbook(source_df, input_df):
             '订单映射核对': general.build_order_audit_df(source_df),
         },
     )
+    path = _align_sheet_order_for_zhishu_sync(path, '一般流程')
     print(f'[合同混合增补] 已生成一般流程导入文件: {path}')
-    return Path(path), manifest_df, missing_df
+    return path, manifest_df, missing_df
 
 
 def _write_anchor_workbook(source_df, input_df):
@@ -480,8 +827,9 @@ def _write_anchor_workbook(source_df, input_df):
     )
     anchor._add_flow_audit_sheet(path, source_df)
     anchor._add_platform_audit_sheet(path, source_df)
+    path = _align_sheet_order_for_zhishu_sync(path, '主播流程')
     print(f'[合同混合增补] 已生成主播流程导入文件: {path}')
-    return Path(path), manifest_df, missing_df
+    return path, manifest_df, missing_df
 
 
 def _source_keys(source_df):
@@ -546,7 +894,7 @@ def _generation_status(row, generated_keys, unresolved):
 
 def _write_audit_workbook(input_audit_df, route_df, unresolved_df, general_add_exclude_df,
                           general_manifest_df, general_missing_df, anchor_manifest_df, anchor_missing_df,
-                          general_path, anchor_path):
+                          mixed_path):
     summary = pd.DataFrame([
         {'项目': '输入文件', '值': str(INPUT_FILE)},
         {'项目': '输入展开行数', '值': len(input_audit_df)},
@@ -555,15 +903,14 @@ def _write_audit_workbook(input_audit_df, route_df, unresolved_df, general_add_e
         {'项目': '待处理合同数', '值': route_df['合同key'].nunique() if len(route_df) else 0},
         {'项目': '一般流程合同数', '值': int((route_df.get('路由流程', pd.Series(dtype=str)) == '一般流程').sum())},
         {'项目': '主播流程合同数', '值': int((route_df.get('路由流程', pd.Series(dtype=str)) == '主播流程').sum())},
-        {'项目': '一般流程输出', '值': str(general_path or '')},
-        {'项目': '主播流程输出', '值': str(anchor_path or '')},
+        {'项目': '混合流程输出', '值': str(mixed_path or '')},
     ])
     sheets = {
         '处理汇总': summary,
         '输入清单_处理结果': input_audit_df,
         '待处理_路由结果': route_df,
         '未生成清单': unresolved_df,
-        'contract_general_add排除池': general_add_exclude_df,
+        'contract_general_add历史范围': general_add_exclude_df,
         '一般流程合同附件下载清单': general_manifest_df,
         '一般流程合同附件DOCID缺失': general_missing_df,
         '主播流程合同附件下载清单': anchor_manifest_df,
@@ -601,11 +948,18 @@ def run():
     general_source_df, general_mcn_raw, general_event_raw = _resolve_general_sources(general_keys)
     anchor_source_df, anchor_raw_df = _resolve_anchor_sources(anchor_keys)
 
-    general_input = route_df[route_df['路由流程'].eq('一般流程')].copy() if not route_df.empty else pd.DataFrame()
-    anchor_input = route_df[route_df['路由流程'].eq('主播流程')].copy() if not route_df.empty else pd.DataFrame()
-
-    general_path, general_manifest_df, general_missing_df = _write_general_workbook(general_source_df, general_input)
-    anchor_path, anchor_manifest_df, anchor_missing_df = _write_anchor_workbook(anchor_source_df, anchor_input)
+    (
+        mixed_path,
+        general_manifest_df,
+        general_missing_df,
+        anchor_manifest_df,
+        anchor_missing_df,
+    ) = _write_mixed_workbook(general_source_df, anchor_source_df)
+    archived_request_path, other_request_path = _write_sync_request_files(
+        general_source_df,
+        anchor_source_df,
+        mixed_path,
+    )
 
     general_output_keys = _source_keys(general_source_df)
     anchor_output_keys = _source_keys(anchor_source_df)
@@ -628,11 +982,19 @@ def run():
         general_missing_df,
         anchor_manifest_df,
         anchor_missing_df,
-        general_path,
-        anchor_path,
+        mixed_path,
     )
 
-    return [path for path in (general_path, anchor_path, audit_path) if path]
+    return [
+        path
+        for path in (
+            mixed_path,
+            audit_path,
+            archived_request_path,
+            other_request_path,
+        )
+        if path
+    ]
 
 
 if __name__ == '__main__':

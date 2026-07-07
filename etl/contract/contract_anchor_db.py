@@ -631,11 +631,12 @@ def _build_employee_info_by_name(names, status_by_number, status_by_name):
         for name in unique_names
     }
     feishu_id_map = build_feishu_employee_id_map(name_to_code.values())
+    feishu_id_by_name = base.build_feishu_employee_id_map_by_name(unique_names)
     return {
         name: {
             'name': name,
             'code': code,
-            'user_id': feishu_id_map.get(_text(code), ''),
+            'user_id': feishu_id_map.get(_text(code), '') or feishu_id_by_name.get(name, ''),
             'status': _employee_status_label(name, code, status_by_number, status_by_name),
         }
         for name, code in name_to_code.items()

@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
 """混合增补导入文件附件下载。
 
-只处理 contract_mixed_add 生成的两份导入 Excel:
-
-1. 智书合同字段_一般流程_混合增补_*.xlsx
-2. 智书合同字段_主播流程_混合增补_*.xlsx
+只处理 contract_mixed_add 生成的混合导入范围，与
+「智书合同字段_混合增补_*.xlsx」保持一致。
 
 处理清单仅作为审计文件，不参与附件下载。本任务直接复用
 contract_mixed_add.py 的输入读取、剔除、路由和 source 解析逻辑来确定下载范围。
@@ -118,6 +116,25 @@ def _download_enabled(cookie):
     return bool(_text(cookie))
 
 
+def _retarget_manifest_to_mixed_root(manifest_df):
+    if manifest_df.empty or 'target_path' not in manifest_df.columns:
+        return manifest_df
+    result = manifest_df.copy()
+
+    def target_path(row):
+        contract_number = _text(row.get('contract_number（合同编码）'))
+        original_path = Path(_text(row.get('target_path')))
+        if contract_number and contract_number in original_path.parts:
+            contract_index = original_path.parts.index(contract_number)
+            relative_parts = original_path.parts[contract_index:]
+        else:
+            relative_parts = (contract_number or '未识别合同', original_path.name)
+        return str(mixed.MIXED_ATTACHMENT_ROOT.joinpath(*relative_parts))
+
+    result['target_path'] = result.apply(target_path, axis=1)
+    return result
+
+
 def _disabled_status(cookie):
     flag = os.getenv(general.ATTACHMENT_DOWNLOAD_ENABLED_ENV, '').strip().lower()
     if flag in ('0', 'false', 'n', 'no', '否'):
@@ -211,7 +228,7 @@ def _write_outputs(input_df, route_df, general_add_exclude_df,
         ),
         '输入清单_处理结果': input_df,
         '待处理_路由结果': route_df,
-        'contract_general_add排除池': general_add_exclude_df,
+        'contract_general_add历史范围': general_add_exclude_df,
         '一般流程下载清单': general_manifest_df,
         '一般流程DOCID缺失': general_missing_df,
         '主播流程下载清单': anchor_manifest_df,
@@ -243,6 +260,8 @@ def run():
 
     general_source_df, general_manifest_df, general_missing_df = _build_general_manifest(general_scope)
     anchor_source_df, anchor_manifest_df, anchor_missing_df = _build_anchor_manifest(anchor_scope)
+    general_manifest_df = _retarget_manifest_to_mixed_root(general_manifest_df)
+    anchor_manifest_df = _retarget_manifest_to_mixed_root(anchor_manifest_df)
 
     cookie = os.getenv(general.ATTACHMENT_COOKIE_ENV, '').strip()
     general_manifest_df = _download_manifest(general_manifest_df, cookie, FLOW_GENERAL)
