@@ -245,6 +245,7 @@ def _write_outputs(input_df, route_df, general_add_exclude_df,
 
 def run():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    mixed.MIXED_ATTACHMENT_ROOT.mkdir(parents=True, exist_ok=True)
     input_df, route_df, general_add_exclude_df, general_scope, anchor_scope = _resolve_scope_from_mixed_logic()
     if route_df.empty:
         print('[混合增补附件] 混合增补输入经剔除后无待处理合同')

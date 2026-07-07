@@ -147,9 +147,19 @@ def run_contract_all_with_attachments():
     _run_task_sequence(CONTRACT_ALL_TASKS + CONTRACT_ATTACHMENT_TASKS, 'contract_all_with_attachments')
 
 
+def run_contract_mixed_add_all():
+    """一次跑混合合同增补:导入 Excel + 0/9 JSON + 附件文件夹/下载清单。"""
+    _run_task_sequence(
+        ('contract_mixed_add', 'contract_mixed_add_attachments_db'),
+        'contract_mixed_add_all',
+    )
+
+
 TASKS['all'] = run_all
 TASKS['contract_all'] = run_contract_all
 TASKS['contract_all_with_attachments'] = run_contract_all_with_attachments
+TASKS['contract_mixed_add_all'] = run_contract_mixed_add_all
+TASKS['contract_mixed_add_with_attachments'] = run_contract_mixed_add_all
 
 
 def main():

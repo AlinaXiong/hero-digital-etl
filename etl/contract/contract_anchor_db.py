@@ -2681,7 +2681,8 @@ def build_main_output(source_df, headers):
         _set(row, 'contract_name（合同名称）', _text(source['合同标题']))
         _set(row, '泛微合同状态', _text(source.get('合同审批状态')))
         _set(row, '合同状态', resolve_contract_status_label(source['合同签署状态ID']))
-        _set(row, 'contractCategory(智书框架合同类型)', source['合同分类'])
+        _set(row, 'contractCategory(智书框架合同类型)',
+             _text(source.get('Excel覆盖_智书合同类型')) or source['合同分类'])
         _set(row, 'pay_type_code（收支类型）', source['收支类型'])
         _set(row, 'property_type_code（计价方式）', DEFAULT_PROPERTY_TYPE)
         _set(row, 'estimated_amount（预估金额）', contract_amount)

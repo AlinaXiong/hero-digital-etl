@@ -5,16 +5,23 @@
 
 1. 读取清单并剔除已导入/重复编号;
 2. 按 Excel 智书合同类型或泛微合同类型分流:主播类走 contract_anchor_db,其余走 contract_general_db;
-3. 复用两个主任务的解析与导出 builder,生成一个混合导入 Excel:一般流程占前 9 个 sheet,
+3. 只读取输入清单前三列:合同编号用于定位源数据,关联业财订单/智书合同类型有值时优先采用,
+   为空时沿用原清洗逻辑;第 4 列及之后全部忽略;
+4. 复用两个主任务的解析与导出 builder,生成一个混合导入 Excel:一般流程占前 9 个 sheet,
    主播流程占后 4 个 sheet。
 
 运行方式::
 
     python run.py contract_mixed_add
+    python run.py contract_mixed_add_all
 
 可用环境变量覆盖输入文件::
 
     CONTRACT_MIXED_ADD_FILE
+
+默认输入文件放在::
+
+    resources/source/contract_mixed_add/技术导入数据清单.xlsx
 """
 from __future__ import annotations
 
@@ -36,11 +43,48 @@ from etl.util import common as c
 
 TASK_NAME = 'contract_mixed_add'
 OUTPUT_DIR = c.OUT_DIR / TASK_NAME
-SOURCE_DIR = c.SRC_DIR / 'contract_general_add'
-INPUT_FILE = Path(os.getenv(
-    'CONTRACT_MIXED_ADD_FILE',
-    SOURCE_DIR / '需技术侧优先导入的合同数据.xlsx',
-))
+SOURCE_DIR = c.SRC_DIR / TASK_NAME
+DEFAULT_INPUT_FILE_NAME = '技术导入数据清单.xlsx'
+
+
+def _default_input_file():
+    if SOURCE_DIR.exists():
+        xlsx_files = sorted(SOURCE_DIR.glob('*.xlsx'))
+        if len(xlsx_files) == 1:
+            return xlsx_files[0]
+        if len(xlsx_files) > 1:
+            raise RuntimeError(
+                '混合增补输入目录中存在多个 Excel，请只保留一个导入清单，'
+                '或设置 CONTRACT_MIXED_ADD_FILE 指向具体 .xlsx 文件: '
+                + ', '.join(path.name for path in xlsx_files)
+            )
+    return SOURCE_DIR / DEFAULT_INPUT_FILE_NAME
+
+
+def _input_file_from_directory(directory):
+    xlsx_files = sorted(directory.glob('*.xlsx'))
+    if len(xlsx_files) == 1:
+        return xlsx_files[0]
+    if not xlsx_files:
+        return directory / DEFAULT_INPUT_FILE_NAME
+    raise RuntimeError(
+        '混合增补输入目录中存在多个 Excel，请只保留一个导入清单，'
+        '或设置 CONTRACT_MIXED_ADD_FILE 指向具体 .xlsx 文件: '
+        + ', '.join(path.name for path in xlsx_files)
+    )
+
+
+def _resolve_input_file(value=None):
+    raw = '' if value is None else str(value).strip().strip('"')
+    if not raw:
+        return _default_input_file()
+    path = Path(raw)
+    if path.is_dir():
+        return _input_file_from_directory(path)
+    return path
+
+
+INPUT_FILE = _resolve_input_file(os.getenv('CONTRACT_MIXED_ADD_FILE'))
 
 DATE_SUFFIX = general.DATE_SUFFIX
 GENERAL_OUTPUT_FILE = OUTPUT_DIR / f'智书合同字段_一般流程_混合增补_{DATE_SUFFIX}.xlsx'
@@ -49,6 +93,8 @@ MIXED_OUTPUT_FILE = OUTPUT_DIR / f'智书合同字段_混合增补_{DATE_SUFFIX}
 MIXED_ATTACHMENT_ROOT = OUTPUT_DIR / f'混合增补合同附件_{DATE_SUFFIX}'
 ARCHIVED_REQUEST_FILE = OUTPUT_DIR / f'智书合同同步请求_归档_9_{DATE_SUFFIX}.json'
 OTHER_REQUEST_FILE = OUTPUT_DIR / f'智书合同同步请求_其他_0_{DATE_SUFFIX}.json'
+APPROVE_TO_NODE_REQUEST_FILE = OUTPUT_DIR / f'智书合同自动审批请求_非归档_{DATE_SUFFIX}.json'
+YECAI_SYNC_REQUEST_FILE = OUTPUT_DIR / f'智书合同同步业财请求_全量_{DATE_SUFFIX}.json'
 AUDIT_FILE = OUTPUT_DIR / f'混合增补处理清单_{DATE_SUFFIX}.xlsx'
 
 # ZhiShuSynServiceImpl.SheetRole uses fixed workbook indexes instead of sheet names.
@@ -98,57 +144,18 @@ CONTRACT_COLUMN_CANDIDATES = (
 )
 STATUS_COLUMN_CANDIDATES = ('导入状态', '状态', '是否导入', '导入标记')
 TYPE_COLUMN_CANDIDATES = ('智书合同类型', '合同类型', 'contractCategory(智书框架合同类型)')
-ORDER_COLUMN_CANDIDATES = ('关联业财订单', '订单编号')
-OLD_CODE_COLUMN_CANDIDATES = ('老泛微编码', '泛微编码', 'OA编号')
+ORDER_COLUMN_CANDIDATES = ('关联业财订单（必填）', '关联业财订单', '订单编号')
+OLD_CODE_COLUMN_CANDIDATES = ('老泛微项目编码', '老泛微编码', '泛微编码', 'OA编号')
 
-EXCLUDED_CONTRACT_NUMBERS = frozenset({
-    'H-DF2025070326',
-    'H-DF2025080282',
-    'H-DF2025090217',
-    'H-DF2025100218',
-    'H-DF2025110097',
-    'H-DF2025110417',
-    'H-DF2025110418',
-    'H-DF2025120085',
-    'H-DF2025120203',
-    'H-DF2025120221',
-    'H-DF2025120227',
-    'H-DF2025120228',
-    'H-DF2025120229',
-    'H-DF2026030454',
-    'H-DS2024120042',
-    'H-KF2023040006',
-    'H-KF2026030029',
-    'H-KS2024080001',
-    'H-OF2025100064',
-    'H-OF2025100071',
-    'H-OF2026010010',
-    'H-OF2026010043',
-    'H-OF2026010064',
-    'H-OF2026010065',
-    'H-OF2026020005',
-    'H-OF2026020009',
-    'H-OF2026030008',
-    'H-OF2026030009',
-    'H-OF2026030010',
-    'H-OF2026030014',
-    'H-OF2026030028',
-    'H-OF2026030049',
-    'H-OF2026030072',
-    'H-OF2026040005',
-    'H-OF2026040017',
-    'H-OF2026040033',
-    'H-OF2026040047',
-    'H-OF2026050001',
-    'H-OF2026050006',
-    'H-OF2026060001',
-    'H-OF2026060015',
-    'H-OF2026060043',
-    'H-OF2026060047',
-    'H-S201804001',
-    'H-S201905003',
-    'H-S202003039-S01',
-})
+EXCEL_ORDER_OVERRIDE_SOURCE = 'Excel关联业财订单覆盖'
+EXCEL_CATEGORY_OVERRIDE_SOURCE = 'Excel智书合同类型覆盖'
+APPROVAL_NODE_NAME_OVERRIDES = {
+    # 自动审批接口使用的节点名与泛微节点名存在一处历史叫法差异。
+    '上传电子档': '上传电子版',
+}
+
+# 默认不排除任何合同。需要临时排除时再在这里显式添加合同编号。
+EXCLUDED_CONTRACT_NUMBERS = frozenset()
 
 
 def _text(value):
@@ -179,8 +186,21 @@ def _split_contract_numbers(value):
 
 
 def _read_mixed_input(path):
+    path = _resolve_input_file(path)
     if not path.exists():
-        raise FileNotFoundError(f'混合增补输入文件不存在: {path}')
+        raise FileNotFoundError(
+            '混合增补输入文件不存在: '
+            f'{path}\n'
+            f'请把唯一一份 Excel 放到 {SOURCE_DIR}，推荐文件名: {DEFAULT_INPUT_FILE_NAME}；'
+            '或设置环境变量 CONTRACT_MIXED_ADD_FILE 指向具体文件/目录。'
+        )
+    if path.is_dir():
+        raise IsADirectoryError(
+            '混合增补输入路径是目录，且未找到可自动识别的 Excel: '
+            f'{path}\n'
+            f'请在该目录只放置一份 Excel，推荐文件名: {DEFAULT_INPUT_FILE_NAME}，'
+            '或设置 CONTRACT_MIXED_ADD_FILE 指向具体 .xlsx 文件。'
+        )
 
     # 输入清单的「创建人」仅是业务备注，禁止参与导入值映射。
     # 合同创建人必须由 general/anchor 原流程从泛微源数据解析并执行离职替换规则。
@@ -188,14 +208,12 @@ def _read_mixed_input(path):
     rows = []
     skipped_sheets = []
     for sheet_name, raw in sheets.items():
-        contract_col = _first_existing_column(raw, CONTRACT_COLUMN_CANDIDATES)
-        if not contract_col:
+        if raw.empty or len(raw.columns) < 1:
             skipped_sheets.append(sheet_name)
             continue
-        status_col = _first_existing_column(raw, STATUS_COLUMN_CANDIDATES)
-        type_col = _first_existing_column(raw, TYPE_COLUMN_CANDIDATES)
-        order_col = _first_existing_column(raw, ORDER_COLUMN_CANDIDATES)
-        old_code_col = _first_existing_column(raw, OLD_CODE_COLUMN_CANDIDATES)
+        contract_col = raw.columns[0]
+        order_col = raw.columns[1] if len(raw.columns) > 1 else None
+        type_col = raw.columns[2] if len(raw.columns) > 2 else None
 
         for excel_index, row in raw.iterrows():
             raw_contract = _text(row.get(contract_col))
@@ -209,12 +227,12 @@ def _read_mixed_input(path):
                     '合同key': _contract_key(contract_number),
                     '智书合同类型': _text(row.get(type_col)) if type_col else '',
                     '关联业财订单': _text(row.get(order_col)) if order_col else '',
-                    '老泛微编码': _text(row.get(old_code_col)) if old_code_col else '',
-                    '导入状态': _text(row.get(status_col)) if status_col else '',
+                    '老泛微编码': '',
+                    '导入状态': '',
                 })
 
     if not rows:
-        detail = f'; 已跳过无合同编号列sheet: {", ".join(skipped_sheets)}' if skipped_sheets else ''
+        detail = f'; 已跳过空sheet: {", ".join(skipped_sheets)}' if skipped_sheets else ''
         raise RuntimeError(f'输入文件未读到任何合同编号: {path}{detail}')
 
     result = pd.DataFrame(rows)
@@ -277,11 +295,7 @@ def _load_general_add_processed_keys():
 def _apply_input_exclusions(input_df, _general_add_keys):
     result = input_df.copy()
     reasons = [[] for _ in range(len(result))]
-    marked = result['导入状态'].map(lambda value: '已导入' in _text(value))
     explicitly_excluded = result['合同key'].isin(EXCLUDED_CONTRACT_NUMBERS)
-    for pos, is_marked in enumerate(marked):
-        if is_marked:
-            reasons[pos].append('表格导入状态标注已导入')
     for pos, is_excluded in enumerate(explicitly_excluded):
         if is_excluded:
             reasons[pos].append('用户指定不处理')
@@ -414,6 +428,79 @@ def _query_selected_anchor_source(contract_keys):
 def _copy_attrs(target, source):
     target.attrs = dict(source.attrs)
     return target
+
+
+def _join_order_override_field(items, field, unique=False):
+    values = [_text(item.get(field, '')) for item in items]
+    if unique:
+        values = c.clean_text_values(values)
+    return ';'.join(value for value in values if value)
+
+
+def _order_override_items(order_value):
+    items = []
+    for order_code in general._split_multi_values(order_value):
+        info = c.hand_order_info_for_order(order_code) or c.cleanable_order_info_for_order(order_code) or {}
+        items.append({
+            '订单编号': order_code,
+            '订单标题': _text(info.get('订单标题')),
+            '成本中心': _text(info.get('成本中心')),
+            '订单开始日': c.format_date(info.get('订单开始日')),
+            '订单结束日': c.format_date(info.get('订单结束日')),
+            '映射来源': _text(info.get('映射来源')) or EXCEL_ORDER_OVERRIDE_SOURCE,
+        })
+    return items
+
+
+def _route_override_lookup(route_df):
+    if route_df.empty:
+        return pd.DataFrame()
+    return route_df.drop_duplicates('合同key', keep='first').set_index('合同key')
+
+
+def _apply_excel_overrides(source_df, route_df):
+    """Apply the input sheet's first-three-column overrides to resolved source rows."""
+    if source_df.empty or route_df.empty:
+        return source_df
+
+    route = _route_override_lookup(route_df)
+    result = source_df.copy()
+    result.attrs = dict(source_df.attrs)
+    for column in ('Excel覆盖_关联业财订单', 'Excel覆盖_智书合同类型'):
+        if column not in result.columns:
+            result[column] = ''
+
+    for index, row in result.iterrows():
+        key = _contract_key(row.get('合同编号'))
+        if not key or key not in route.index:
+            continue
+
+        category = _text(route.at[key, '智书合同类型']) if '智书合同类型' in route.columns else ''
+        if category:
+            result.at[index, 'Excel覆盖_智书合同类型'] = category
+            if '合同分类' in result.columns:
+                result.at[index, '合同分类'] = category
+            if '合同分类依据' in result.columns:
+                result.at[index, '合同分类依据'] = f'{EXCEL_CATEGORY_OVERRIDE_SOURCE}: {category}'
+
+        order_value = _text(route.at[key, '关联业财订单']) if '关联业财订单' in route.columns else ''
+        if order_value:
+            result.at[index, 'Excel覆盖_关联业财订单'] = order_value
+            if '订单编号' in result.columns:
+                items = _order_override_items(order_value)
+                result.at[index, '订单编号'] = _join_order_override_field(items, '订单编号')
+                if '订单名称' in result.columns:
+                    result.at[index, '订单名称'] = _join_order_override_field(items, '订单标题')
+                if '订单成本中心' in result.columns:
+                    result.at[index, '订单成本中心'] = _join_order_override_field(items, '成本中心')
+                if '订单开始日' in result.columns:
+                    result.at[index, '订单开始日'] = _join_order_override_field(items, '订单开始日')
+                if '订单结束日' in result.columns:
+                    result.at[index, '订单结束日'] = _join_order_override_field(items, '订单结束日')
+                if '订单映射来源' in result.columns:
+                    result.at[index, '订单映射来源'] = _join_order_override_field(
+                        items, '映射来源', unique=True)
+    return result
 
 
 def _resolve_general_sources(contract_keys):
@@ -634,6 +721,7 @@ def _apply_anchor_template_layout(output_file):
 
 
 def _write_mixed_workbook(general_source_df, anchor_source_df):
+    MIXED_ATTACHMENT_ROOT.mkdir(parents=True, exist_ok=True)
     general_headers, general_sheets = _build_general_sheet_frames(general_source_df)
     anchor_headers, anchor_sheets = _build_anchor_sheet_frames(anchor_source_df)
     general_manifest_df, general_missing_df = _build_attachment_audit(
@@ -663,8 +751,27 @@ def _write_mixed_workbook(general_source_df, anchor_source_df):
     )
 
 
+def _is_archived_for_sync(row):
+    approval_status = _text(row.get('合同审批状态'))
+    if approval_status == '归档':
+        return True
+
+    status_text = _text(row.get('合同签署状态'))
+    status_id = c.format_code(row.get('合同签署状态ID'))
+    if '归档' in status_text:
+        return True
+
+    # uf_htsp(赛事合同审批台账)的 htzt 独立码表:0=审批中,1=归档。
+    if _text(row.get('数据来源')) == '泛微(赛事)':
+        return status_id == '1'
+
+    # uf_htk/主播合同使用通用码表:0=审批中,1=审批完成,2=已归档。
+    return status_id == '2'
+
+
 def _contract_numbers_by_archive_status(general_source_df, anchor_source_df):
     status_by_contract = {}
+    archived_by_contract = {}
     for source_df in (general_source_df, anchor_source_df):
         if source_df.empty:
             continue
@@ -672,17 +779,31 @@ def _contract_numbers_by_archive_status(general_source_df, anchor_source_df):
             contract_number = _text(row.get('合同编号'))
             if contract_number and contract_number not in status_by_contract:
                 status_by_contract[contract_number] = _text(row.get('合同审批状态'))
+                archived_by_contract[contract_number] = _is_archived_for_sync(row)
     archived = [
         contract_number
-        for contract_number, status in status_by_contract.items()
-        if status == '归档'
+        for contract_number in status_by_contract
+        if archived_by_contract.get(contract_number)
     ]
     other = [
         contract_number
-        for contract_number, status in status_by_contract.items()
-        if status != '归档'
+        for contract_number in status_by_contract
+        if not archived_by_contract.get(contract_number)
     ]
-    return archived, other
+    return archived, other, status_by_contract
+
+
+def _approval_node_groups_for_zero_status_contracts(status_by_contract, contract_numbers):
+    groups = {}
+    skipped = []
+    for contract_number in contract_numbers:
+        status = status_by_contract.get(contract_number, '')
+        node_name = APPROVAL_NODE_NAME_OVERRIDES.get(status, status)
+        if not node_name:
+            skipped.append(contract_number)
+            continue
+        groups.setdefault(node_name, []).append(contract_number)
+    return groups, skipped
 
 
 def _write_json_file(path, payload):
@@ -694,7 +815,11 @@ def _write_json_file(path, payload):
 
 
 def _write_sync_request_files(general_source_df, anchor_source_df, mixed_path):
-    archived, other = _contract_numbers_by_archive_status(general_source_df, anchor_source_df)
+    archived, other, status_by_contract = _contract_numbers_by_archive_status(general_source_df, anchor_source_df)
+    approve_node_groups, approve_skipped = _approval_node_groups_for_zero_status_contracts(
+        status_by_contract,
+        other,
+    )
     file_path = Path(mixed_path).resolve().as_posix()
     fallback_root = MIXED_ATTACHMENT_ROOT.resolve().as_posix()
     archived_path = _write_json_file(ARCHIVED_REQUEST_FILE, {
@@ -713,12 +838,21 @@ def _write_sync_request_files(general_source_df, anchor_source_df, mixed_path):
         'threadCount': 5,
         'batchSize': 10,
     })
+    approve_path = _write_json_file(APPROVE_TO_NODE_REQUEST_FILE, approve_node_groups)
+    yecai_path = _write_json_file(YECAI_SYNC_REQUEST_FILE, {
+        'contractNumbers': list(status_by_contract.keys()),
+        'threadCount': 5,
+    })
     print(
         '[合同混合增补] 已生成同步请求:',
         f'归档(9) {len(archived)} 个 -> {archived_path};',
-        f'其他(0) {len(other)} 个 -> {other_path}',
+        f'其他(0) {len(other)} 个 -> {other_path};',
+        f'0状态自动审批 {sum(len(items) for items in approve_node_groups.values())} 个 -> {approve_path};',
+        f'同步业财 {len(status_by_contract)} 个 -> {yecai_path}',
     )
-    return archived_path, other_path
+    if approve_skipped:
+        print(f'[合同混合增补] 0状态自动审批跳过 {len(approve_skipped)} 个合同: 合同审批状态为空')
+    return archived_path, other_path, approve_path, yecai_path
 
 
 def _flow_scope_summary(flow_name, source_df, input_df, output_file):
@@ -947,6 +1081,8 @@ def run():
 
     general_source_df, general_mcn_raw, general_event_raw = _resolve_general_sources(general_keys)
     anchor_source_df, anchor_raw_df = _resolve_anchor_sources(anchor_keys)
+    general_source_df = _apply_excel_overrides(general_source_df, route_df)
+    anchor_source_df = _apply_excel_overrides(anchor_source_df, route_df)
 
     (
         mixed_path,
@@ -955,7 +1091,7 @@ def run():
         anchor_manifest_df,
         anchor_missing_df,
     ) = _write_mixed_workbook(general_source_df, anchor_source_df)
-    archived_request_path, other_request_path = _write_sync_request_files(
+    archived_request_path, other_request_path, approve_node_request_path, yecai_request_path = _write_sync_request_files(
         general_source_df,
         anchor_source_df,
         mixed_path,
@@ -992,6 +1128,8 @@ def run():
             audit_path,
             archived_request_path,
             other_request_path,
+            approve_node_request_path,
+            yecai_request_path,
         )
         if path
     ]

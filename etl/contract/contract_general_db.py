@@ -2914,8 +2914,9 @@ def build_main_output(source_df, headers):
         _set(row, '泛微项目编码', _text(source.get('泛微项目编号')))
         _set(row, '合同审批状态', _text(source.get('合同审批状态')))
         _set(row, '订单编号', _text(source.get('订单编号')))
+        category_override = _text(source.get('Excel覆盖_智书合同类型'))
         _set(row, 'contractCategory(智书框架合同类型)',
-             '其他-保密协议' if '保密协议' in contract_name else source['合同分类'])
+             category_override or ('其他-保密协议' if '保密协议' in contract_name else source['合同分类']))
         _set(row, '收入币种', _text(source.get('收入币种')))
         _set(row, '支出币种', _text(source.get('支出币种')))
         _set(row, 'pay_type_code（收支类型）', source['收支类型'])

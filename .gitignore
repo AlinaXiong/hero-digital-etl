@@ -7,6 +7,8 @@ venv/
 .idea/
 # 临时
 ~$*.xlsx
+# 混合合同增补输入清单(本地业务数据,不提交)
+resources/source/contract_mixed_add/*.xlsx
 # 一般流程合同附件下载目录(日期后缀会变,如 一般流程合同附件_20260621)
 output/contract_general_db/一般流程合同附件_*/
 output/contract_anti_bribery_db/反商业贿赂协议合同附件_*/

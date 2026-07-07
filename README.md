@@ -44,6 +44,8 @@ python run.py export_feishu_employees
 | `python run.py contract_general_attachments_db` | 合同迁移 - 一般流程附件下载 | 泛微合同稿件字段 + `workflow_docshareinfo` / `docimagefile` | 一般流程合同附件 + 下载清单 |
 | `python run.py contract_anchor_db` | 合同迁移 - 主播流程 Excel 导出 | 泛微 `uf_htk` + `uf_zbkp` / `uf_zbkp_dt1` + Hand 主播档案 | 智书合同字段-主播流程 |
 | `python run.py contract_anchor_attachments_db` | 合同迁移 - 主播流程附件下载 | 主播合同清洗口径 + 泛微合同稿件字段 | 主播流程合同附件 + 下载清单 |
+| `python run.py contract_mixed_add` | 混合合同清单增补 - 一般流程 + 主播流程合并导入 Excel，并生成 0/9 JSON 和 0 状态自动审批 JSON | 默认读取 `resources/source/contract_mixed_add/技术导入数据清单.xlsx` | 智书合同字段_混合增补 + 同步请求 JSON |
+| `python run.py contract_mixed_add_all` | 混合合同清单增补一键任务，先生成 Excel/0/9/自动审批 JSON，再生成/下载附件 | 同上；附件下载依赖 `.env` 的泛微 cookie | 混合导入 Excel + 附件文件夹 + 下载清单 + 0/9/自动审批 JSON |
 | `python run.py contract_anti_bribery_db` | 合同迁移 - 反商业贿赂协议 Excel 导出 | 泛微一般合同/赛事合同 + 反贿赂模板 | 反商业贿赂协议清洗结果 |
 | `python run.py contract_anti_bribery_attachments_db` | 合同迁移 - 反商业贿赂协议附件下载 | 反贿赂合同清洗口径 + 泛微合同稿件字段 | 反贿赂合同附件 + 下载清单 |
 | `python run.py anti_bribery_signers_db` | 反商业贿赂协议签署情况补登 | 泛微 `uf_htk` / `uf_htsp` + 签署情况底稿 | 反商业贿赂协议签署情况 |
@@ -95,6 +97,45 @@ python run.py all
 python run.py contract_all
 python run.py contract_all_with_attachments
 python run.py export_feishu_employees
+```
+
+### contract_mixed_add_all（混合合同增补一键任务）
+
+把业务清单 Excel 放到：
+
+```text
+resources/source/contract_mixed_add/技术导入数据清单.xlsx
+```
+
+清单只读取前三列，第 4 列及之后的导入状态、同步状态等全部忽略：
+
+| 列名 | 用法 |
+| --- | --- |
+| `合同编号` | 必填，用于从泛微源库定位合同 |
+| `关联业财订单（必填）` | 有值时直接覆盖导入模板中的订单编号；为空时沿用原项目/订单映射逻辑 |
+| `智书合同类型` | 有值时直接覆盖导入模板中的智书合同类型；为空时沿用原合同分类逻辑 |
+
+执行：
+
+```powershell
+python run.py contract_mixed_add_all
+```
+
+产出：
+
+- `output/contract_mixed_add/智书合同字段_混合增补_<YYYYMMDD>.xlsx`
+- `output/contract_mixed_add/智书合同同步请求_归档_9_<YYYYMMDD>.json`
+- `output/contract_mixed_add/智书合同同步请求_其他_0_<YYYYMMDD>.json`
+- `output/contract_mixed_add/智书合同自动审批请求_非归档_<YYYYMMDD>.json`，范围与 `其他_0` JSON 完全一致，按泛微节点名分组
+- `output/contract_mixed_add/智书合同同步业财请求_全量_<YYYYMMDD>.json`，用于 `/api/contract/syn/yecai`，包含本次全部合同编码
+- `output/contract_mixed_add/混合增补合同附件_<YYYYMMDD>/`
+- `output/contract_mixed_add_attachments_db/混合增补附件下载清单_<YYYYMMDD>.xlsx`
+
+如果不想把输入文件放默认目录，也可以临时指定：
+
+```powershell
+$env:CONTRACT_MIXED_ADD_FILE="C:\path\to\技术导入数据清单.xlsx"
+python run.py contract_mixed_add_all
 ```
 
 ### ap_payment_opening_extra_db（应付期初 - 对公付款单补充三 tab DB 直连版）
