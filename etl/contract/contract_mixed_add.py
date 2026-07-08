@@ -139,6 +139,16 @@ GENERAL_ADD_SOURCE_FILES = (
     general_add.AMOUNT_INPUT_FILE,
 )
 
+GENERAL_RELATION_BLANK_COLUMNS = (
+    'relation.relation_contracts（关联合同）',
+    '框架合同编号',
+)
+GENERAL_PURCHASE_REQUEST_BLANK_COLUMNS = (
+    'custom_1024_7db9a8ee2b3d4a3f9d9835dd9fee69df（采购申请）',
+)
+ANCHOR_MAIN_EXECUTOR_COLUMN_INDEX = 20  # Excel T 列
+ANCHOR_MAIN_EXECUTOR_OUTPUT_HEADER = '合同执行人'
+
 CONTRACT_COLUMN_CANDIDATES = (
     '合同编号', '合同号', '合同编码', 'contract_number（合同编码）', 'contract_number',
 )
@@ -152,6 +162,7 @@ EXCEL_CATEGORY_OVERRIDE_SOURCE = 'Excel智书合同类型覆盖'
 APPROVAL_NODE_NAME_OVERRIDES = {
     # 自动审批接口使用的节点名与泛微节点名存在一处历史叫法差异。
     '上传电子档': '上传电子版',
+    '申请人确认签署类型': '申请人确认签约性质',
 }
 
 # 默认不排除任何合同。需要临时排除时再在这里显式添加合同编号。
@@ -625,25 +636,66 @@ def _align_sheet_order_for_zhishu_sync(output_file, flow_name):
     return path
 
 
+def _blank_output_columns(output_df, columns):
+    result = output_df.copy()
+    for column in columns:
+        if column in result.columns:
+            result[column] = ''
+    return result
+
+
+def _rename_anchor_main_executor_header(output_file):
+    path = Path(output_file)
+    workbook = load_workbook(path)
+    renamed = False
+    for sheet_name in (anchor.SHEET_MAIN, JAVA_ANCHOR_SHEET_NAMES[0]):
+        if sheet_name in workbook.sheetnames:
+            workbook[sheet_name].cell(
+                row=1,
+                column=ANCHOR_MAIN_EXECUTOR_COLUMN_INDEX,
+            ).value = ANCHOR_MAIN_EXECUTOR_OUTPUT_HEADER
+            renamed = True
+    if renamed:
+        workbook.save(path)
+    return path
+
+
 def _build_general_sheet_frames(source_df):
     headers = general._template_headers()
     if source_df.empty:
-        return headers, {
+        sheets = {
             sheet_name: pd.DataFrame(columns=headers[sheet_name])
             for sheet_name in GENERAL_SOURCE_TO_JAVA_SHEET_NAMES
         }
+        sheets[general.SHEET_RELATION] = _blank_output_columns(
+            sheets[general.SHEET_RELATION],
+            GENERAL_RELATION_BLANK_COLUMNS,
+        )
+        sheets[general.SHEET_PURCHASE_REQUEST] = _blank_output_columns(
+            sheets[general.SHEET_PURCHASE_REQUEST],
+            GENERAL_PURCHASE_REQUEST_BLANK_COLUMNS,
+        )
+        return headers, sheets
 
     relation_df, _ = general.build_relation_output(source_df, headers[general.SHEET_RELATION])
+    relation_df = _blank_output_columns(relation_df, GENERAL_RELATION_BLANK_COLUMNS)
     order_detail_df, _ = general.build_order_detail_output(source_df, headers[general.SHEET_ORDER_DETAIL])
     counterparty_df, _ = general.build_counterparty_output(source_df, headers[general.SHEET_COUNTERPARTY])
     our_party_df, _ = general.build_our_party_output(source_df, headers[general.SHEET_OUR_PARTY])
+    purchase_request_df = general.build_purchase_request_output(
+        source_df,
+        headers[general.SHEET_PURCHASE_REQUEST],
+    )
+    purchase_request_df = _blank_output_columns(
+        purchase_request_df,
+        GENERAL_PURCHASE_REQUEST_BLANK_COLUMNS,
+    )
     return headers, {
         general.SHEET_MAIN: general.build_main_output(source_df, headers[general.SHEET_MAIN]),
         general.SHEET_RELATION: relation_df,
         general.SHEET_RELATED_ORDER: general.build_related_order_output(
             source_df, headers[general.SHEET_RELATED_ORDER]),
-        general.SHEET_PURCHASE_REQUEST: general.build_purchase_request_output(
-            source_df, headers[general.SHEET_PURCHASE_REQUEST]),
+        general.SHEET_PURCHASE_REQUEST: purchase_request_df,
         general.SHEET_ORDER_DETAIL: order_detail_df,
         general.SHEET_COUNTERPARTY: counterparty_df,
         general.SHEET_OUR_PARTY: our_party_df,
@@ -741,6 +793,7 @@ def _write_mixed_workbook(general_source_df, anchor_source_df):
     )
     _apply_anchor_template_layout(path)
     path = _align_sheet_order_for_zhishu_sync(path, '混合流程')
+    path = _rename_anchor_main_executor_header(path)
     print(f'[合同混合增补] 已生成混合导入文件: {path}')
     return (
         path,
@@ -874,8 +927,13 @@ def _write_general_workbook(source_df, input_df):
     headers = general._template_headers()
     main_df = general.build_main_output(source_df, headers[general.SHEET_MAIN])
     relation_df, _ = general.build_relation_output(source_df, headers[general.SHEET_RELATION])
+    relation_df = _blank_output_columns(relation_df, GENERAL_RELATION_BLANK_COLUMNS)
     related_order_df = general.build_related_order_output(source_df, headers[general.SHEET_RELATED_ORDER])
     purchase_request_df = general.build_purchase_request_output(source_df, headers[general.SHEET_PURCHASE_REQUEST])
+    purchase_request_df = _blank_output_columns(
+        purchase_request_df,
+        GENERAL_PURCHASE_REQUEST_BLANK_COLUMNS,
+    )
     order_detail_df, _ = general.build_order_detail_output(source_df, headers[general.SHEET_ORDER_DETAIL])
     counterparty_df, _ = general.build_counterparty_output(source_df, headers[general.SHEET_COUNTERPARTY])
     our_party_df, _ = general.build_our_party_output(source_df, headers[general.SHEET_OUR_PARTY])
@@ -962,6 +1020,7 @@ def _write_anchor_workbook(source_df, input_df):
     anchor._add_flow_audit_sheet(path, source_df)
     anchor._add_platform_audit_sheet(path, source_df)
     path = _align_sheet_order_for_zhishu_sync(path, '主播流程')
+    path = _rename_anchor_main_executor_header(path)
     print(f'[合同混合增补] 已生成主播流程导入文件: {path}')
     return path, manifest_df, missing_df
 
