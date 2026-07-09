@@ -1844,11 +1844,74 @@ def _windows_long_path(path):
     return Path('\\\\?\\' + text)
 
 
+IMAGE_ATTACHMENT_SUFFIXES = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp')
+
+
+def _is_image_attachment_path(path):
+    return Path(path).suffix.lower() in IMAGE_ATTACHMENT_SUFFIXES
+
+
+def _pdf_path_for_image_attachment(path):
+    path = Path(path)
+    suffix = path.suffix
+    if not suffix or suffix.lower() not in IMAGE_ATTACHMENT_SUFFIXES:
+        return path
+    text = str(path)
+    if text.lower().endswith('.pdf' + suffix.lower()):
+        return Path(text[:-len(suffix)])
+    return path.with_suffix('.pdf')
+
+
+def _convert_image_attachment_to_pdf(image_path):
+    """把下载到本地的图片附件转为同目录 PDF,成功后删除原图片。"""
+    image_path = Path(image_path)
+    pdf_path = _pdf_path_for_image_attachment(image_path)
+    if pdf_path == image_path:
+        return image_path, ''
+    pdf_fs_path = _windows_long_path(pdf_path)
+    if pdf_fs_path.exists() and pdf_fs_path.stat().st_size > 0:
+        _windows_long_path(image_path).unlink(missing_ok=True)
+        return pdf_path, 'pdf_exists_deleted_image'
+
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as exc:
+        raise RuntimeError('图片附件转PDF失败: 缺少 Pillow 依赖,请先安装 requirements.txt') from exc
+
+    temp_path = pdf_path.with_suffix(pdf_path.suffix + '.part')
+    temp_fs_path = _windows_long_path(temp_path)
+    try:
+        with Image.open(_windows_long_path(image_path)) as image:
+            image = ImageOps.exif_transpose(image)
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            image.save(temp_fs_path, 'PDF', resolution=100.0)
+        os.replace(temp_fs_path, pdf_fs_path)
+        _windows_long_path(image_path).unlink(missing_ok=True)
+        return pdf_path, 'converted_to_pdf'
+    except Exception as exc:
+        if temp_fs_path.exists():
+            temp_fs_path.unlink(missing_ok=True)
+        raise RuntimeError(f'图片附件转PDF失败: {exc}') from exc
+
+
 def _download_attachment_file(meta, cookie, log_prefix='附件下载'):
     target_path = Path(meta['target_path'])
     target_fs_path = _windows_long_path(target_path)
+    final_path = _pdf_path_for_image_attachment(target_path) if _is_image_attachment_path(target_path) else target_path
+    final_fs_path = _windows_long_path(final_path)
+    if final_path != target_path and final_fs_path.exists() and final_fs_path.stat().st_size > 0:
+        if target_fs_path.exists():
+            target_fs_path.unlink(missing_ok=True)
+        return 'skipped_exists', '', str(final_path), str(target_path), 'pdf_exists'
     if target_fs_path.exists() and target_fs_path.stat().st_size > 0:
-        return 'skipped_exists', ''
+        if _is_image_attachment_path(target_path):
+            try:
+                final_path, conversion_status = _convert_image_attachment_to_pdf(target_path)
+                return 'skipped_exists', '', str(final_path), str(target_path), conversion_status
+            except RuntimeError as exc:
+                return 'failed', str(exc), str(target_path), '', 'failed'
+        return 'skipped_exists', '', str(target_path), '', ''
     target_fs_path.parent.mkdir(parents=True, exist_ok=True)
     base_url = os.getenv(ATTACHMENT_BASE_URL_ENV, DEFAULT_ATTACHMENT_BASE_URL)
     url = f'{base_url.rstrip("/")}/weaver/weaver.file.FileDownload?fileid={meta["imagefileid"]}'
@@ -1883,7 +1946,16 @@ def _download_attachment_file(meta, cookie, log_prefix='附件下载'):
                 with open(temp_fs_path, 'wb') as file:
                     file.write(data)
             os.replace(temp_fs_path, target_fs_path)
-            return ('downloaded', '') if attempt == 1 else ('downloaded', f'重试成功: 第{attempt}次')
+            if _is_image_attachment_path(target_path):
+                try:
+                    final_path, conversion_status = _convert_image_attachment_to_pdf(target_path)
+                except RuntimeError as exc:
+                    return 'failed', str(exc), str(target_path), '', 'failed'
+                error = '' if attempt == 1 else f'重试成功: 第{attempt}次'
+                return 'downloaded', error, str(final_path), str(target_path), conversion_status
+            return (
+                ('downloaded', '') if attempt == 1 else ('downloaded', f'重试成功: 第{attempt}次')
+            ) + (str(target_path), '', '')
         except urllib.error.HTTPError as exc:
             last_error = str(exc)
             retryable = exc.code in (429, 500, 502, 503, 504)
@@ -1893,7 +1965,7 @@ def _download_attachment_file(meta, cookie, log_prefix='附件下载'):
         except RuntimeError as exc:
             if temp_fs_path.exists():
                 temp_fs_path.unlink(missing_ok=True)
-            return 'failed', str(exc)
+            return 'failed', str(exc), str(target_path), '', ''
 
         if temp_fs_path.exists():
             temp_fs_path.unlink(missing_ok=True)
@@ -1906,7 +1978,7 @@ def _download_attachment_file(meta, cookie, log_prefix='附件下载'):
             flush=True,
         )
         time.sleep(min(2 * attempt, 10))
-    return 'failed', last_error
+    return 'failed', last_error, str(target_path), '', ''
 
 
 def download_attachment_manifest(manifest_df, cookie, log_prefix='附件下载'):
@@ -1925,11 +1997,20 @@ def download_attachment_manifest(manifest_df, cookie, log_prefix='附件下载')
         for done_count, future in enumerate(as_completed(futures), 1):
             index = futures[future]
             try:
-                status, error = future.result()
+                status, error, final_path, original_path, conversion_status = future.result()
             except Exception as exc:  # 防御单个任务异常,不让整体下载中断。
                 status, error = 'failed', str(exc)
+                final_path = _cell_text(result_df.at[index, 'target_path']) if 'target_path' in result_df.columns else ''
+                original_path = ''
+                conversion_status = ''
             result_df.at[index, 'status'] = status
             result_df.at[index, 'error'] = error
+            if final_path:
+                result_df.at[index, 'target_path'] = final_path
+            if original_path:
+                result_df.at[index, 'original_target_path'] = original_path
+            if conversion_status:
+                result_df.at[index, 'image_conversion_status'] = conversion_status
             if error and (status == 'failed' or '重试成功' in error):
                 meta = result_df.loc[index]
                 print(

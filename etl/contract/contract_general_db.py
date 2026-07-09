@@ -127,6 +127,8 @@ DEFAULT_SEAL_NUMBER = 2
 DEFAULT_PREPAID = '否'
 DEFAULT_PAYMENT_NATURE = '一般付款'
 DEFAULT_CONTRACT_CREATOR_NAME = '黄劭文'
+RESIGNED_EXECUTOR_FALLBACK_USER_ID = '149744414'
+RESIGNED_EXECUTOR_FALLBACK_NAME = '杨昕'
 
 ATTACHMENT_COOKIE_ENV = c.ATTACHMENT_COOKIE_ENV
 ATTACHMENT_BASE_URL_ENV = c.ATTACHMENT_BASE_URL_ENV
@@ -381,6 +383,13 @@ def _first_non_blank(*values):
         if text:
             return text
     return ''
+
+
+def resolve_contract_executor_user_id(code, status, feishu_id_map):
+    user_id = feishu_id_map.get(_text(code), '')
+    if not user_id or _text(status) == '离职':
+        return RESIGNED_EXECUTOR_FALLBACK_USER_ID
+    return user_id
 
 
 def _split_multi_values(value):
@@ -2487,7 +2496,14 @@ def resolve_source_values(source_df, option_table=FW_TABLE):
         contact_values.extend(c.clean_text_values(_text(value).split(';')))
     feishu_id_by_contact = _timed('  ├─申请人/创建人飞书ID联系方式兜底(汉得)',
                                   lambda: build_feishu_employee_id_map_by_contact(contact_values))
-    df['合同执行人飞书ID'] = df['合同执行人员工号'].map(lambda code: feishu_id_map.get(_text(code), ''))
+    df['合同执行人飞书ID'] = df.apply(
+        lambda row: resolve_contract_executor_user_id(
+            row.get('合同执行人员工号'),
+            row.get('合同执行人状态'),
+            feishu_id_map,
+        ),
+        axis=1,
+    )
     df['合同创建人user_id'] = df.apply(
         lambda row: feishu_id_map.get(_text(row.get('合同创建人工号')), '')
         or next((
@@ -3084,8 +3100,7 @@ def build_order_detail_output(source_df, headers):
             _set(row, 'contract_number（合同编码）', _text(source['合同编号']))
             _set(row, 'custom_1_5549b19faea641eeac924deada603c11（订单名称）', order_name)
             _set(row, 'custom_1_7f977c0d30064dd199434f706470c669（订单编号）', order_code)
-            _set(row, 'custom_16_3171b080033943c9a98380f20e0895a8（成本中心）',
-                 _first_non_blank(entry.get('成本中心'), source.get('成本中心')))
+            _set(row, 'custom_16_3171b080033943c9a98380f20e0895a8（成本中心）', '')
             order_start_date = c.format_date(entry.get('订单开始日'))
             order_end_date = c.format_date(entry.get('订单结束日'))
             order_period = f'{order_start_date}~{order_end_date}'.strip('~')

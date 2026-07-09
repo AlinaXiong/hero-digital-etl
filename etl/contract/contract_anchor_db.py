@@ -2421,7 +2421,14 @@ def resolve_source_values(source_df):
     for value in pd.concat([df['合同创建人联系方式'], df['申请人联系方式']], ignore_index=True):
         contact_values.extend(c.clean_text_values(_text(value).split(';')))
     feishu_id_by_contact = base.build_feishu_employee_id_map_by_contact(contact_values)
-    df['合同执行人飞书ID'] = df['合同执行人员工号'].map(lambda code: feishu_id_map.get(_text(code), ''))
+    df['合同执行人飞书ID'] = df.apply(
+        lambda row: base.resolve_contract_executor_user_id(
+            row.get('合同执行人员工号'),
+            row.get('合同执行人状态'),
+            feishu_id_map,
+        ),
+        axis=1,
+    )
     df['合同创建人user_id'] = df.apply(
         lambda row: feishu_id_map.get(_text(row.get('合同创建人工号')), '')
         or next((
