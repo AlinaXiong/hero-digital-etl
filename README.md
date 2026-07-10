@@ -30,6 +30,7 @@ python run.py contract_anti_bribery_db
 python run.py contract_anti_bribery_attachments_db
 python run.py anti_bribery_signers_db
 python run.py export_feishu_employees
+python run.py check_zhishu_imported
 ```
 
 | 执行命令 | 业务含义 | 数据源 | 产出模板 |
@@ -50,6 +51,7 @@ python run.py export_feishu_employees
 | `python run.py contract_anti_bribery_attachments_db` | 合同迁移 - 反商业贿赂协议附件下载 | 反贿赂合同清洗口径 + 泛微合同稿件字段 | 反贿赂合同附件 + 下载清单 |
 | `python run.py anti_bribery_signers_db` | 反商业贿赂协议签署情况补登 | 泛微 `uf_htk` / `uf_htsp` + 签署情况底稿 | 反商业贿赂协议签署情况 |
 | `python run.py export_feishu_employees` | 飞书全量员工信息导出（合同相关辅助任务） | 飞书 CoreHR 员工接口 | 飞书员工信息 Excel |
+| `python run.py check_zhishu_imported` | 多线程检查 Excel 合同是否已导入智书，并生成未导入三列清单 | `resources/source/zhishu_import_check/已有标黄.xlsx` 或该目录唯一 `.xlsx` + 智书查询接口 | 未导入智书清单 |
 | `python run.py all` | 一次跑核心 DB 导入任务 | 依次执行 `ap_payment_opening_extra_db`、`ap_prepayment_opening_db`、`ar_invoice_opening_db`、`invoice_info_db` | 多个模板/清洗表 |
 | `python run.py contract_all` | 一次跑所有合同任务(不含附件下载) | 依次执行 `contract_general_db`、`contract_anchor_db`、`contract_anti_bribery_db` | 智书合同各模板 |
 | `python run.py contract_all_with_attachments` | 一次跑所有合同任务(含附件下载) | `contract_all` 三个任务 + `contract_general_attachments_db`、`contract_anchor_attachments_db`、`contract_anti_bribery_attachments_db` | 智书合同各模板 + 合同附件 |
@@ -343,6 +345,29 @@ python run.py ap_payment_opening_extra_db
 ```
 
 `.env` 读取真实数据库连接信息，本地使用即可，不要提交到 GitHub。脚本只执行 `SELECT` 查询，不写入数据库。
+
+## Swagger / HTTP API
+
+启动本地 API：
+
+```powershell
+uvicorn api:app --host 0.0.0.0 --port 8000
+```
+
+打开 Swagger UI：
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+常用接口：
+
+- `GET /tasks`：查看可执行任务
+- `POST /tasks/{task_name}/runs`：提交一个任务运行
+- `GET /runs`：查看最近运行记录
+- `GET /runs/{run_id}`：查看单次运行状态和日志尾部
+
+API 同一时间只允许一个 ETL 任务运行，避免并发写同一批输出目录。
 
 数据库访问统一走 SQLAlchemy。调试时可打印已代入参数、可直接复制到 MySQL 执行的 SQL：
 

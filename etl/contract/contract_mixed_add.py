@@ -148,6 +148,7 @@ GENERAL_PURCHASE_REQUEST_BLANK_COLUMNS = (
 )
 ANCHOR_MAIN_EXECUTOR_COLUMN_INDEX = 20  # Excel T 列
 ANCHOR_MAIN_EXECUTOR_OUTPUT_HEADER = '合同执行人'
+COUNTERPARTY_CODE_COLUMN = 'counter_party_code（对方主体编码）'
 
 CONTRACT_COLUMN_CANDIDATES = (
     '合同编号', '合同号', '合同编码', 'contract_number（合同编码）', 'contract_number',
@@ -644,6 +645,195 @@ def _blank_output_columns(output_df, columns):
     return result
 
 
+def _counterparty_name_keys(*values):
+    keys = []
+    for value in values:
+        key = c.normalize_name(value)
+        if key and key not in ('nan', 'none') and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _counterparty_info_names(info):
+    if not info:
+        return []
+    return [
+        info.get('source_name', ''),
+        info.get('name', ''),
+        info.get('target_name', ''),
+        info.get('taxpayer_name', ''),
+    ]
+
+
+def _append_unique_code(codes_by_key, key, code):
+    code = _text(code)
+    if not key or not code:
+        return
+    codes = codes_by_key.setdefault(key, [])
+    if code not in codes:
+        codes.append(code)
+
+
+def _join_counterparty_codes(*code_groups):
+    codes = []
+    for code_group in code_groups:
+        if isinstance(code_group, (list, tuple, set)):
+            raw_codes = code_group
+        else:
+            raw_codes = re.split(r'[;；]+', _text(code_group))
+        for code in raw_codes:
+            code = _text(code)
+            if code and code not in codes:
+                codes.append(code)
+    return ';'.join(codes)
+
+
+def _build_mixed_counterparty_code_map(source_df, include_anchor=False):
+    if source_df.empty:
+        return {}
+
+    vendor_codes_by_key = {}
+    customer_codes_by_key = {}
+    names = []
+    customer_info_map = source_df.attrs.get('customer_info_map', {})
+    supplier_info_map = source_df.attrs.get('supplier_info_map', {})
+
+    for info in customer_info_map.values():
+        info_names = _counterparty_info_names(info)
+        names.extend(info_names)
+        for key in _counterparty_name_keys(*info_names):
+            _append_unique_code(customer_codes_by_key, key, info.get('code', ''))
+
+    for info in supplier_info_map.values():
+        info_names = _counterparty_info_names(info)
+        names.extend(info_names)
+        for key in _counterparty_name_keys(*info_names):
+            _append_unique_code(vendor_codes_by_key, key, info.get('code', ''))
+
+    if include_anchor:
+        anchor_vendor_by_id = source_df.attrs.get('anchor_vendor_by_id_number', {})
+        anchor_vendor_by_name = source_df.attrs.get('anchor_vendor_by_name', {})
+        for source in source_df.to_dict('records'):
+            vendor_info = anchor.resolve_anchor_vendor_info(source, anchor_vendor_by_id, anchor_vendor_by_name)
+            info_names = [
+                vendor_info.get('source_name', ''),
+                vendor_info.get('name', ''),
+                _text(source.get('主播姓名')),
+                _text(source.get('主播昵称')),
+            ]
+            names.extend(info_names)
+            for key in _counterparty_name_keys(*info_names):
+                _append_unique_code(vendor_codes_by_key, key, vendor_info.get('code', ''))
+
+    vendor_info_by_name = c.build_hand_vendor_info_by_names(names)
+    for key, info in vendor_info_by_name.items():
+        _append_unique_code(vendor_codes_by_key, key, info.get('code', ''))
+
+    customer_code_by_name = c.build_customer_map_for_names(names)
+    for key, code in customer_code_by_name.items():
+        _append_unique_code(customer_codes_by_key, key, code)
+
+    return {
+        key: _join_counterparty_codes(vendor_codes_by_key.get(key, []), customer_codes_by_key.get(key, []))
+        for key in set(vendor_codes_by_key) & set(customer_codes_by_key)
+        if vendor_codes_by_key.get(key) and customer_codes_by_key.get(key)
+    }
+
+
+def _counterparty_code_for_names(name_values, current_code, mixed_code_by_name):
+    for key in _counterparty_name_keys(*name_values):
+        mixed_code = mixed_code_by_name.get(key)
+        if mixed_code:
+            return mixed_code
+    return current_code
+
+
+def _apply_general_mixed_counterparty_codes(counterparty_df, source_df):
+    if counterparty_df.empty or COUNTERPARTY_CODE_COLUMN not in counterparty_df.columns:
+        return counterparty_df
+    result = counterparty_df.copy()
+    mixed_code_by_name = _build_mixed_counterparty_code_map(source_df)
+    if not mixed_code_by_name:
+        return result
+
+    customer_info_map = source_df.attrs.get('customer_info_map', {})
+    supplier_info_map = source_df.attrs.get('supplier_info_map', {})
+    row_index = 0
+    for source in source_df.to_dict('records'):
+        for customer_id in c.parse_browser_ids(source.get('合同客户ID')):
+            if row_index >= len(result):
+                return result
+            info = customer_info_map.get(customer_id, {})
+            result.at[result.index[row_index], COUNTERPARTY_CODE_COLUMN] = _counterparty_code_for_names(
+                _counterparty_info_names(info),
+                result.iloc[row_index][COUNTERPARTY_CODE_COLUMN],
+                mixed_code_by_name,
+            )
+            row_index += 1
+        for supplier_id in c.parse_browser_ids(source.get('合同供应商ID')):
+            if row_index >= len(result):
+                return result
+            info = supplier_info_map.get(supplier_id, {})
+            result.at[result.index[row_index], COUNTERPARTY_CODE_COLUMN] = _counterparty_code_for_names(
+                _counterparty_info_names(info),
+                result.iloc[row_index][COUNTERPARTY_CODE_COLUMN],
+                mixed_code_by_name,
+            )
+            row_index += 1
+    return result
+
+
+def _apply_anchor_mixed_counterparty_codes(counterparty_df, source_df):
+    if counterparty_df.empty or COUNTERPARTY_CODE_COLUMN not in counterparty_df.columns:
+        return counterparty_df
+    result = counterparty_df.copy()
+    mixed_code_by_name = _build_mixed_counterparty_code_map(source_df, include_anchor=True)
+    if not mixed_code_by_name:
+        return result
+
+    customer_info_map = source_df.attrs.get('customer_info_map', {})
+    supplier_info_map = source_df.attrs.get('supplier_info_map', {})
+    anchor_vendor_by_id = source_df.attrs.get('anchor_vendor_by_id_number', {})
+    anchor_vendor_by_name = source_df.attrs.get('anchor_vendor_by_name', {})
+    row_index = 0
+    for source in source_df.to_dict('records'):
+        if row_index >= len(result):
+            return result
+        vendor_info = anchor.resolve_anchor_vendor_info(source, anchor_vendor_by_id, anchor_vendor_by_name)
+        result.at[result.index[row_index], COUNTERPARTY_CODE_COLUMN] = _counterparty_code_for_names(
+            [
+                vendor_info.get('source_name', ''),
+                vendor_info.get('name', ''),
+                _text(source.get('主播姓名')),
+                _text(source.get('主播昵称')),
+            ],
+            result.iloc[row_index][COUNTERPARTY_CODE_COLUMN],
+            mixed_code_by_name,
+        )
+        row_index += 1
+        for customer_id in c.parse_browser_ids(source.get('合同客户ID')):
+            if row_index >= len(result):
+                return result
+            info = customer_info_map.get(customer_id, {})
+            result.at[result.index[row_index], COUNTERPARTY_CODE_COLUMN] = _counterparty_code_for_names(
+                _counterparty_info_names(info),
+                result.iloc[row_index][COUNTERPARTY_CODE_COLUMN],
+                mixed_code_by_name,
+            )
+            row_index += 1
+        for supplier_id in c.parse_browser_ids(source.get('合同供应商ID')):
+            if row_index >= len(result):
+                return result
+            info = supplier_info_map.get(supplier_id, {})
+            result.at[result.index[row_index], COUNTERPARTY_CODE_COLUMN] = _counterparty_code_for_names(
+                _counterparty_info_names(info),
+                result.iloc[row_index][COUNTERPARTY_CODE_COLUMN],
+                mixed_code_by_name,
+            )
+            row_index += 1
+    return result
+
+
 def _rename_anchor_main_executor_header(output_file):
     path = Path(output_file)
     workbook = load_workbook(path)
@@ -681,6 +871,7 @@ def _build_general_sheet_frames(source_df):
     relation_df = _blank_output_columns(relation_df, GENERAL_RELATION_BLANK_COLUMNS)
     order_detail_df, _ = general.build_order_detail_output(source_df, headers[general.SHEET_ORDER_DETAIL])
     counterparty_df, _ = general.build_counterparty_output(source_df, headers[general.SHEET_COUNTERPARTY])
+    counterparty_df = _apply_general_mixed_counterparty_codes(counterparty_df, source_df)
     our_party_df, _ = general.build_our_party_output(source_df, headers[general.SHEET_OUR_PARTY])
     purchase_request_df = general.build_purchase_request_output(
         source_df,
@@ -715,6 +906,7 @@ def _build_anchor_sheet_frames(source_df):
         }
 
     counterparty_df, _ = anchor.build_counterparty_output(source_df, headers[anchor.SHEET_COUNTERPARTY])
+    counterparty_df = _apply_anchor_mixed_counterparty_codes(counterparty_df, source_df)
     our_party_df, _ = anchor.build_our_party_output(source_df, headers[anchor.SHEET_OUR_PARTY])
     fee_detail_df, _ = anchor.build_fee_detail_output(source_df, headers[anchor.SHEET_FEE_DETAIL])
     return headers, {
@@ -936,6 +1128,7 @@ def _write_general_workbook(source_df, input_df):
     )
     order_detail_df, _ = general.build_order_detail_output(source_df, headers[general.SHEET_ORDER_DETAIL])
     counterparty_df, _ = general.build_counterparty_output(source_df, headers[general.SHEET_COUNTERPARTY])
+    counterparty_df = _apply_general_mixed_counterparty_codes(counterparty_df, source_df)
     our_party_df, _ = general.build_our_party_output(source_df, headers[general.SHEET_OUR_PARTY])
     payment_df = general.build_payment_plan_output(source_df, headers[general.SHEET_PAYMENT_PLAN])
     collection_df = general.build_collection_plan_output(source_df, headers[general.SHEET_COLLECTION_PLAN])
@@ -987,6 +1180,7 @@ def _write_anchor_workbook(source_df, input_df):
     headers = anchor._template_headers()
     main_df = anchor.build_main_output(source_df, headers[anchor.SHEET_MAIN])
     counterparty_df, _ = anchor.build_counterparty_output(source_df, headers[anchor.SHEET_COUNTERPARTY])
+    counterparty_df = _apply_anchor_mixed_counterparty_codes(counterparty_df, source_df)
     our_party_df, _ = anchor.build_our_party_output(source_df, headers[anchor.SHEET_OUR_PARTY])
     fee_detail_df, _ = anchor.build_fee_detail_output(source_df, headers[anchor.SHEET_FEE_DETAIL])
 

@@ -11,6 +11,7 @@ import sys
 from datetime import datetime
 
 from etl.util import common as c
+from etl.util import check_zhishu_imported
 from etl.lark import export_feishu_employees
 
 from etl.contract import (
@@ -54,6 +55,7 @@ TASKS = {
     'contract_mixed_add_attachments_db': contract_mixed_add_attachments_db.run,  # 混合合同清单增补附件下载
     'invoice_info_db': invoice_info_db.run,               # 发票信息(DB直连版)
     'export_feishu_employees': export_feishu_employees.run,  # 飞书全量员工信息导出Excel
+    'check_zhishu_imported': check_zhishu_imported.run,  # 多线程检查合同是否已导入智书并生成未导入清单
 }
 
 ALL_TASK_NAMES = (
