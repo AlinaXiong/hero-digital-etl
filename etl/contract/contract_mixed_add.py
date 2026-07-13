@@ -28,7 +28,6 @@ from __future__ import annotations
 import os
 import re
 import json
-from copy import copy
 from datetime import datetime
 from pathlib import Path
 
@@ -87,6 +86,8 @@ def _resolve_input_file(value=None):
 INPUT_FILE = _resolve_input_file(os.getenv('CONTRACT_MIXED_ADD_FILE'))
 
 DATE_SUFFIX = general.DATE_SUFFIX
+MIXED_TEMPLATE_FILE = general.TEMPLATE_DIR / '智书合同字段-混合流程.xlsx'
+INPUT_TEMPLATE_FILE = general.TEMPLATE_DIR / '混合合同增补业务清单模板.xlsx'
 GENERAL_OUTPUT_FILE = OUTPUT_DIR / f'智书合同字段_一般流程_混合增补_{DATE_SUFFIX}.xlsx'
 ANCHOR_OUTPUT_FILE = OUTPUT_DIR / f'智书合同字段_主播流程_混合增补_{DATE_SUFFIX}.xlsx'
 MIXED_OUTPUT_FILE = OUTPUT_DIR / f'智书合同字段_混合增补_{DATE_SUFFIX}.xlsx'
@@ -570,6 +571,39 @@ def _write_template_sheets_with_fallback(template_file, output_file, sheet_to_df
         return c.write_template_sheets(template_file, fallback, sheet_to_df, extra_sheets=extra_sheets)
 
 
+def _mixed_template_headers():
+    """读取混合模板的表头，以模板字段名覆盖同位置的历史 builder 字段名。"""
+    workbook = load_workbook(MIXED_TEMPLATE_FILE, read_only=True, data_only=True)
+    try:
+        return {
+            sheet_name: [_text(cell.value) for cell in next(
+                workbook[sheet_name].iter_rows(min_row=1, max_row=1)
+            )]
+            for sheet_name in JAVA_GENERAL_SHEET_NAMES + JAVA_ANCHOR_SHEET_NAMES
+        }
+    finally:
+        workbook.close()
+
+
+def _apply_mixed_template_headers(sheet_to_df):
+    """保持字段列顺序，将输出 DataFrame 的表头对齐至混合模板。"""
+    template_headers = _mixed_template_headers()
+    result = {}
+    for sheet_name, output_df in sheet_to_df.items():
+        headers = template_headers.get(sheet_name)
+        if headers is None:
+            raise KeyError(f'混合流程模板缺少 sheet: {sheet_name}')
+        if len(output_df.columns) != len(headers):
+            raise ValueError(
+                f'混合流程模板字段数不匹配: {sheet_name}，'
+                f'输出 {len(output_df.columns)} 列，模板 {len(headers)} 列'
+            )
+        aligned = output_df.copy()
+        aligned.columns = headers
+        result[sheet_name] = aligned
+    return result
+
+
 def _ensure_placeholder_sheets(workbook, sheet_names):
     for sheet_name in sheet_names:
         if sheet_name not in workbook.sheetnames:
@@ -933,38 +967,10 @@ def _build_attachment_audit(source_df, flow_module, headers):
     return manifest_df, missing_df
 
 
-def _apply_anchor_template_layout(output_file):
-    """Copy the four anchor-sheet header layouts into the combined workbook."""
-    workbook = load_workbook(output_file)
-    template = load_workbook(anchor.TEMPLATE_FILE)
-    for source_name, target_name in ANCHOR_SOURCE_TO_JAVA_SHEET_NAMES.items():
-        source = template[source_name]
-        target = workbook[target_name]
-        target.freeze_panes = source.freeze_panes
-        target.sheet_view.showGridLines = source.sheet_view.showGridLines
-        target.sheet_format.defaultColWidth = source.sheet_format.defaultColWidth
-        target.sheet_format.defaultRowHeight = source.sheet_format.defaultRowHeight
-
-        for column_name, dimension in source.column_dimensions.items():
-            target_dimension = target.column_dimensions[column_name]
-            target_dimension.width = dimension.width
-            target_dimension.hidden = dimension.hidden
-            target_dimension.outlineLevel = dimension.outlineLevel
-        if 1 in source.row_dimensions:
-            target.row_dimensions[1].height = source.row_dimensions[1].height
-
-        for source_cell in source[1]:
-            target_cell = target.cell(row=1, column=source_cell.column)
-            if source_cell.has_style:
-                target_cell._style = copy(source_cell._style)
-            if source_cell.hyperlink:
-                target_cell._hyperlink = copy(source_cell.hyperlink)
-            if source_cell.comment:
-                target_cell.comment = copy(source_cell.comment)
-    workbook.save(output_file)
-
-
 def _write_mixed_workbook(general_source_df, anchor_source_df):
+    if not MIXED_TEMPLATE_FILE.exists():
+        raise FileNotFoundError(f'混合流程模板不存在: {MIXED_TEMPLATE_FILE}')
+
     MIXED_ATTACHMENT_ROOT.mkdir(parents=True, exist_ok=True)
     general_headers, general_sheets = _build_general_sheet_frames(general_source_df)
     anchor_headers, anchor_sheets = _build_anchor_sheet_frames(anchor_source_df)
@@ -973,17 +979,22 @@ def _write_mixed_workbook(general_source_df, anchor_source_df):
     anchor_manifest_df, anchor_missing_df = _build_attachment_audit(
         anchor_source_df, anchor, anchor_headers)
 
+    general_java_sheets = {
+        GENERAL_SOURCE_TO_JAVA_SHEET_NAMES[source_name]: output_df
+        for source_name, output_df in general_sheets.items()
+    }
     anchor_java_sheets = {
         ANCHOR_SOURCE_TO_JAVA_SHEET_NAMES[source_name]: output_df
         for source_name, output_df in anchor_sheets.items()
     }
-    path = _write_template_sheets_with_fallback(
-        general.TEMPLATE_FILE,
-        MIXED_OUTPUT_FILE,
-        general_sheets,
-        extra_sheets=anchor_java_sheets,
+    template_sheets = _apply_mixed_template_headers(
+        {**general_java_sheets, **anchor_java_sheets}
     )
-    _apply_anchor_template_layout(path)
+    path = _write_template_sheets_with_fallback(
+        MIXED_TEMPLATE_FILE,
+        MIXED_OUTPUT_FILE,
+        template_sheets,
+    )
     path = _align_sheet_order_for_zhishu_sync(path, '混合流程')
     path = _rename_anchor_main_executor_header(path)
     print(f'[合同混合增补] 已生成混合导入文件: {path}')
@@ -1314,7 +1325,8 @@ def _write_audit_workbook(input_audit_df, route_df, unresolved_df, general_add_e
     return Path(path) if path else None
 
 
-def run():
+def run(suppress_audit=False):
+    """生成混合导入结果；API 调用可跳过仅供审计的处理清单 Excel。"""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     input_df = _read_mixed_input(INPUT_FILE)
     general_add_keys, general_add_exclude_df = _load_general_add_processed_keys()
@@ -1362,17 +1374,21 @@ def run():
         unresolved_df,
     )
 
-    audit_path = _write_audit_workbook(
-        input_audit_df,
-        route_df,
-        unresolved_df,
-        general_add_exclude_df,
-        general_manifest_df,
-        general_missing_df,
-        anchor_manifest_df,
-        anchor_missing_df,
-        mixed_path,
-    )
+    audit_path = None
+    if suppress_audit:
+        print('[合同混合增补] API 调用跳过处理清单 Excel')
+    else:
+        audit_path = _write_audit_workbook(
+            input_audit_df,
+            route_df,
+            unresolved_df,
+            general_add_exclude_df,
+            general_manifest_df,
+            general_missing_df,
+            anchor_manifest_df,
+            anchor_missing_df,
+            mixed_path,
+        )
 
     return [
         path

@@ -243,7 +243,8 @@ def _write_outputs(input_df, route_df, general_add_exclude_df,
     return output_file
 
 
-def run():
+def run(suppress_manifest=False):
+    """下载附件；API 调用可跳过仅供审计的附件下载清单 Excel。"""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     mixed.MIXED_ATTACHMENT_ROOT.mkdir(parents=True, exist_ok=True)
     input_df, route_df, general_add_exclude_df, general_scope, anchor_scope = _resolve_scope_from_mixed_logic()
@@ -268,6 +269,9 @@ def run():
     general_manifest_df = _download_manifest(general_manifest_df, cookie, FLOW_GENERAL)
     anchor_manifest_df = _download_manifest(anchor_manifest_df, cookie, FLOW_ANCHOR)
 
+    if suppress_manifest:
+        print('[混合增补附件] API 调用跳过附件下载清单 Excel')
+        return None
     return _write_outputs(
         input_df,
         route_df,

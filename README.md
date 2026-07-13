@@ -366,8 +366,41 @@ http://127.0.0.1:8000/docs
 - `POST /tasks/{task_name}/runs`：提交一个任务运行
 - `GET /runs`：查看最近运行记录
 - `GET /runs/{run_id}`：查看单次运行状态和日志尾部
+- `GET /runs/{run_id}/logs`：查看任务运行中的实时日志
+- `POST /contract-mixed-add/runs`：上传混合合同增补 Excel 并执行 `contract_mixed_add_all`
+- `GET /runs/{run_id}/download`：任务成功后下载本次生成的 Excel、JSON、审计表和附件 ZIP
 
 API 同一时间只允许一个 ETL 任务运行，避免并发写同一批输出目录。
+任务执行过程会同时输出到启动 Uvicorn 的终端，以及 `GET /runs/{run_id}/logs`，便于实时观察进度和异常。
+
+混合合同增补先在上传接口说明中点击“下载业务清单模板”，再填写并提交。业务清单只需填写前三列：合同编号、关联业财订单、智书合同类型；后两列为空时系统沿用原合同数据。任务成功后下载的结果 ZIP 才包含 13 Sheet 智书导入 Excel（9 个一般流程 Sheet、4 个主播流程 Sheet），无需作为接口输入上传。
+
+```powershell
+curl.exe -L "http://127.0.0.1:8000/contract-mixed-add/template" `
+  -o "混合合同增补业务清单模板.xlsx"
+```
+
+接口示例（请求返回 `run_id` 后轮询状态；成功后下载结果包）：
+
+```powershell
+$response = curl.exe -X POST "http://127.0.0.1:8000/contract-mixed-add/runs" `
+  -F "file=@C:\path\技术导入数据清单.xlsx" `
+  -F "notify_open_id=ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" `
+  -F "notify_email=user@example.com" | ConvertFrom-Json
+
+Invoke-RestMethod "http://127.0.0.1:8000/runs/$($response.run_id)"
+Invoke-RestMethod "http://127.0.0.1:8000/runs/$($response.run_id)/logs?tail_chars=4000"
+curl.exe -L "http://127.0.0.1:8000/runs/$($response.run_id)/download" `
+  -o "contract_mixed_add_result.zip"
+```
+
+上传只接受 `.xlsx` 或 `.xlsm`，默认最大 50 MB；可通过环境变量 `API_MAX_UPLOAD_MB` 调整。接口结果 ZIP 内包含混合导入 Excel、同步请求 JSON 和附件文件（若 `.env` 已配置有效的泛微附件 cookie）；不会生成“处理清单”或“附件下载清单”两个审计 Excel。
+
+`notify_open_id` 为必填字段，格式必须为 `ou_` 加 16 至 64 位小写字母/数字。请在飞书中 `@系统咨询小助手`，询问“我的 Open ID 是多少”，并使用该通知机器人应用对应的 `ou_...`。飞书 Open ID 按应用隔离，其他应用或其他机器人的 Open ID 不能用于本接口。
+
+`notify_email` 为可选字段，仅在结果 ZIP 超过飞书 30 MB 限制时使用：填写后会将 ZIP 作为邮件附件发送；不填写则飞书消息给出本次任务的完整接口下载地址。邮件发送需在 `.env` 配置 `SMTP_HOST`、`SMTP_FROM`，以及需要鉴权时的 `SMTP_USERNAME` / `SMTP_PASSWORD`。
+
+任务成功时，机器人会先发送结果 ZIP 文件（飞书单文件上限 30 MB），再发送完成通知；任务失败时发送错误通知。飞书应用需开通 `im:message:send_as_bot` 和“获取与上传图片或文件资源”权限，并将收件人纳入应用可用范围。通知机器人可在 `.env` 单独配置 `FEISHU_NOTIFY_APP_ID` / `FEISHU_NOTIFY_APP_SECRET`，未配置时复用主飞书应用。若需让飞书用户在其他电脑或手机上打开下载地址，应配置 `API_PUBLIC_BASE_URL`（例如公司内网可访问的 `https://etl.example.com`）。
 
 数据库访问统一走 SQLAlchemy。调试时可打印已代入参数、可直接复制到 MySQL 执行的 SQL：
 

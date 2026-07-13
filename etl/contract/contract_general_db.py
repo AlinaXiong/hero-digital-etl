@@ -126,6 +126,10 @@ DEFAULT_SIGN_FORM = '纸质签约'
 DEFAULT_SEAL_NUMBER = 2
 DEFAULT_PREPAID = '否'
 DEFAULT_PAYMENT_NATURE = '一般付款'
+PAYMENT_NATURE_FIELD_CANDIDATES = (
+    'payment_plan_list[].payment_custom_attributes/custom_15_071a641657e94f2faf65bf973850166e（付款性质）',
+    'payment_plan_list[].payment_custom_attributes/custom_付款性质（付款性质）',
+)
 DEFAULT_CONTRACT_CREATOR_NAME = '黄劭文'
 RESIGNED_EXECUTOR_FALLBACK_USER_ID = '149744414'
 RESIGNED_EXECUTOR_FALLBACK_NAME = '杨昕'
@@ -1310,6 +1314,17 @@ def _set(row, field_name, value):
             row[header] = value
             return
     raise KeyError(f'模板缺少字段: {field_name}')
+
+
+def _set_first_existing(row, field_names, value):
+    """按候选字段顺序写值，兼容同一业务字段在不同模板版本中的表头。"""
+    normalized_headers = {_normalize_field_name(header): header for header in row}
+    for field_name in field_names:
+        header = normalized_headers.get(_normalize_field_name(field_name))
+        if header is not None:
+            row[header] = value
+            return
+    raise KeyError(f'模板缺少字段（候选: {" / ".join(field_names)}）')
 
 
 def _read_general_required_rules(headers_by_sheet):
@@ -3275,8 +3290,7 @@ def build_payment_plan_output(source_df, headers):
         _set(row, 'payment_plan_list[].prepaid（是否预付）', DEFAULT_PREPAID)
         _set(row, 'payment_plan_list[].payment_amount（付款金额）', amount)
         _set(row, 'payment_plan_list[].payment_desc（付款说明）', desc[:80])
-        _set(row, 'payment_plan_list[].payment_custom_attributes/custom_15_071a641657e94f2faf65bf973850166e（付款性质）',
-             DEFAULT_PAYMENT_NATURE)
+        _set_first_existing(row, PAYMENT_NATURE_FIELD_CANDIDATES, DEFAULT_PAYMENT_NATURE)
         _set(row, 'payment_plan_list[].payment_counter_party[].counter_party_code（付款对象）',
              _first_counterparty_code(source, customer_info_map, supplier_info_map))
         _set(row, '付款计划行id(付款记录传的id)', line_id)

@@ -9,11 +9,14 @@
 同口径(均为 V 编号)。
 """
 import json
+import mimetypes
 import os
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+from pathlib import Path
 
 FEISHU_HOST = os.getenv('FEISHU_HOST', 'https://open.feishu.cn').rstrip('/')
 _TOKEN_PATH = '/open-apis/auth/v3/tenant_access_token/internal'
@@ -22,13 +25,17 @@ _DEPARTMENT_BATCH_PATH = '/open-apis/corehr/v2/departments/batch_get'
 _COMPANY_LIST_PATH = '/open-apis/corehr/v1/companies'
 _LOCATION_LIST_PATH = '/open-apis/corehr/v1/locations'
 _EMPLOYEE_TYPE_LIST_PATH = '/open-apis/corehr/v1/employee_types'
+_MESSAGE_CREATE_PATH = '/open-apis/im/v1/messages'
+_FILE_UPLOAD_PATH = '/open-apis/im/v1/files'
+_MAX_MESSAGE_FILE_BYTES = 30 * 1024 * 1024
 _MAX_RETRY = 4
 
 _STATUS_MAPS_CACHE = None
 _TOKEN_CACHE = None
+_MESSAGE_TOKEN_CACHE = None
 
 
-def _request(method, path, params=None, payload=None, timeout=30, auth=True):
+def _request(method, path, params=None, payload=None, timeout=30, auth=True, token=None):
     """统一请求(GET/POST), 带瞬时网络/SSL 异常重试(代理环境偶发 SSL EOF)。"""
     url = FEISHU_HOST + path
     if params:
@@ -40,10 +47,57 @@ def _request(method, path, params=None, payload=None, timeout=30, auth=True):
         if data is not None:
             req.add_header('Content-Type', 'application/json; charset=utf-8')
         if auth:
-            req.add_header('Authorization', f'Bearer {_token()}')
+            req.add_header('Authorization', f'Bearer {token or _token()}')
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode('utf-8'))
+        except urllib.error.HTTPError as error:
+            # 4xx 多为权限、应用可用范围或收件人 ID 问题；保留飞书响应体便于定位。
+            detail = error.read().decode('utf-8', errors='replace').strip()
+            raise RuntimeError(f'飞书 API HTTP {error.code}: {detail or error.reason}') from error
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+            last_error = error
+            if attempt < _MAX_RETRY - 1:
+                time.sleep(1.5 * (attempt + 1))
+    raise last_error
+
+
+def _request_multipart(path, fields, file_field, file_path, timeout=60, token=None):
+    """上传飞书 IM 文件，保留与 JSON 请求相同的错误诊断与网络重试。"""
+    target = Path(file_path)
+    boundary = f'----HeroDigitalEtl{uuid.uuid4().hex}'
+    chunks = []
+    for name, value in fields.items():
+        chunks.extend((
+            f'--{boundary}\r\n'.encode('ascii'),
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode('utf-8'),
+            str(value).encode('utf-8'),
+            b'\r\n',
+        ))
+    content_type = mimetypes.guess_type(target.name)[0] or 'application/octet-stream'
+    chunks.extend((
+        f'--{boundary}\r\n'.encode('ascii'),
+        (
+            f'Content-Disposition: form-data; name="{file_field}"; '
+            f'filename="{target.name}"\r\n'
+        ).encode('utf-8'),
+        f'Content-Type: {content_type}\r\n\r\n'.encode('ascii'),
+        target.read_bytes(),
+        b'\r\n',
+        f'--{boundary}--\r\n'.encode('ascii'),
+    ))
+    data = b''.join(chunks)
+    last_error = None
+    for attempt in range(_MAX_RETRY):
+        request = urllib.request.Request(FEISHU_HOST + path, data=data, method='POST')
+        request.add_header('Authorization', f'Bearer {token or _token()}')
+        request.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode('utf-8'))
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode('utf-8', errors='replace').strip()
+            raise RuntimeError(f'飞书文件上传 HTTP {error.code}: {detail or error.reason}') from error
         except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
             last_error = error
             if attempt < _MAX_RETRY - 1:
@@ -70,15 +124,21 @@ def _post_json(path, payload, headers=None, timeout=30):
     raise last_error
 
 
-def _get_tenant_access_token():
-    app_id = os.environ.get('FEISHU_APP_ID', '').strip()
-    app_secret = os.environ.get('FEISHU_APP_SECRET', '').strip()
+def _get_tenant_access_token_for(app_id, app_secret, credential_name):
     if not app_id or not app_secret:
-        raise RuntimeError('缺少 FEISHU_APP_ID / FEISHU_APP_SECRET; 请在 .env 配置')
+        raise RuntimeError(f'缺少 {credential_name}; 请在 .env 配置')
     result = _request('POST', _TOKEN_PATH, payload={'app_id': app_id, 'app_secret': app_secret}, auth=False)
     if result.get('code') != 0:
         raise RuntimeError(f"飞书获取 tenant_access_token 失败: {result.get('code')} {result.get('msg')}")
     return result['tenant_access_token']
+
+
+def _get_tenant_access_token():
+    return _get_tenant_access_token_for(
+        os.environ.get('FEISHU_APP_ID', '').strip(),
+        os.environ.get('FEISHU_APP_SECRET', '').strip(),
+        'FEISHU_APP_ID / FEISHU_APP_SECRET',
+    )
 
 
 def _token():
@@ -88,10 +148,91 @@ def _token():
     return _TOKEN_CACHE
 
 
+def _message_token():
+    """通知机器人可单独配置，避免影响用于 CoreHR 查询的既有应用。"""
+    global _MESSAGE_TOKEN_CACHE
+    app_id = os.environ.get('FEISHU_NOTIFY_APP_ID', '').strip()
+    app_secret = os.environ.get('FEISHU_NOTIFY_APP_SECRET', '').strip()
+    if not app_id and not app_secret:
+        return _token()
+    if not app_id or not app_secret:
+        raise RuntimeError('FEISHU_NOTIFY_APP_ID / FEISHU_NOTIFY_APP_SECRET 必须同时配置')
+    if not _MESSAGE_TOKEN_CACHE:
+        _MESSAGE_TOKEN_CACHE = _get_tenant_access_token_for(
+            app_id,
+            app_secret,
+            'FEISHU_NOTIFY_APP_ID / FEISHU_NOTIFY_APP_SECRET',
+        )
+    return _MESSAGE_TOKEN_CACHE
+
+
 def _check(result, tag):
     if result.get('code') != 0:
         raise RuntimeError(f"飞书 {tag} 失败: {result.get('code')} {result.get('msg')}")
     return result.get('data') or {}
+
+
+def send_text_message(open_id, text):
+    """以应用机器人身份向指定飞书 open_id 发送文本消息。"""
+    receiver = str(open_id or '').strip()
+    if not receiver:
+        raise ValueError('飞书 open_id 不能为空')
+    content = str(text or '').strip()
+    if not content:
+        raise ValueError('飞书消息内容不能为空')
+    result = _request(
+        'POST',
+        _MESSAGE_CREATE_PATH,
+        params={'receive_id_type': 'open_id'},
+        payload={
+            'receive_id': receiver,
+            'msg_type': 'text',
+            'content': json.dumps({'text': content}, ensure_ascii=False),
+        },
+        token=_message_token(),
+    )
+    return _check(result, '发送消息')
+
+
+def send_file_message(open_id, file_path):
+    """以应用机器人身份上传并发送一个不超过 30 MB 的本地文件。"""
+    receiver = str(open_id or '').strip()
+    if not receiver:
+        raise ValueError('飞书 open_id 不能为空')
+    path = Path(file_path)
+    if not path.is_file():
+        raise FileNotFoundError(f'待发送的飞书文件不存在: {path}')
+    size = path.stat().st_size
+    if size <= 0:
+        raise ValueError(f'待发送的飞书文件为空: {path.name}')
+    if size > _MAX_MESSAGE_FILE_BYTES:
+        raise ValueError(
+            f'飞书单文件最大支持 30 MB，当前 ZIP 为 {size / 1024 / 1024:.1f} MB: {path.name}'
+        )
+
+    token = _message_token()
+    upload = _request_multipart(
+        _FILE_UPLOAD_PATH,
+        fields={'file_type': 'stream', 'file_name': path.name},
+        file_field='file',
+        file_path=path,
+        token=token,
+    )
+    file_key = _check(upload, '上传文件').get('file_key')
+    if not file_key:
+        raise RuntimeError(f'飞书上传文件未返回 file_key: {upload}')
+    result = _request(
+        'POST',
+        _MESSAGE_CREATE_PATH,
+        params={'receive_id_type': 'open_id'},
+        payload={
+            'receive_id': receiver,
+            'msg_type': 'file',
+            'content': json.dumps({'file_key': file_key}, ensure_ascii=False),
+        },
+        token=token,
+    )
+    return _check(result, '发送文件消息')
 
 
 def search_all(path, fields=None, extra_params=None):
