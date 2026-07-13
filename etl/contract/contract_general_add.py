@@ -467,7 +467,7 @@ def build_payment_plan_output(source_df, headers, input_df=None):
         general._set(row, 'payment_plan_list[].payment_desc（付款说明）', 'H-KF虚拟订单付款计划合并')
         general._set(
             row,
-            'payment_plan_list[].payment_custom_attributes/custom_付款性质（付款性质）',
+            'payment_plan_list[].payment_custom_attributes/custom_15_071a641657e94f2faf65bf973850166e（付款性质）',
             general.DEFAULT_PAYMENT_NATURE,
         )
         general._set(

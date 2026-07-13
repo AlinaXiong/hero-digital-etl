@@ -3275,7 +3275,7 @@ def build_payment_plan_output(source_df, headers):
         _set(row, 'payment_plan_list[].prepaid（是否预付）', DEFAULT_PREPAID)
         _set(row, 'payment_plan_list[].payment_amount（付款金额）', amount)
         _set(row, 'payment_plan_list[].payment_desc（付款说明）', desc[:80])
-        _set(row, 'payment_plan_list[].payment_custom_attributes/custom_付款性质（付款性质）',
+        _set(row, 'payment_plan_list[].payment_custom_attributes/custom_15_071a641657e94f2faf65bf973850166e（付款性质）',
              DEFAULT_PAYMENT_NATURE)
         _set(row, 'payment_plan_list[].payment_counter_party[].counter_party_code（付款对象）',
              _first_counterparty_code(source, customer_info_map, supplier_info_map))
