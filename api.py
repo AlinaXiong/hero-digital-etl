@@ -194,35 +194,83 @@ def _run_download_url(run: RunInfo) -> str:
     return run.download_url or _download_url(run.run_id)
 
 
-def _notification_text(run: RunInfo) -> str:
-    if run.status == "succeeded":
-        return (
-            "混合合同增补任务已完成。\n"
+def _notification_card(
+    run: RunInfo,
+    *,
+    title: str,
+    template: str,
+    delivery: str,
+    package: Path | None = None,
+    error: str | None = None,
+    show_download: bool = True,
+) -> dict[str, Any]:
+    """构造兼容飞书消息接口的 1.0 交互卡片。"""
+    fields = [{
+        "is_short": False,
+        "text": {"tag": "lark_md", "content": f"**任务编号**\n`{run.run_id}`"},
+    }, {
+        "is_short": False,
+        "text": {"tag": "lark_md", "content": f"**处理结果**\n{delivery}"},
+    }]
+    if package is not None:
+        fields.append({
+            "is_short": True,
+            "text": {
+                "tag": "lark_md",
+                "content": f"**结果包大小**\n{package.stat().st_size / 1024 / 1024:.1f} MB",
+            },
+        })
+    if error:
+        fields.append({
+            "is_short": False,
+            "text": {
+                "tag": "lark_md",
+                "content": f"**说明**\n{str(error).strip()[:500]}",
+            },
+        })
+
+    elements: list[dict[str, Any]] = [{"tag": "div", "fields": fields}]
+    if show_download:
+        elements.extend((
+            {"tag": "hr"},
+            {
+                "tag": "action",
+                "actions": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "下载结果"},
+                    "type": "primary",
+                    "url": _run_download_url(run),
+                }],
+            },
+        ))
+    return {
+        "config": {"wide_screen_mode": True, "enable_forward": True},
+        "header": {
+            "template": template,
+            "title": {"tag": "plain_text", "content": title},
+        },
+        "elements": elements,
+    }
+
+
+def _send_notification_card(
+    feishu: Any,
+    notify_open_id: str,
+    run: RunInfo,
+    **card_kwargs: Any,
+) -> None:
+    """优先发交互卡片；飞书卡片配置异常时降级为文本通知。"""
+    card = _notification_card(run, **card_kwargs)
+    try:
+        feishu.send_interactive_card(notify_open_id, card)
+    except Exception:
+        fallback = (
+            f"{card_kwargs['title']}\n"
             f"任务编号：{run.run_id}\n"
-            "结果 ZIP 已作为飞书文件发送。\n"
-            f"备用下载：{_run_download_url(run)}"
+            f"处理结果：{card_kwargs['delivery']}\n"
+            f"下载结果：{_run_download_url(run)}"
         )
-    return (
-        "混合合同增补任务执行失败。\n"
-        f"任务编号：{run.run_id}\n"
-        f"错误：{run.error or '请通过接口日志查看详情'}"
-    )
-
-
-def _oversized_zip_notification_text(run: RunInfo, package: Path, email_sent: bool = False) -> str:
-    size_mb = package.stat().st_size / 1024 / 1024
-    delivery = (
-        "结果 ZIP 已发送至您填写的邮箱。"
-        if email_sent else
-        "未填写邮箱，因此未发送邮件。"
-    )
-    return (
-        "混合合同增补任务已完成。\n"
-        f"任务编号：{run.run_id}\n"
-        f"结果 ZIP 为 {size_mb:.1f} MB，超过飞书单文件 30 MB 限制，未作为附件发送。\n"
-        f"{delivery}\n"
-        f"请从接口下载：{_run_download_url(run)}"
-    )
+        feishu.send_text_message(notify_open_id, fallback)
 
 
 def _send_notification(
@@ -233,7 +281,16 @@ def _send_notification(
     from etl.lark import feishu
 
     if run.status != "succeeded":
-        feishu.send_text_message(notify_open_id, _notification_text(run))
+        _send_notification_card(
+            feishu,
+            notify_open_id,
+            run,
+            title="混合合同增补执行失败",
+            template="red",
+            delivery="任务执行失败，请查看错误说明后修正业务清单。",
+            error=run.error or "请通过接口日志查看详情",
+            show_download=False,
+        )
         return
 
     package = _result_zip_path(run)
@@ -251,39 +308,60 @@ def _send_notification(
                     run.run_id,
                 )
             except Exception as exc:
-                feishu.send_text_message(
+                _send_notification_card(
+                    feishu,
                     notify_open_id,
-                    "混合合同增补任务已完成，但超大 ZIP 邮件发送失败。\n"
-                    f"任务编号：{run.run_id}\n"
-                    f"原因：{type(exc).__name__}: {exc}\n"
-                    f"请从接口下载：{_run_download_url(run)}",
+                    run,
+                    title="混合合同增补已完成",
+                    template="orange",
+                    delivery="ZIP 超过飞书 30 MB 限制，邮件发送失败，请通过接口下载。",
+                    package=package,
+                    error=f"{type(exc).__name__}: {exc}",
                 )
                 return
-            feishu.send_text_message(
+            _send_notification_card(
+                feishu,
                 notify_open_id,
-                _oversized_zip_notification_text(run, package, email_sent=True),
+                run,
+                title="混合合同增补已完成",
+                template="green",
+                delivery="ZIP 超过飞书 30 MB 限制，已发送至您填写的邮箱。",
+                package=package,
             )
             return
-        feishu.send_text_message(
+        _send_notification_card(
+            feishu,
             notify_open_id,
-            _oversized_zip_notification_text(run, package),
+            run,
+            title="混合合同增补已完成",
+            template="orange",
+            delivery="ZIP 超过飞书 30 MB 限制；未填写邮箱，请通过接口下载。",
+            package=package,
         )
         return
     try:
         feishu.send_file_message(notify_open_id, package)
     except Exception as exc:
-        fallback = (
-            "混合合同增补任务已完成，但 ZIP 附件发送失败。\n"
-            f"任务编号：{run.run_id}\n"
-            f"原因：{type(exc).__name__}: {exc}\n"
-            f"请从接口下载：{_run_download_url(run)}"
+        _send_notification_card(
+            feishu,
+            notify_open_id,
+            run,
+            title="混合合同增补已完成",
+            template="orange",
+            delivery="ZIP 飞书附件发送失败，请通过接口下载。",
+            package=package,
+            error=f"{type(exc).__name__}: {exc}",
         )
-        try:
-            feishu.send_text_message(notify_open_id, fallback)
-        except Exception:
-            pass
-        raise
-    feishu.send_text_message(notify_open_id, _notification_text(run))
+        return
+    _send_notification_card(
+        feishu,
+        notify_open_id,
+        run,
+        title="混合合同增补已完成",
+        template="green",
+        delivery="结果 ZIP 已作为飞书附件发送。",
+        package=package,
+    )
 
 
 def _run_in_background(
@@ -621,7 +699,7 @@ def download_contract_mixed_add_template() -> FileResponse:
 1. 点击 [下载业务清单模板](/contract-mixed-add/template)；填写前三列后上传。结果 ZIP 中会生成 13 Sheet 智书导入 Excel，不需要将其作为输入上传。
 2. 填写业务清单的前三列：合同编号、关联业财订单、智书合同类型；上传 `.xlsx` 或 `.xlsm` 文件。
 3. 填入接收飞书通知的 `notify_open_id`；`notify_email` 可选，仅在 ZIP 超过 30 MB 时用于接收邮件附件。响应中的 `run_id` 可用于查询状态、日志和下载 ZIP。
-4. 成功后机器人会发送结果 ZIP 附件（飞书单文件上限 30 MB）；若超限，填写了邮箱则发送邮件附件，否则飞书消息会直接给出本次任务的完整下载地址。也可调用 `GET /runs/{run_id}/download` 下载结果。失败时请通过 `GET /runs/{run_id}/logs` 查看完整日志。
+4. 机器人会以飞书卡片通知任务结果，并提供“下载结果”按钮。成功后会发送结果 ZIP 附件（飞书单文件上限 30 MB）；若超限，填写了邮箱则发送邮件附件，否则请点击卡片按钮或调用 `GET /runs/{run_id}/download` 下载结果。失败时请通过 `GET /runs/{run_id}/logs` 查看完整日志。
 
 **如何获取 Open ID：**在飞书中 `@系统咨询小助手`，询问“我的 Open ID 是多少”。只可使用该通知机器人应用对应的 `ou_...`；其他应用或其他机器人的 Open ID 会因应用隔离而无法收取消息。
 """,

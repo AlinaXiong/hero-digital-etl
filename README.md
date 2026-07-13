@@ -400,7 +400,7 @@ curl.exe -L "http://127.0.0.1:8000/runs/$($response.run_id)/download" `
 
 `notify_email` 为可选字段，仅在结果 ZIP 超过飞书 30 MB 限制时使用：填写后会将 ZIP 作为邮件附件发送；不填写则飞书消息给出本次任务的完整接口下载地址。邮件发送需在 `.env` 配置 `SMTP_HOST`、`SMTP_FROM`，以及需要鉴权时的 `SMTP_USERNAME` / `SMTP_PASSWORD`。
 
-任务成功时，机器人会先发送结果 ZIP 文件（飞书单文件上限 30 MB），再发送完成通知；任务失败时发送错误通知。飞书应用需开通 `im:message:send_as_bot` 和“获取与上传图片或文件资源”权限，并将收件人纳入应用可用范围。通知机器人可在 `.env` 单独配置 `FEISHU_NOTIFY_APP_ID` / `FEISHU_NOTIFY_APP_SECRET`，未配置时复用主飞书应用。若需让飞书用户在其他电脑或手机上打开下载地址，应配置 `API_PUBLIC_BASE_URL`（例如公司内网可访问的 `https://etl.example.com`）。
+任务成功时，机器人会先发送结果 ZIP 文件（飞书单文件上限 30 MB），再发送一张带“下载结果”按钮的完成卡片；任务失败时发送红色错误卡片。ZIP 超限时会发送橙色提示卡片，填写了邮箱则附带邮件发送结果。飞书应用需开通 `im:message:send_as_bot` 和“获取与上传图片或文件资源”权限，并将收件人纳入应用可用范围。通知机器人可在 `.env` 单独配置 `FEISHU_NOTIFY_APP_ID` / `FEISHU_NOTIFY_APP_SECRET`，未配置时复用主飞书应用。若需让飞书用户在其他电脑或手机上打开下载地址，应配置 `API_PUBLIC_BASE_URL`（例如公司内网可访问的 `https://etl.example.com`）。
 
 数据库访问统一走 SQLAlchemy。调试时可打印已代入参数、可直接复制到 MySQL 执行的 SQL：
 

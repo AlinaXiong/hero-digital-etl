@@ -194,6 +194,27 @@ def send_text_message(open_id, text):
     return _check(result, '发送消息')
 
 
+def send_interactive_card(open_id, card):
+    """以应用机器人身份向指定 open_id 发送飞书交互卡片。"""
+    receiver = str(open_id or '').strip()
+    if not receiver:
+        raise ValueError('飞书 open_id 不能为空')
+    if not isinstance(card, dict) or not card:
+        raise ValueError('飞书卡片内容不能为空')
+    result = _request(
+        'POST',
+        _MESSAGE_CREATE_PATH,
+        params={'receive_id_type': 'open_id'},
+        payload={
+            'receive_id': receiver,
+            'msg_type': 'interactive',
+            'content': json.dumps(card, ensure_ascii=False),
+        },
+        token=_message_token(),
+    )
+    return _check(result, '发送卡片消息')
+
+
 def send_file_message(open_id, file_path):
     """以应用机器人身份上传并发送一个不超过 30 MB 的本地文件。"""
     receiver = str(open_id or '').strip()
