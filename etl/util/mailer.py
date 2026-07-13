@@ -44,11 +44,11 @@ def send_result_zip_email(recipient: str, package: Path, download_url: str, run_
 
     host, port, sender, username, password, use_ssl, starttls = _smtp_config()
     message = EmailMessage()
-    message['Subject'] = f'混合合同增补结果 - {run_id[:8]}'
+    message['Subject'] = f'智书合同导入清单结果 - {run_id[:8]}'
     message['From'] = sender
     message['To'] = destination
     message.set_content(
-        '混合合同增补任务已完成。\n\n'
+        '智书合同导入清单任务已完成。\n\n'
         f'任务编号：{run_id}\n'
         '结果 ZIP 已作为邮件附件发送。\n'
         f'备用下载地址：{download_url}\n'

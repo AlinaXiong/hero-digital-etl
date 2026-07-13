@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""混合增补导入文件附件下载。
+"""智书合同导入清单附件下载。
 
 只处理 contract_mixed_add 生成的混合导入范围，与
 「智书合同字段_混合增补_*.xlsx」保持一致。
@@ -150,16 +150,16 @@ def _download_manifest(manifest_df, cookie, flow_name):
         result = manifest_df.copy()
         result['status'] = status
         result['error'] = error
-        print(f'[混合增补附件] {flow_name}: 未下载 {len(result)} 条, status={status}')
+        print(f'[智书合同导入清单附件] {flow_name}: 未下载 {len(result)} 条, status={status}')
         return result
 
-    print(f'[混合增补附件] {flow_name}: 开始下载 {len(manifest_df)} 个文件')
+    print(f'[智书合同导入清单附件] {flow_name}: 开始下载 {len(manifest_df)} 个文件')
     if flow_name == FLOW_ANCHOR:
         return anchor._download_attachment_manifest_16_workers(manifest_df, cookie)
     return general.download_attachment_manifest_16_workers(
         manifest_df,
         cookie,
-        log_prefix='混合增补一般流程附件',
+        log_prefix='智书合同导入清单一般流程附件',
     )
 
 
@@ -249,11 +249,11 @@ def run(suppress_manifest=False):
     mixed.MIXED_ATTACHMENT_ROOT.mkdir(parents=True, exist_ok=True)
     input_df, route_df, general_add_exclude_df, general_scope, anchor_scope = _resolve_scope_from_mixed_logic()
     if route_df.empty:
-        print('[混合增补附件] 混合增补输入经剔除后无待处理合同')
+        print('[智书合同导入清单附件] 输入经剔除后无待处理合同')
         return None
 
     print(
-        '[混合增补附件] 输入范围:',
+        '[智书合同导入清单附件] 输入范围:',
         f'{len(input_df)} 行 / {input_df["合同key"].nunique()} 个合同;',
         f'剔除 {(input_df["是否剔除"] == "Y").sum()} 行;',
         f'一般流程 {general_scope["合同key"].nunique() if len(general_scope) else 0} 个;',
@@ -270,7 +270,7 @@ def run(suppress_manifest=False):
     anchor_manifest_df = _download_manifest(anchor_manifest_df, cookie, FLOW_ANCHOR)
 
     if suppress_manifest:
-        print('[混合增补附件] API 调用跳过附件下载清单 Excel')
+        print('[智书合同导入清单附件] API 调用跳过附件下载清单 Excel')
         return None
     return _write_outputs(
         input_df,

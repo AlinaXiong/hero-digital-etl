@@ -45,8 +45,8 @@ python run.py check_zhishu_imported
 | `python run.py contract_general_attachments_db` | 合同迁移 - 一般流程附件下载 | 泛微合同稿件字段 + `workflow_docshareinfo` / `docimagefile` | 一般流程合同附件 + 下载清单 |
 | `python run.py contract_anchor_db` | 合同迁移 - 主播流程 Excel 导出 | 泛微 `uf_htk` + `uf_zbkp` / `uf_zbkp_dt1` + Hand 主播档案 | 智书合同字段-主播流程 |
 | `python run.py contract_anchor_attachments_db` | 合同迁移 - 主播流程附件下载 | 主播合同清洗口径 + 泛微合同稿件字段 | 主播流程合同附件 + 下载清单 |
-| `python run.py contract_mixed_add` | 混合合同清单增补 - 一般流程 + 主播流程合并导入 Excel，并生成 0/9 JSON 和 0 状态自动审批 JSON | 默认读取 `resources/source/contract_mixed_add/技术导入数据清单.xlsx` | 智书合同字段_混合增补 + 同步请求 JSON |
-| `python run.py contract_mixed_add_all` | 混合合同清单增补一键任务，先生成 Excel/0/9/自动审批 JSON，再生成/下载附件 | 同上；附件下载依赖 `.env` 的泛微 cookie | 混合导入 Excel + 附件文件夹 + 下载清单 + 0/9/自动审批 JSON |
+| `python run.py contract_mixed_add` | 智书合同导入清单 - 一般流程 + 主播流程合并导入 Excel，并生成 0/9 JSON 和 0 状态自动审批 JSON | 默认读取 `resources/source/contract_mixed_add/技术导入数据清单.xlsx` | 智书合同字段_混合增补 + 同步请求 JSON |
+| `python run.py contract_mixed_add_all` | 智书合同导入清单一键任务，先生成 Excel/0/9/自动审批 JSON，再生成/下载附件 | 同上；附件下载依赖 `.env` 的泛微 cookie | 混合导入 Excel + 附件文件夹 + 下载清单 + 0/9/自动审批 JSON |
 | `python run.py contract_anti_bribery_db` | 合同迁移 - 反商业贿赂协议 Excel 导出 | 泛微一般合同/赛事合同 + 反贿赂模板 | 反商业贿赂协议清洗结果 |
 | `python run.py contract_anti_bribery_attachments_db` | 合同迁移 - 反商业贿赂协议附件下载 | 反贿赂合同清洗口径 + 泛微合同稿件字段 | 反贿赂合同附件 + 下载清单 |
 | `python run.py anti_bribery_signers_db` | 反商业贿赂协议签署情况补登 | 泛微 `uf_htk` / `uf_htsp` + 签署情况底稿 | 反商业贿赂协议签署情况 |
@@ -101,7 +101,7 @@ python run.py contract_all_with_attachments
 python run.py export_feishu_employees
 ```
 
-### contract_mixed_add_all（混合合同增补一键任务）
+### contract_mixed_add_all（智书合同导入清单一键任务）
 
 把业务清单 Excel 放到：
 
@@ -367,17 +367,17 @@ http://127.0.0.1:8000/docs
 - `GET /runs`：查看最近运行记录
 - `GET /runs/{run_id}`：查看单次运行状态和日志尾部
 - `GET /runs/{run_id}/logs`：查看任务运行中的实时日志
-- `POST /contract-mixed-add/runs`：上传混合合同增补 Excel 并执行 `contract_mixed_add_all`
+- `POST /contract-mixed-add/runs`：上传智书合同导入业务清单并执行 `contract_mixed_add_all`
 - `GET /runs/{run_id}/download`：任务成功后下载本次生成的 Excel、JSON、审计表和附件 ZIP
 
-API 同一时间只允许一个 ETL 任务运行，避免并发写同一批输出目录。
+API 允许多人同时提交任务；每次提交都会立即返回独立的 `run_id`。普通 `/tasks/{task_name}/runs` 任务仍按顺序串行执行；智书合同导入清单使用独立子进程并行执行，默认最大并行数为 2，超出的任务保持 `queued`，可通过 `API_MIXED_ADD_MAX_CONCURRENCY` 调整。
 任务执行过程会同时输出到启动 Uvicorn 的终端，以及 `GET /runs/{run_id}/logs`，便于实时观察进度和异常。
 
-混合合同增补先在上传接口说明中点击“下载业务清单模板”，再填写并提交。业务清单只需填写前三列：合同编号、关联业财订单、智书合同类型；后两列为空时系统沿用原合同数据。任务成功后下载的结果 ZIP 才包含 13 Sheet 智书导入 Excel（9 个一般流程 Sheet、4 个主播流程 Sheet），无需作为接口输入上传。
+智书合同导入清单先在上传接口说明中点击“下载业务清单模板”，再填写并提交。业务清单只需填写前三列：合同编号、关联业财订单、智书合同类型；后两列为空时系统沿用原合同数据。任务成功后下载的结果 ZIP 才包含 13 Sheet 智书导入 Excel（9 个一般流程 Sheet、4 个主播流程 Sheet），无需作为接口输入上传。
 
 ```powershell
 curl.exe -L "http://127.0.0.1:8000/contract-mixed-add/template" `
-  -o "混合合同增补业务清单模板.xlsx"
+  -o "智书合同导入清单模板.xlsx"
 ```
 
 接口示例（请求返回 `run_id` 后轮询状态；成功后下载结果包）：
@@ -391,7 +391,7 @@ $response = curl.exe -X POST "http://127.0.0.1:8000/contract-mixed-add/runs" `
 Invoke-RestMethod "http://127.0.0.1:8000/runs/$($response.run_id)"
 Invoke-RestMethod "http://127.0.0.1:8000/runs/$($response.run_id)/logs?tail_chars=4000"
 curl.exe -L "http://127.0.0.1:8000/runs/$($response.run_id)/download" `
-  -o "contract_mixed_add_result.zip"
+  -o "智书合同导入清单结果.zip"
 ```
 
 上传只接受 `.xlsx` 或 `.xlsm`，默认最大 50 MB；可通过环境变量 `API_MAX_UPLOAD_MB` 调整。接口结果 ZIP 内包含混合导入 Excel、同步请求 JSON 和附件文件（若 `.env` 已配置有效的泛微附件 cookie）；不会生成“处理清单”或“附件下载清单”两个审计 Excel。

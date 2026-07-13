@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""混合合同清单增补导入任务。
+"""智书合同导入清单任务。
 
 同一份业务清单里可能同时包含一般流程合同和主播流程合同。本任务只负责:
 
@@ -53,7 +53,7 @@ def _default_input_file():
             return xlsx_files[0]
         if len(xlsx_files) > 1:
             raise RuntimeError(
-                '混合增补输入目录中存在多个 Excel，请只保留一个导入清单，'
+                '智书合同导入清单输入目录中存在多个 Excel，请只保留一个导入清单，'
                 '或设置 CONTRACT_MIXED_ADD_FILE 指向具体 .xlsx 文件: '
                 + ', '.join(path.name for path in xlsx_files)
             )
@@ -67,7 +67,7 @@ def _input_file_from_directory(directory):
     if not xlsx_files:
         return directory / DEFAULT_INPUT_FILE_NAME
     raise RuntimeError(
-        '混合增补输入目录中存在多个 Excel，请只保留一个导入清单，'
+        '智书合同导入清单输入目录中存在多个 Excel，请只保留一个导入清单，'
         '或设置 CONTRACT_MIXED_ADD_FILE 指向具体 .xlsx 文件: '
         + ', '.join(path.name for path in xlsx_files)
     )
@@ -202,14 +202,14 @@ def _read_mixed_input(path):
     path = _resolve_input_file(path)
     if not path.exists():
         raise FileNotFoundError(
-            '混合增补输入文件不存在: '
+            '智书合同导入清单输入文件不存在: '
             f'{path}\n'
             f'请把唯一一份 Excel 放到 {SOURCE_DIR}，推荐文件名: {DEFAULT_INPUT_FILE_NAME}；'
             '或设置环境变量 CONTRACT_MIXED_ADD_FILE 指向具体文件/目录。'
         )
     if path.is_dir():
         raise IsADirectoryError(
-            '混合增补输入路径是目录，且未找到可自动识别的 Excel: '
+            '智书合同导入清单输入路径是目录，且未找到可自动识别的 Excel: '
             f'{path}\n'
             f'请在该目录只放置一份 Excel，推荐文件名: {DEFAULT_INPUT_FILE_NAME}，'
             '或设置 CONTRACT_MIXED_ADD_FILE 指向具体 .xlsx 文件。'
@@ -297,7 +297,7 @@ def _load_general_add_processed_keys():
                 if key.startswith('H-KF'):
                     processed_keys.add(f'{key}_VIRTUAL')
         except Exception as error:
-            print(f'[合同混合增补] contract_general_add子合同排除池读取失败,仅使用直接输入清单: {error}')
+            print(f'[智书合同导入清单] contract_general_add子合同排除池读取失败,仅使用直接输入清单: {error}')
 
     extra_df = pd.DataFrame(child_rows)
     exclude_df = pd.concat([direct_df, extra_df], ignore_index=True) if not extra_df.empty else direct_df
@@ -667,7 +667,7 @@ def _align_sheet_order_for_zhishu_sync(output_file, flow_name):
             workbook.remove(worksheet)
     workbook.active = active_index
     workbook.save(path)
-    print(f'[合同混合增补] 已按Java SheetRole顺序整理{flow_name}文件: {path}')
+    print(f'[智书合同导入清单] 已按Java SheetRole顺序整理{flow_name}文件: {path}')
     return path
 
 
@@ -997,7 +997,7 @@ def _write_mixed_workbook(general_source_df, anchor_source_df):
     )
     path = _align_sheet_order_for_zhishu_sync(path, '混合流程')
     path = _rename_anchor_main_executor_header(path)
-    print(f'[合同混合增补] 已生成混合导入文件: {path}')
+    print(f'[智书合同导入清单] 已生成混合导入文件: {path}')
     return (
         path,
         general_manifest_df,
@@ -1100,14 +1100,14 @@ def _write_sync_request_files(general_source_df, anchor_source_df, mixed_path):
         'threadCount': 5,
     })
     print(
-        '[合同混合增补] 已生成同步请求:',
+        '[智书合同导入清单] 已生成同步请求:',
         f'归档(9) {len(archived)} 个 -> {archived_path};',
         f'其他(0) {len(other)} 个 -> {other_path};',
         f'0状态自动审批 {sum(len(items) for items in approve_node_groups.values())} 个 -> {approve_path};',
         f'同步业财 {len(status_by_contract)} 个 -> {yecai_path}',
     )
     if approve_skipped:
-        print(f'[合同混合增补] 0状态自动审批跳过 {len(approve_skipped)} 个合同: 合同审批状态为空')
+        print(f'[智书合同导入清单] 0状态自动审批跳过 {len(approve_skipped)} 个合同: 合同审批状态为空')
     return archived_path, other_path, approve_path, yecai_path
 
 
@@ -1124,7 +1124,7 @@ def _flow_scope_summary(flow_name, source_df, input_df, output_file):
 
 def _write_general_workbook(source_df, input_df):
     if source_df.empty:
-        print('[合同混合增补] 一般流程无可生成合同,跳过一般流程导入文件')
+        print('[智书合同导入清单] 一般流程无可生成合同,跳过一般流程导入文件')
         return None, pd.DataFrame(), pd.DataFrame()
 
     headers = general._template_headers()
@@ -1179,13 +1179,13 @@ def _write_general_workbook(source_df, input_df):
         },
     )
     path = _align_sheet_order_for_zhishu_sync(path, '一般流程')
-    print(f'[合同混合增补] 已生成一般流程导入文件: {path}')
+    print(f'[智书合同导入清单] 已生成一般流程导入文件: {path}')
     return path, manifest_df, missing_df
 
 
 def _write_anchor_workbook(source_df, input_df):
     if source_df.empty:
-        print('[合同混合增补] 主播流程无可生成合同,跳过主播流程导入文件')
+        print('[智书合同导入清单] 主播流程无可生成合同,跳过主播流程导入文件')
         return None, pd.DataFrame(), pd.DataFrame()
 
     headers = anchor._template_headers()
@@ -1226,7 +1226,7 @@ def _write_anchor_workbook(source_df, input_df):
     anchor._add_platform_audit_sheet(path, source_df)
     path = _align_sheet_order_for_zhishu_sync(path, '主播流程')
     path = _rename_anchor_main_executor_header(path)
-    print(f'[合同混合增补] 已生成主播流程导入文件: {path}')
+    print(f'[智书合同导入清单] 已生成主播流程导入文件: {path}')
     return path, manifest_df, missing_df
 
 
@@ -1321,7 +1321,7 @@ def _write_audit_workbook(input_audit_df, route_df, unresolved_df, general_add_e
         print(f'处理清单被占用,改写到: {fallback}')
         path = c.write_exceptions(fallback, sheets)
     if path:
-        print(f'[合同混合增补] 已生成处理清单: {path}')
+        print(f'[智书合同导入清单] 已生成处理清单: {path}')
     return Path(path) if path else None
 
 
@@ -1337,7 +1337,7 @@ def run(suppress_audit=False):
     anchor_keys = route_df.loc[route_df['路由流程'].eq('主播流程'), '合同key'] if not route_df.empty else []
 
     print(
-        '[合同混合增补] 输入:',
+        '[智书合同导入清单] 输入:',
         f'{len(input_df)} 行 / {input_df["合同key"].nunique()} 个合同;',
         f'剔除 {(input_df["是否剔除"] == "Y").sum()} 行;',
         f'一般流程 {len(list(general_keys))} 个;',
@@ -1376,7 +1376,7 @@ def run(suppress_audit=False):
 
     audit_path = None
     if suppress_audit:
-        print('[合同混合增补] API 调用跳过处理清单 Excel')
+        print('[智书合同导入清单] API 调用跳过处理清单 Excel')
     else:
         audit_path = _write_audit_workbook(
             input_audit_df,

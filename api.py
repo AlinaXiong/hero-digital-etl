@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
 """ETL 的 HTTP API。
 
-所有 ETL 任务会写入共享的输出目录，也会复用模块级配置。因此服务一次只执行
-一个任务。混合合同增补支持直接上传 Excel；任务完成后可下载本次生成的 Excel、
-JSON、审计文件和附件 ZIP。
+普通 ETL 任务会写入共享输出目录并复用模块级配置，因此通过后台队列串行执行。
+智书合同导入清单任务使用独立子进程和独立运行目录并行执行；任务完成后可下载本次
+生成的 Excel、JSON、审计文件和附件 ZIP。
 """
 from __future__ import annotations
 
 import io
+import json
 import os
+import queue
 import re
+import subprocess
 import sys
 import threading
 import traceback
@@ -30,6 +33,10 @@ from run import TASKS
 
 API_RUN_ROOT = c.OUT_DIR / "api_runs"
 MAX_UPLOAD_BYTES = int(os.getenv("API_MAX_UPLOAD_MB", "50")) * 1024 * 1024
+MIXED_ADD_MAX_CONCURRENCY = max(
+    1,
+    int(os.getenv("API_MIXED_ADD_MAX_CONCURRENCY", "2")),
+)
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 EXCEL_EXTENSIONS = frozenset({".xlsx", ".xlsm"})
 FEISHU_OPEN_ID_PATTERN = re.compile(r"^ou_[a-z0-9]{16,64}$")
@@ -65,6 +72,7 @@ class RunLog(BaseModel):
 class HealthInfo(BaseModel):
     status: Literal["ok"] = "ok"
     active_run_id: str | None = None
+    active_run_ids: list[str] = Field(default_factory=list)
 
 
 class TaskInfo(BaseModel):
@@ -105,8 +113,8 @@ app = FastAPI(
     title="Hero Digital ETL API",
     version="1.0.0",
     description=(
-        "提交 ETL 任务、查看运行日志，并下载混合合同增补结果。\n\n"
-        "**混合合同增补使用顺序：**先下载业务清单模板，填写后提交；"
+        "提交 ETL 任务、查看运行日志，并下载智书合同导入清单结果。\n\n"
+        "**智书合同导入清单使用顺序：**先下载业务清单模板，填写后提交；"
         "任务结束会向指定飞书用户发送通知。"
     ),
 )
@@ -114,7 +122,14 @@ app = FastAPI(
 _state_lock = threading.RLock()
 _runs: dict[str, RunInfo] = {}
 _run_logs: dict[str, str] = {}
-_active_run_id: str | None = None
+_active_run_ids: set[str] = set()
+_RunJob = tuple[str, Callable[..., Any], str | None, str | None, bool]
+_run_queue: queue.Queue[_RunJob] = queue.Queue()
+_run_worker_lock = threading.Lock()
+_run_worker_thread: threading.Thread | None = None
+_mixed_run_queue: queue.Queue[_RunJob] = queue.Queue()
+_mixed_worker_lock = threading.Lock()
+_mixed_worker_threads: list[threading.Thread] = []
 
 
 def _now() -> datetime:
@@ -146,7 +161,14 @@ def _task_description(task: Callable[[], Any]) -> str:
 def health() -> HealthInfo:
     """返回服务状态，供健康检查和自动化调用。"""
     with _state_lock:
-        return HealthInfo(active_run_id=_active_run_id)
+        active_run_ids = sorted(
+            _active_run_ids,
+            key=lambda run_id: _runs[run_id].started_at or _runs[run_id].submitted_at,
+        )
+        return HealthInfo(
+            active_run_id=active_run_ids[0] if active_run_ids else None,
+            active_run_ids=active_run_ids,
+        )
 
 
 @app.get("/health", response_model=HealthInfo, tags=["系统"])
@@ -207,7 +229,7 @@ def _notification_card(
     """构造兼容飞书消息接口的 1.0 交互卡片。"""
     fields = [{
         "is_short": False,
-        "text": {"tag": "lark_md", "content": f"**任务编号**\n`{run.run_id}`"},
+        "text": {"tag": "lark_md", "content": f"**任务编号**\n{run.run_id}"},
     }, {
         "is_short": False,
         "text": {"tag": "lark_md", "content": f"**处理结果**\n{delivery}"},
@@ -285,7 +307,7 @@ def _send_notification(
             feishu,
             notify_open_id,
             run,
-            title="混合合同增补执行失败",
+            title="智书合同导入清单执行失败",
             template="red",
             delivery="任务执行失败，请查看错误说明后修正业务清单。",
             error=run.error or "请通过接口日志查看详情",
@@ -312,7 +334,7 @@ def _send_notification(
                     feishu,
                     notify_open_id,
                     run,
-                    title="混合合同增补已完成",
+                    title="智书合同导入清单已完成",
                     template="orange",
                     delivery="ZIP 超过飞书 30 MB 限制，邮件发送失败，请通过接口下载。",
                     package=package,
@@ -323,7 +345,7 @@ def _send_notification(
                 feishu,
                 notify_open_id,
                 run,
-                title="混合合同增补已完成",
+                title="智书合同导入清单已完成",
                 template="green",
                 delivery="ZIP 超过飞书 30 MB 限制，已发送至您填写的邮箱。",
                 package=package,
@@ -333,7 +355,7 @@ def _send_notification(
             feishu,
             notify_open_id,
             run,
-            title="混合合同增补已完成",
+            title="智书合同导入清单已完成",
             template="orange",
             delivery="ZIP 超过飞书 30 MB 限制；未填写邮箱，请通过接口下载。",
             package=package,
@@ -346,7 +368,7 @@ def _send_notification(
             feishu,
             notify_open_id,
             run,
-            title="混合合同增补已完成",
+            title="智书合同导入清单已完成",
             template="orange",
             delivery="ZIP 飞书附件发送失败，请通过接口下载。",
             package=package,
@@ -357,7 +379,7 @@ def _send_notification(
         feishu,
         notify_open_id,
         run,
-        title="混合合同增补已完成",
+        title="智书合同导入清单已完成",
         template="green",
         delivery="结果 ZIP 已作为飞书附件发送。",
         package=package,
@@ -366,12 +388,11 @@ def _send_notification(
 
 def _run_in_background(
     run_id: str,
-    runner: Callable[[], Any],
+    runner: Callable[..., Any],
     notify_open_id: str | None = None,
     notify_email: str | None = None,
+    streamed_runner: bool = False,
 ) -> None:
-    global _active_run_id
-
     stdout_log = _LiveRunLog(run_id, sys.__stdout__)
     stderr_log = _LiveRunLog(run_id, sys.__stderr__)
     result: Any = None
@@ -381,11 +402,16 @@ def _run_in_background(
         run = _runs[run_id]
         run.status = "running"
         run.started_at = _now()
+        _active_run_ids.add(run_id)
 
     try:
-        # 运行期间禁止并发提交，因而重定向标准输出不会串入另一个 ETL 任务日志。
-        with redirect_stdout(stdout_log), redirect_stderr(stderr_log):
-            result = runner()
+        if streamed_runner:
+            # 并行任务由独立子进程执行，显式转发输出，不能改写进程级 sys.stdout。
+            result = runner(stdout_log, stderr_log)
+        else:
+            # 普通任务仍串行执行，兼容依赖 print 的历史脚本。
+            with redirect_stdout(stdout_log), redirect_stderr(stderr_log):
+                result = runner()
         succeeded = True
     except Exception as exc:  # 保留任务原始异常及回溯，供调用方排查。
         error = f"{type(exc).__name__}: {exc}"
@@ -434,7 +460,82 @@ def _run_in_background(
         if notify_open_id:
             run.notification_status = "sent" if notification_sent else "failed"
             run.notification_error = notification_error
-        _active_run_id = None
+        _active_run_ids.discard(run_id)
+
+
+def _run_queue_worker(work_queue: queue.Queue[_RunJob]) -> None:
+    """执行指定队列；队列的工作线程数量决定最大并行数。"""
+    while True:
+        job = work_queue.get()
+        run_id = job[0]
+        try:
+            _run_in_background(*job)
+        except BaseException as exc:  # 防止单个任务的 API 收尾异常终止整个工作队列。
+            error = f"{type(exc).__name__}: {exc}"
+            trace = traceback.format_exc()
+            with _state_lock:
+                content = _run_logs.get(run_id, "") + trace
+                _run_logs[run_id] = content
+                run = _runs.get(run_id)
+                if run is not None:
+                    run.status = "failed"
+                    run.finished_at = _now()
+                    run.error = error
+                    run.log_tail = _tail(content, 4_000)[0]
+                _active_run_ids.discard(run_id)
+            try:
+                _save_log_file(run_id, content)
+            except Exception:
+                pass
+        finally:
+            work_queue.task_done()
+
+
+def _enqueue_run(
+    run_id: str,
+    runner: Callable[[], Any],
+    notify_open_id: str | None = None,
+    notify_email: str | None = None,
+) -> None:
+    """把任务加入进程内 FIFO 队列，并确保唯一的守护工作线程已启动。"""
+    global _run_worker_thread
+
+    _run_queue.put((run_id, runner, notify_open_id, notify_email, False))
+    with _run_worker_lock:
+        if _run_worker_thread is not None and _run_worker_thread.is_alive():
+            return
+        _run_worker_thread = threading.Thread(
+            target=_run_queue_worker,
+            args=(_run_queue,),
+            name="etl-worker",
+            daemon=True,
+        )
+        _run_worker_thread.start()
+
+
+def _enqueue_mixed_run(
+    run_id: str,
+    runner: Callable[[io.TextIOBase, io.TextIOBase], Any],
+    notify_open_id: str | None = None,
+    notify_email: str | None = None,
+) -> None:
+    """把混合合同任务加入可并行队列，每个工作线程只监控一个隔离子进程。"""
+    global _mixed_worker_threads
+
+    _mixed_run_queue.put((run_id, runner, notify_open_id, notify_email, True))
+    with _mixed_worker_lock:
+        _mixed_worker_threads = [
+            worker for worker in _mixed_worker_threads if worker.is_alive()
+        ]
+        for index in range(len(_mixed_worker_threads), MIXED_ADD_MAX_CONCURRENCY):
+            worker = threading.Thread(
+                target=_run_queue_worker,
+                args=(_mixed_run_queue,),
+                name=f"mixed-etl-worker-{index + 1}",
+                daemon=True,
+            )
+            worker.start()
+            _mixed_worker_threads.append(worker)
 
 
 def _normalise_output_files(value: Any) -> list[str]:
@@ -456,19 +557,12 @@ def _normalise_output_files(value: Any) -> list[str]:
 
 def create_run(task_name: str, runner: Callable[[], Any] | None = None) -> RunInfo:
     """提交一个后台任务。测试或内部调用可传入 ``runner`` 覆盖已登记任务。"""
-    global _active_run_id
-
     if runner is None:
         runner = TASKS.get(task_name)
     if runner is None:
         raise HTTPException(status_code=404, detail=f"未知任务: {task_name}")
 
     with _state_lock:
-        if _active_run_id is not None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"已有任务正在运行: {_active_run_id}",
-            )
         run_id = uuid.uuid4().hex
         run = RunInfo(
             run_id=run_id,
@@ -478,15 +572,8 @@ def create_run(task_name: str, runner: Callable[[], Any] | None = None) -> RunIn
         )
         _runs[run_id] = run
         _run_logs[run_id] = ""
-        _active_run_id = run_id
 
-    thread = threading.Thread(
-        target=_run_in_background,
-        args=(run_id, runner),
-        name=f"etl-{run_id[:8]}",
-        daemon=True,
-    )
-    thread.start()
+    _enqueue_run(run_id, runner)
     return _copy_run(run)
 
 
@@ -585,7 +672,7 @@ def _package_contract_mixed_add_result(run_id: str, generated: list[Path]) -> Pa
     """打包该次任务的 Excel、请求 JSON 和实际下载附件。"""
     from etl.contract import contract_mixed_add as mixed
 
-    package = API_RUN_ROOT / run_id / "result" / "contract_mixed_add_result.zip"
+    package = API_RUN_ROOT / run_id / "result" / "智书合同导入清单结果.zip"
     package.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(package, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in generated:
@@ -652,7 +739,7 @@ def _mixed_add_run_context(input_file: Path, output_dir: Path):
 
 
 def _run_contract_mixed_add_all(input_file: Path, run_id: str) -> list[Path]:
-    """在当前任务线程内用上传文件运行原有的一键流程。"""
+    """在隔离进程内用上传文件运行原有的一键流程。"""
     generated_dir = API_RUN_ROOT / run_id / "generated"
     with _mixed_add_run_context(input_file, generated_dir) as (mixed, attachments):
         print("=== 运行 contract_mixed_add_all: contract_mixed_add ===")
@@ -666,6 +753,88 @@ def _run_contract_mixed_add_all(input_file: Path, run_id: str) -> list[Path]:
         return [*generated, package]
 
 
+def _mixed_worker_result_file(run_id: str) -> Path:
+    return API_RUN_ROOT / run_id / "worker_result.json"
+
+
+def _run_contract_mixed_add_subprocess(
+    input_file: Path,
+    run_id: str,
+    stdout_log: io.TextIOBase,
+    stderr_log: io.TextIOBase,
+) -> list[Path]:
+    """在独立 Python 进程执行任务，并把子进程输出实时转发到本次运行日志。"""
+    del stderr_log  # 子进程 stderr 合并到 stdout，确保输出顺序稳定且不会阻塞管道。
+
+    result_file = _mixed_worker_result_file(run_id)
+    result_file.unlink(missing_ok=True)
+    command = [
+        sys.executable,
+        "-u",
+        "-X",
+        "utf8",
+        str(Path(__file__).resolve()),
+        "--contract-mixed-add-worker",
+        str(input_file.resolve()),
+        run_id,
+        str(API_RUN_ROOT.resolve()),
+    ]
+    environment = os.environ.copy()
+    environment["PYTHONIOENCODING"] = "utf-8"
+    print(
+        f"[API] 启动智书合同导入清单独立进程: run_id={run_id}",
+        file=stdout_log,
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=c.ROOT,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if process.stdout is not None:
+        for line in process.stdout:
+            stdout_log.write(line)
+        process.stdout.close()
+    return_code = process.wait()
+    if return_code != 0:
+        raise RuntimeError(f"智书合同导入清单子进程异常退出，退出码: {return_code}")
+    if not result_file.is_file():
+        raise RuntimeError(f"智书合同导入清单子进程未生成结果清单: {result_file}")
+
+    values = json.loads(result_file.read_text(encoding="utf-8"))
+    if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
+        raise RuntimeError(f"智书合同导入清单子进程结果格式错误: {result_file}")
+    return [Path(item) for item in values]
+
+
+def _contract_mixed_add_worker_main(input_file: str, run_id: str, run_root: str) -> int:
+    """子进程入口：覆盖运行根目录，执行任务并原子写入结果文件清单。"""
+    global API_RUN_ROOT
+
+    API_RUN_ROOT = Path(run_root).resolve()
+    result_file = _mixed_worker_result_file(run_id)
+    result_file.parent.mkdir(parents=True, exist_ok=True)
+    result_file.unlink(missing_ok=True)
+    try:
+        generated = _run_contract_mixed_add_all(Path(input_file), run_id)
+        temporary = result_file.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps([str(path.resolve()) for path in generated], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        temporary.replace(result_file)
+        return 0
+    except Exception:
+        traceback.print_exc()
+        return 1
+
+
 @app.get(
     "/contract-mixed-add/template",
     response_class=FileResponse,
@@ -677,11 +846,11 @@ def download_contract_mixed_add_template() -> FileResponse:
 
     template = mixed.INPUT_TEMPLATE_FILE
     if not template.is_file():
-        raise HTTPException(status_code=503, detail="混合合同增补模板尚未部署，请联系管理员")
+        raise HTTPException(status_code=503, detail="智书合同导入清单模板尚未部署，请联系管理员")
     return FileResponse(
         template,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename="混合合同增补业务清单模板.xlsx",
+        filename="智书合同导入清单模板.xlsx",
     )
 
 
@@ -689,17 +858,17 @@ def download_contract_mixed_add_template() -> FileResponse:
     "/contract-mixed-add/runs",
     response_model=RunInfo,
     status_code=status.HTTP_202_ACCEPTED,
-    tags=["混合合同增补"],
-    summary="上传 Excel 并运行 contract_mixed_add_all",
-    description="""
-上传已填写的混合合同增补业务清单，系统会按合同类型分流到一般流程或主播流程，生成可导入智书的 13 Sheet Excel、同步 JSON 和附件结果 ZIP。为减少结果包体积，接口调用不会生成“处理清单”和“附件下载清单”两个审计 Excel。
+    tags=["智书合同导入清单"],
+    summary="上传 Excel 并生成智书合同导入清单",
+    description=f"""
+上传已填写的智书合同导入业务清单，系统会按合同类型分流到一般流程或主播流程，生成可导入智书的 13 Sheet Excel、同步 JSON 和附件结果 ZIP。任务使用独立子进程执行，当前最多并行处理 {MIXED_ADD_MAX_CONCURRENCY} 份清单（通过 `API_MIXED_ADD_MAX_CONCURRENCY` 配置）；超出并行数的任务保持 `queued`。为减少结果包体积，接口调用不会生成“处理清单”和“附件下载清单”两个审计 Excel。
 
 **操作步骤：**
 
 1. 点击 [下载业务清单模板](/contract-mixed-add/template)；填写前三列后上传。结果 ZIP 中会生成 13 Sheet 智书导入 Excel，不需要将其作为输入上传。
 2. 填写业务清单的前三列：合同编号、关联业财订单、智书合同类型；上传 `.xlsx` 或 `.xlsm` 文件。
 3. 填入接收飞书通知的 `notify_open_id`；`notify_email` 可选，仅在 ZIP 超过 30 MB 时用于接收邮件附件。响应中的 `run_id` 可用于查询状态、日志和下载 ZIP。
-4. 机器人会以飞书卡片通知任务结果，并提供“下载结果”按钮。成功后会发送结果 ZIP 附件（飞书单文件上限 30 MB）；若超限，填写了邮箱则发送邮件附件，否则请点击卡片按钮或调用 `GET /runs/{run_id}/download` 下载结果。失败时请通过 `GET /runs/{run_id}/logs` 查看完整日志。
+4. 机器人会以飞书卡片通知任务结果，并提供“下载结果”按钮。成功后会发送结果 ZIP 附件（飞书单文件上限 30 MB）；若超限，填写了邮箱则发送邮件附件，否则请点击卡片按钮或调用 `GET /runs/{{run_id}}/download` 下载结果。失败时请通过 `GET /runs/{{run_id}}/logs` 查看完整日志。
 
 **如何获取 Open ID：**在飞书中 `@系统咨询小助手`，询问“我的 Open ID 是多少”。只可使用该通知机器人应用对应的 `ou_...`；其他应用或其他机器人的 Open ID 会因应用隔离而无法收取消息。
 """,
@@ -719,6 +888,7 @@ async def create_contract_mixed_add_run(
         min_length=19,
         max_length=67,
         pattern=FEISHU_OPEN_ID_PATTERN.pattern,
+        json_schema_extra={"example": ""},
     ),
     notify_email: str | None = Form(
         default=None,
@@ -727,11 +897,10 @@ async def create_contract_mixed_add_run(
             "留空则通过飞书消息中的接口地址自行下载。"
         ),
         max_length=254,
+        json_schema_extra={"example": ""},
     ),
 ) -> RunInfo:
     """上传业务清单；处理完成后从 ``/runs/{run_id}/download`` 下载 ZIP。"""
-    global _active_run_id
-
     if not FEISHU_OPEN_ID_PATTERN.fullmatch(notify_open_id):
         raise HTTPException(
             status_code=422,
@@ -741,13 +910,8 @@ async def create_contract_mixed_add_run(
     if notify_email and not EMAIL_PATTERN.fullmatch(notify_email):
         raise HTTPException(status_code=422, detail="notify_email 格式错误：请输入有效邮箱地址")
 
-    # 先取得全局运行资格，避免无效上传与正在运行任务争抢同一输出目录。
+    # 每次上传使用独立运行目录；任务在独立子进程中执行，模块级配置不会互相覆盖。
     with _state_lock:
-        if _active_run_id is not None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"已有任务正在运行: {_active_run_id}",
-            )
         run_id = uuid.uuid4().hex
         placeholder = RunInfo(
             run_id=run_id,
@@ -759,29 +923,26 @@ async def create_contract_mixed_add_run(
         )
         _runs[run_id] = placeholder
         _run_logs[run_id] = ""
-        # 上传时也占用任务槽，防止保存结束前其他请求插入运行。
-        _active_run_id = run_id
 
     try:
         input_file = await _store_upload(run_id, file)
     except Exception:
         with _state_lock:
             _runs.pop(run_id, None)
-            _active_run_id = None
+            _run_logs.pop(run_id, None)
         raise
 
-    thread = threading.Thread(
-        target=_run_in_background,
-        args=(
+    _enqueue_mixed_run(
+        run_id,
+        lambda stdout_log, stderr_log: _run_contract_mixed_add_subprocess(
+            input_file,
             run_id,
-            lambda: _run_contract_mixed_add_all(input_file, run_id),
-            notify_open_id,
-            notify_email,
+            stdout_log,
+            stderr_log,
         ),
-        name=f"etl-{run_id[:8]}",
-        daemon=True,
+        notify_open_id,
+        notify_email,
     )
-    thread.start()
     return _copy_run(placeholder)
 
 
@@ -790,11 +951,11 @@ async def create_contract_mixed_add_run(
     response_class=FileResponse,
     responses={
         200: {
-            "description": "混合合同增补结果 ZIP",
+            "description": "智书合同导入清单结果 ZIP",
             "content": {"application/zip": {"schema": {"type": "string", "format": "binary"}}},
         },
     },
-    tags=["混合合同增补"],
+    tags=["智书合同导入清单"],
 )
 def download_run_result(run_id: str) -> FileResponse:
     run = _get_run_or_404(run_id)
@@ -809,5 +970,11 @@ def download_run_result(run_id: str) -> FileResponse:
     return FileResponse(
         package,
         media_type="application/zip",
-        filename=f"contract_mixed_add_{run_id[:8]}.zip",
+        filename=f"智书合同导入清单_{run_id[:8]}.zip",
     )
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 5 and sys.argv[1] == "--contract-mixed-add-worker":
+        raise SystemExit(_contract_mixed_add_worker_main(*sys.argv[2:5]))
+    raise SystemExit("api.py 仅支持由 Uvicorn 启动，或作为智书合同导入清单子进程运行")

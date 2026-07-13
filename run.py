@@ -150,7 +150,7 @@ def run_contract_all_with_attachments():
 
 
 def run_contract_mixed_add_all():
-    """一次跑混合合同增补:导入 Excel + 0/9 JSON + 附件文件夹/下载清单。"""
+    """一次跑智书合同导入清单:导入 Excel + 0/9 JSON + 附件文件夹/下载清单。"""
     _run_task_sequence(
         ('contract_mixed_add', 'contract_mixed_add_attachments_db'),
         'contract_mixed_add_all',
