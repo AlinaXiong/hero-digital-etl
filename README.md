@@ -354,6 +354,15 @@ python run.py ap_payment_opening_extra_db
 uvicorn api:app --host 0.0.0.0 --port 8000
 ```
 
+构建并运行 dev Docker 镜像（当前 Dockerfile 会按部署要求把项目根目录 `.env` 直接打入镜像，只能推送到受控私有仓库）：
+
+```powershell
+docker build --platform linux/amd64 -t hero-digital-etl:dev .
+docker run --rm -p 8000:8000 --name hero-digital-etl-dev hero-digital-etl:dev
+```
+
+容器固定使用一个 Uvicorn worker；智书合同导入清单的任务级并行仍由服务内部隔离子进程池负责。容器健康检查调用 `GET /health`。
+
 打开 Swagger UI：
 
 ```text
