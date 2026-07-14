@@ -8,7 +8,7 @@
 3. 只读取输入清单前三列:合同编号用于定位源数据,关联业财订单/智书合同类型有值时优先采用,
    为空时沿用原清洗逻辑;第 4 列及之后全部忽略;
 4. 复用两个主任务的解析与导出 builder,生成一个混合导入 Excel:一般流程占前 9 个 sheet,
-   主播流程占后 4 个 sheet。
+   主播流程占后 4 个 sheet；并保留模板中紧随主播流程的两个空付款/收款计划 sheet。
 
 运行方式::
 
@@ -116,6 +116,17 @@ JAVA_ANCHOR_SHEET_NAMES = (
     '主播流程_对方信息',
     '主播流程_我方信息',
     '主播流程_费用明细',
+)
+# 混合模板还预置了两个主播付款/收款计划 sheet。当前 ETL 不填充数据，
+# 但必须保留在费用明细之后，确保 Java 按固定索引读取时仍对应 13、14 位。
+JAVA_ANCHOR_EMPTY_PLAN_SHEET_NAMES = (
+    '主播流程_付款计划',
+    '主播流程_收款计划',
+)
+JAVA_MIXED_SHEET_NAMES = (
+    JAVA_GENERAL_SHEET_NAMES
+    + JAVA_ANCHOR_SHEET_NAMES
+    + JAVA_ANCHOR_EMPTY_PLAN_SHEET_NAMES
 )
 GENERAL_SOURCE_TO_JAVA_SHEET_NAMES = {
     general.SHEET_MAIN: JAVA_GENERAL_SHEET_NAMES[0],
@@ -648,7 +659,7 @@ def _align_sheet_order_for_zhishu_sync(output_file, flow_name):
     elif flow_name == '混合流程':
         _rename_general_sheets_for_sync(workbook)
         _rename_anchor_sheets_for_sync(workbook)
-        required_names = JAVA_GENERAL_SHEET_NAMES + JAVA_ANCHOR_SHEET_NAMES
+        required_names = JAVA_MIXED_SHEET_NAMES
         placeholder_names = ()
         ordered_names = required_names
         active_index = 0
