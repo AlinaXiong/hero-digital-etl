@@ -3,7 +3,7 @@
 
 同一份业务清单里可能同时包含一般流程合同和主播流程合同。本任务只负责:
 
-1. 读取清单并剔除已导入/重复编号;
+1. 仅读取本次上传的业务清单，并按合同编号去重;
 2. 按 Excel 智书合同类型或泛微合同类型分流:主播类走 contract_anchor_db,其余走 contract_general_db;
 3. 只读取输入清单前三列:合同编号用于定位源数据,关联业财订单/智书合同类型有值时优先采用,
    为空时沿用原清洗逻辑;第 4 列及之后全部忽略;
@@ -35,7 +35,6 @@ import pandas as pd
 from openpyxl import load_workbook
 
 from etl.contract import contract_anchor_db as anchor
-from etl.contract import contract_general_add as general_add
 from etl.contract import contract_general_db as general
 from etl.util import common as c
 
@@ -145,11 +144,6 @@ ANCHOR_SOURCE_TO_JAVA_SHEET_NAMES = {
     anchor.SHEET_OUR_PARTY: JAVA_ANCHOR_SHEET_NAMES[2],
     anchor.SHEET_FEE_DETAIL: JAVA_ANCHOR_SHEET_NAMES[3],
 }
-
-GENERAL_ADD_SOURCE_FILES = (
-    general_add.MISSING_INPUT_FILE,
-    general_add.AMOUNT_INPUT_FILE,
-)
 
 GENERAL_RELATION_BLANK_COLUMNS = (
     'relation.relation_contracts（关联合同）',
@@ -265,58 +259,7 @@ def _read_mixed_input(path):
     return result
 
 
-def _load_general_add_input_keys():
-    rows = []
-    for path in GENERAL_ADD_SOURCE_FILES:
-        if not path.exists():
-            continue
-        raw = pd.read_excel(path, dtype=object)
-        contract_col = _first_existing_column(raw, ('合同号', '合同编号'), required=True)
-        for excel_index, row in raw.iterrows():
-            for contract_number in _split_contract_numbers(row.get(contract_col)):
-                rows.append({
-                    '来源文件': path.name,
-                    'Excel行号': int(excel_index) + 2,
-                    '合同编号': contract_number,
-                    '合同key': _contract_key(contract_number),
-                    '排除来源': 'contract_general_add.py输入清单',
-                })
-    return pd.DataFrame(rows)
-
-
-def _load_general_add_processed_keys():
-    direct_df = _load_general_add_input_keys()
-    direct_keys = set(direct_df.get('合同key', pd.Series(dtype=object)))
-    direct_keys.discard('')
-    processed_keys = set(direct_keys)
-    child_rows = []
-
-    if direct_keys:
-        try:
-            catalog = general_add.load_contract_catalog()
-            child_to_root = general_add.discover_children(catalog, direct_keys)
-            for child_key, root_key in child_to_root.items():
-                processed_keys.add(child_key)
-                child_rows.append({
-                    '来源文件': 'contract_general_add.py',
-                    'Excel行号': '',
-                    '合同编号': child_key,
-                    '合同key': child_key,
-                    '排除来源': f'contract_general_add.py子合同,父合同={root_key}',
-                })
-            for key in direct_keys:
-                if key.startswith('H-KF'):
-                    processed_keys.add(f'{key}_VIRTUAL')
-        except Exception as error:
-            print(f'[智书合同导入清单] contract_general_add子合同排除池读取失败,仅使用直接输入清单: {error}')
-
-    extra_df = pd.DataFrame(child_rows)
-    exclude_df = pd.concat([direct_df, extra_df], ignore_index=True) if not extra_df.empty else direct_df
-    exclude_df = exclude_df.drop_duplicates('合同key', keep='first') if not exclude_df.empty else exclude_df
-    return processed_keys, exclude_df
-
-
-def _apply_input_exclusions(input_df, _general_add_keys):
+def _apply_input_exclusions(input_df):
     result = input_df.copy()
     reasons = [[] for _ in range(len(result))]
     explicitly_excluded = result['合同key'].isin(EXCLUDED_CONTRACT_NUMBERS)
@@ -1301,7 +1244,7 @@ def _generation_status(row, generated_keys, unresolved):
     return '未生成: ' + unresolved.get(key, '未命中源数据')
 
 
-def _write_audit_workbook(input_audit_df, route_df, unresolved_df, general_add_exclude_df,
+def _write_audit_workbook(input_audit_df, route_df, unresolved_df,
                           general_manifest_df, general_missing_df, anchor_manifest_df, anchor_missing_df,
                           mixed_path):
     summary = pd.DataFrame([
@@ -1319,7 +1262,6 @@ def _write_audit_workbook(input_audit_df, route_df, unresolved_df, general_add_e
         '输入清单_处理结果': input_audit_df,
         '待处理_路由结果': route_df,
         '未生成清单': unresolved_df,
-        'contract_general_add历史范围': general_add_exclude_df,
         '一般流程合同附件下载清单': general_manifest_df,
         '一般流程合同附件DOCID缺失': general_missing_df,
         '主播流程合同附件下载清单': anchor_manifest_df,
@@ -1340,8 +1282,7 @@ def run(suppress_audit=False):
     """生成混合导入结果；API 调用可跳过仅供审计的处理清单 Excel。"""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     input_df = _read_mixed_input(INPUT_FILE)
-    general_add_keys, general_add_exclude_df = _load_general_add_processed_keys()
-    input_df = _apply_input_exclusions(input_df, general_add_keys)
+    input_df = _apply_input_exclusions(input_df)
     route_df = _route_processable_rows(input_df)
 
     general_keys = route_df.loc[route_df['路由流程'].eq('一般流程'), '合同key'] if not route_df.empty else []
@@ -1393,7 +1334,6 @@ def run(suppress_audit=False):
             input_audit_df,
             route_df,
             unresolved_df,
-            general_add_exclude_df,
             general_manifest_df,
             general_missing_df,
             anchor_manifest_df,

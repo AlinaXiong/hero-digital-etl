@@ -26,6 +26,8 @@ MANIFEST_FILE = OUTPUT_DIR / f'混合增补附件下载清单_{mixed.DATE_SUFFIX
 
 FLOW_GENERAL = '一般流程'
 FLOW_ANCHOR = '主播流程'
+EMPTY_ATTACHMENT_MAIN_FOLDER = '主文件'
+EMPTY_ATTACHMENT_PDF_NAME = '无附件占位.pdf'
 
 
 def _text(value):
@@ -36,10 +38,80 @@ def _contract_key(value):
     return general._contract_number_key(value)
 
 
+def _build_empty_attachment_pdf():
+    """生成一个无内容但可被 PDF 阅读器识别的单页 PDF。"""
+    objects = (
+        b'<< /Type /Catalog /Pages 2 0 R >>',
+        b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+        b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << >> >>',
+    )
+    content = bytearray(b'%PDF-1.4\n%\xe2\xe3\xcf\xd3\n')
+    offsets = [0]
+    for object_number, object_content in enumerate(objects, 1):
+        offsets.append(len(content))
+        content.extend(f'{object_number} 0 obj\n'.encode('ascii'))
+        content.extend(object_content)
+        content.extend(b'\nendobj\n')
+    xref_offset = len(content)
+    content.extend(f'xref\n0 {len(objects) + 1}\n'.encode('ascii'))
+    content.extend(b'0000000000 65535 f \n')
+    for offset in offsets[1:]:
+        content.extend(f'{offset:010d} 00000 n \n'.encode('ascii'))
+    content.extend(
+        f'trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n'
+        f'startxref\n{xref_offset}\n%%EOF\n'.encode('ascii')
+    )
+    return bytes(content)
+
+
+def _source_contract_numbers(source_dfs):
+    numbers = set()
+    for source_df in source_dfs:
+        if source_df.empty:
+            continue
+        numbers.update(
+            _text(value) for value in source_df.get('合同编号', pd.Series(dtype=object)) if _text(value)
+        )
+    return numbers
+
+
+def _attachment_metadata_contract_numbers(data_frames):
+    numbers = set()
+    for data_frame in data_frames:
+        if data_frame.empty:
+            continue
+        numbers.update(
+            _text(value)
+            for value in data_frame.get('contract_number（合同编码）', pd.Series(dtype=object))
+            if _text(value)
+        )
+    return numbers
+
+
+def _write_empty_attachment_placeholders(source_dfs, manifest_dfs, missing_dfs):
+    """仅为确认没有附件记录的合同生成服务端兜底上传所需的非空 PDF。"""
+    source_numbers = _source_contract_numbers(source_dfs)
+    known_attachment_numbers = _attachment_metadata_contract_numbers([*manifest_dfs, *missing_dfs])
+    empty_contract_numbers = sorted(source_numbers - known_attachment_numbers)
+    placeholder_pdf = _build_empty_attachment_pdf()
+    created = []
+    for contract_number in empty_contract_numbers:
+        contract_directory = mixed.MIXED_ATTACHMENT_ROOT / contract_number
+        contract_directory.mkdir(parents=True, exist_ok=True)
+        if any(path.is_file() and path.stat().st_size > 0 for path in contract_directory.rglob('*')):
+            continue
+        main_file_directory = contract_directory / EMPTY_ATTACHMENT_MAIN_FOLDER
+        main_file_directory.mkdir(parents=True, exist_ok=True)
+        (main_file_directory / EMPTY_ATTACHMENT_PDF_NAME).write_bytes(placeholder_pdf)
+        created.append(contract_number)
+    if created:
+        print(f'[智书合同导入清单附件] 已为 {len(created)} 个无附件合同生成占位 PDF')
+    return created
+
+
 def _resolve_scope_from_mixed_logic():
     input_df = mixed._read_mixed_input(mixed.INPUT_FILE)
-    general_add_keys, general_add_exclude_df = mixed._load_general_add_processed_keys()
-    input_df = mixed._apply_input_exclusions(input_df, general_add_keys)
+    input_df = mixed._apply_input_exclusions(input_df)
     route_df = mixed._route_processable_rows(input_df)
 
     general_scope = (
@@ -50,7 +122,7 @@ def _resolve_scope_from_mixed_logic():
         route_df[route_df['路由流程'].eq(FLOW_ANCHOR)].copy()
         if not route_df.empty else pd.DataFrame()
     )
-    return input_df, route_df, general_add_exclude_df, general_scope, anchor_scope
+    return input_df, route_df, general_scope, anchor_scope
 
 
 def _subset_by_scope(source_df, scope_df):
@@ -211,8 +283,7 @@ def _build_summary(scope_df, general_source_df, anchor_source_df,
     return pd.DataFrame(rows)
 
 
-def _write_outputs(input_df, route_df, general_add_exclude_df,
-                   general_source_df, anchor_source_df,
+def _write_outputs(input_df, route_df, general_source_df, anchor_source_df,
                    general_manifest_df, general_missing_df,
                    anchor_manifest_df, anchor_missing_df):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -228,7 +299,6 @@ def _write_outputs(input_df, route_df, general_add_exclude_df,
         ),
         '输入清单_处理结果': input_df,
         '待处理_路由结果': route_df,
-        'contract_general_add历史范围': general_add_exclude_df,
         '一般流程下载清单': general_manifest_df,
         '一般流程DOCID缺失': general_missing_df,
         '主播流程下载清单': anchor_manifest_df,
@@ -247,7 +317,7 @@ def run(suppress_manifest=False):
     """下载附件；API 调用可跳过仅供审计的附件下载清单 Excel。"""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     mixed.MIXED_ATTACHMENT_ROOT.mkdir(parents=True, exist_ok=True)
-    input_df, route_df, general_add_exclude_df, general_scope, anchor_scope = _resolve_scope_from_mixed_logic()
+    input_df, route_df, general_scope, anchor_scope = _resolve_scope_from_mixed_logic()
     if route_df.empty:
         print('[智书合同导入清单附件] 输入经剔除后无待处理合同')
         return None
@@ -268,6 +338,11 @@ def run(suppress_manifest=False):
     cookie = os.getenv(general.ATTACHMENT_COOKIE_ENV, '').strip()
     general_manifest_df = _download_manifest(general_manifest_df, cookie, FLOW_GENERAL)
     anchor_manifest_df = _download_manifest(anchor_manifest_df, cookie, FLOW_ANCHOR)
+    _write_empty_attachment_placeholders(
+        (general_source_df, anchor_source_df),
+        (general_manifest_df, anchor_manifest_df),
+        (general_missing_df, anchor_missing_df),
+    )
 
     if suppress_manifest:
         print('[智书合同导入清单附件] API 调用跳过附件下载清单 Excel')
@@ -275,7 +350,6 @@ def run(suppress_manifest=False):
     return _write_outputs(
         input_df,
         route_df,
-        general_add_exclude_df,
         general_source_df,
         anchor_source_df,
         general_manifest_df,
