@@ -1,0 +1,23 @@
+.git
+.gitignore
+.idea
+.claude
+.venv
+venv
+__pycache__
+*.py[cod]
+*.log
+
+output
+tools
+README.md
+.env.example
+
+# 本地上传/调试数据不进入镜像；API 运行时由用户上传业务清单。
+resources/source/contract_mixed_add/*.xlsx
+
+# 本机历史附件目录。
+一般流程合同附件_*/
+
+# .env 按当前部署要求故意保留在构建上下文中。
+!.env

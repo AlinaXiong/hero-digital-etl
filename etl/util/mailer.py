@@ -13,7 +13,7 @@ def _enabled(value: str) -> bool:
     return value.strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
 
 
-def _smtp_config() -> tuple[str, int, str, str, str, bool, bool]:
+def _smtp_config() -> tuple[str, int, str, str, str, bool, bool, int]:
     host = os.getenv('SMTP_HOST', '').strip()
     sender = os.getenv('SMTP_FROM', '').strip()
     username = os.getenv('SMTP_USERNAME', '').strip()
@@ -26,11 +26,17 @@ def _smtp_config() -> tuple[str, int, str, str, str, bool, bool]:
         port = int(os.getenv('SMTP_PORT', '465').strip())
     except ValueError as exc:
         raise RuntimeError('SMTP_PORT 必须为数字') from exc
+    try:
+        timeout = int(os.getenv('SMTP_TIMEOUT', '300').strip())
+    except ValueError as exc:
+        raise RuntimeError('SMTP_TIMEOUT 必须为正整数（单位：秒）') from exc
+    if timeout <= 0:
+        raise RuntimeError('SMTP_TIMEOUT 必须为正整数（单位：秒）')
     use_ssl = _enabled(os.getenv('SMTP_USE_SSL', '1'))
     starttls = _enabled(os.getenv('SMTP_STARTTLS', '0'))
     if use_ssl and starttls:
         raise RuntimeError('SMTP_USE_SSL 与 SMTP_STARTTLS 不能同时启用')
-    return host, port, sender, username, password, use_ssl, starttls
+    return host, port, sender, username, password, use_ssl, starttls, timeout
 
 
 def send_result_zip_email(recipient: str, package: Path, download_url: str, run_id: str) -> None:
@@ -42,7 +48,7 @@ def send_result_zip_email(recipient: str, package: Path, download_url: str, run_
     if not path.is_file() or path.stat().st_size <= 0:
         raise FileNotFoundError(f'邮件附件不存在或为空: {path}')
 
-    host, port, sender, username, password, use_ssl, starttls = _smtp_config()
+    host, port, sender, username, password, use_ssl, starttls, timeout = _smtp_config()
     message = EmailMessage()
     message['Subject'] = f'智书合同导入清单结果 - {run_id[:8]}'
     message['From'] = sender
@@ -60,16 +66,33 @@ def send_result_zip_email(recipient: str, package: Path, download_url: str, run_
         filename=path.name,
     )
 
-    if use_ssl:
-        with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=60) as client:
-            if username:
-                client.login(username, password)
-            client.send_message(message)
-        return
+    # ZIP 附件会经 Base64 编码，实际 SMTP 传输量通常会比源文件大约三分之一。
+    # 将发送阶段和精确邮件大小附在异常中，便于 API 任务日志定位服务端断连原因。
+    message_bytes = len(message.as_bytes())
+    stage = 'connect'
+    try:
+        if use_ssl:
+            with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=timeout) as client:
+                if username:
+                    stage = 'login'
+                    client.login(username, password)
+                stage = 'send_message'
+                client.send_message(message)
+            return
 
-    with smtplib.SMTP(host, port, timeout=60) as client:
-        if starttls:
-            client.starttls(context=ssl.create_default_context())
-        if username:
-            client.login(username, password)
-        client.send_message(message)
+        with smtplib.SMTP(host, port, timeout=timeout) as client:
+            if starttls:
+                stage = 'starttls'
+                client.starttls(context=ssl.create_default_context())
+            if username:
+                stage = 'login'
+                client.login(username, password)
+            stage = 'send_message'
+            client.send_message(message)
+    except Exception as exc:
+        raise RuntimeError(
+            'SMTP 邮件发送失败 '
+            f'(stage={stage}, host={host}, port={port}, timeout={timeout}s, ssl={use_ssl}, starttls={starttls}, '
+            f'zip_bytes={path.stat().st_size}, mime_bytes={message_bytes}): '
+            f'{type(exc).__name__}: {exc}'
+        ) from exc

@@ -299,6 +299,7 @@ def _send_notification(
     run: RunInfo,
     notify_open_id: str,
     notify_email: str | None = None,
+    error_log: io.TextIOBase | None = None,
 ) -> None:
     from etl.lark import feishu
 
@@ -330,6 +331,9 @@ def _send_notification(
                     run.run_id,
                 )
             except Exception as exc:
+                log = error_log or sys.stderr
+                print(f"[API] 邮件发送失败: {type(exc).__name__}: {exc}", file=log)
+                traceback.print_exc(file=log)
                 _send_notification_card(
                     feishu,
                     notify_open_id,
@@ -444,6 +448,7 @@ def _run_in_background(
                 notification_run or _copy_run(run),
                 notify_open_id,
                 notify_email,
+                stderr_log,
             )
             notification_sent = True
             print("[API] 已发送飞书完成通知", file=stdout_log)
