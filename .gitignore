@@ -17,3 +17,4 @@ output/contract_anti_bribery_db/*.zip
 output/contract_anchor_db/主播流程合同附件_*/
 /.codex-xlsx-work/
 /.codex/
+/output/api_runs/
