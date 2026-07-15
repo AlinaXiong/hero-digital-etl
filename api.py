@@ -42,6 +42,9 @@ EXCEL_EXTENSIONS = frozenset({".xlsx", ".xlsm"})
 FEISHU_OPEN_ID_PATTERN = re.compile(r"^ou_[a-z0-9]{16,64}$")
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 FEISHU_FILE_MAX_BYTES = 30 * 1024 * 1024
+COS_REQUIRED_ENV_NAMES = ("COS_SECRET_ID", "COS_SECRET_KEY", "COS_BUCKET", "COS_REGION")
+COS_DEFAULT_OBJECT_PREFIX = "contract-mixed-add"
+COS_DEFAULT_DOWNLOAD_EXPIRES_SECONDS = 7 * 24 * 60 * 60
 RunStatus = Literal["queued", "running", "succeeded", "failed"]
 NotificationStatus = Literal["not_requested", "pending", "sent", "failed"]
 
@@ -216,6 +219,94 @@ def _run_download_url(run: RunInfo) -> str:
     return run.download_url or _download_url(run.run_id)
 
 
+def _positive_env_int(name: str, default: int) -> int:
+    """读取正整数环境变量，配置错误时给出明确提示。"""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"环境变量 {name} 必须是正整数") from exc
+    if value <= 0:
+        raise RuntimeError(f"环境变量 {name} 必须是正整数")
+    return value
+
+
+def _cos_settings() -> tuple[str, str, str, str, str | None, int]:
+    """读取 COS 配置；仅在结果包需要上传时才校验。"""
+    values = {name: os.getenv(name, "").strip() for name in COS_REQUIRED_ENV_NAMES}
+    missing = [name for name, value in values.items() if not value]
+    if missing:
+        raise RuntimeError("缺少 COS 配置: " + ", ".join(missing))
+    prefix = os.getenv("COS_OBJECT_PREFIX", COS_DEFAULT_OBJECT_PREFIX).strip().strip("/")
+    if not prefix:
+        prefix = COS_DEFAULT_OBJECT_PREFIX
+    expires = _positive_env_int(
+        "COS_DOWNLOAD_EXPIRES_SECONDS",
+        COS_DEFAULT_DOWNLOAD_EXPIRES_SECONDS,
+    )
+    return (
+        values["COS_SECRET_ID"],
+        values["COS_SECRET_KEY"],
+        values["COS_BUCKET"],
+        values["COS_REGION"],
+        os.getenv("COS_SESSION_TOKEN", "").strip() or None,
+        expires,
+    )
+
+
+def _upload_result_to_cos(run: RunInfo, package: Path) -> tuple[str, int, str]:
+    """上传结果 ZIP 到私有 COS，并返回签名下载链接、有效期和对象键。"""
+    try:
+        from qcloud_cos import CosConfig, CosS3Client
+    except ImportError as exc:
+        raise RuntimeError(
+            "缺少 COS SDK；请执行 pip install -r requirements.txt"
+        ) from exc
+
+    secret_id, secret_key, bucket, region, token, expires = _cos_settings()
+    prefix = os.getenv("COS_OBJECT_PREFIX", COS_DEFAULT_OBJECT_PREFIX).strip().strip("/")
+    if not prefix:
+        prefix = COS_DEFAULT_OBJECT_PREFIX
+    object_key = f"{prefix}/{run.run_id}/result.zip"
+    config = CosConfig(
+        Region=region,
+        SecretId=secret_id,
+        SecretKey=secret_key,
+        Token=token,
+        Scheme="https",
+    )
+    client = CosS3Client(config)
+    client.upload_file(
+        Bucket=bucket,
+        Key=object_key,
+        LocalFilePath=str(package),
+        PartSize=10,
+        MAXThread=5,
+        EnableMD5=False,
+        ACL="private",
+        ContentType="application/zip",
+        ContentDisposition="attachment",
+    )
+    download_url = client.get_presigned_download_url(
+        Bucket=bucket,
+        Key=object_key,
+        Expired=expires,
+    )
+    return download_url, expires, object_key
+
+
+def _duration_text(seconds: int) -> str:
+    if seconds % 86400 == 0:
+        return f"{seconds // 86400} 天"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600} 小时"
+    if seconds % 60 == 0:
+        return f"{seconds // 60} 分钟"
+    return f"{seconds} 秒"
+
+
 def _notification_card(
     run: RunInfo,
     *,
@@ -225,6 +316,8 @@ def _notification_card(
     package: Path | None = None,
     error: str | None = None,
     show_download: bool = True,
+    cos_download_url: str | None = None,
+    cos_download_expires_seconds: int | None = None,
 ) -> dict[str, Any]:
     """构造兼容飞书消息接口的 1.0 交互卡片。"""
     fields = [{
@@ -251,22 +344,46 @@ def _notification_card(
             },
         })
 
+    if cos_download_url:
+        expires_text = _duration_text(cos_download_expires_seconds or 0).replace(" ", "")
+        fields.append({
+            "is_short": False,
+            "text": {
+                "tag": "lark_md",
+                "content": f"**COS 下载注意事项：**\n文件有效期{expires_text}，请及时下载",
+            },
+        })
+
     elements: list[dict[str, Any]] = [{"tag": "div", "fields": fields}]
-    if show_download:
+    if show_download or cos_download_url:
+        actions: list[dict[str, Any]] = []
+        if cos_download_url:
+            actions.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "COS下载链接"},
+                "type": "primary",
+                "url": cos_download_url,
+            })
+        if show_download and not cos_download_url:
+            actions.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "下载结果"},
+                "type": "primary",
+                "url": _run_download_url(run),
+            })
         elements.extend((
             {"tag": "hr"},
             {
                 "tag": "action",
-                "actions": [{
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "下载结果"},
-                    "type": "primary",
-                    "url": _run_download_url(run),
-                }],
+                "actions": actions,
             },
         ))
     return {
-        "config": {"wide_screen_mode": True, "enable_forward": True},
+        "config": {
+            "wide_screen_mode": True,
+            # 签名 URL 在有效期内可被转发使用，卡片中有 COS 链接时禁止转发。
+            "enable_forward": not bool(cos_download_url),
+        },
         "header": {
             "template": template,
             "title": {"tag": "plain_text", "content": title},
@@ -286,12 +403,19 @@ def _send_notification_card(
     try:
         feishu.send_interactive_card(notify_open_id, card)
     except Exception:
+        cos_download_url = card_kwargs.get("cos_download_url")
+        download_lines = []
+        if cos_download_url:
+            download_lines.append(f"COS下载链接：{cos_download_url}")
+        if card_kwargs.get("show_download", True) and not cos_download_url:
+            download_lines.append(f"下载结果：{_run_download_url(run)}")
         fallback = (
             f"{card_kwargs['title']}\n"
             f"任务编号：{run.run_id}\n"
-            f"处理结果：{card_kwargs['delivery']}\n"
-            f"下载结果：{_run_download_url(run)}"
+            f"处理结果：{card_kwargs['delivery']}"
         )
+        if download_lines:
+            fallback += "\n" + "\n".join(download_lines)
         feishu.send_text_message(notify_open_id, fallback)
 
 
@@ -319,40 +443,47 @@ def _send_notification(
     package = _result_zip_path(run)
     if package is None:
         raise FileNotFoundError(f"任务结果 ZIP 不存在: {run.run_id}")
-    if package.stat().st_size > FEISHU_FILE_MAX_BYTES:
-        if notify_email:
-            from etl.util.mailer import send_result_zip_email
-
-            try:
-                send_result_zip_email(
-                    notify_email,
-                    package,
-                    _run_download_url(run),
-                    run.run_id,
-                )
-            except Exception as exc:
-                log = error_log or sys.stderr
-                print(f"[API] 邮件发送失败: {type(exc).__name__}: {exc}", file=log)
-                traceback.print_exc(file=log)
-                _send_notification_card(
-                    feishu,
-                    notify_open_id,
-                    run,
-                    title="智书合同导入清单已完成",
-                    template="orange",
-                    delivery="ZIP 超过飞书 30 MB 限制，邮件发送失败，请通过接口下载。",
-                    package=package,
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-                return
+    is_large_package = package.stat().st_size > FEISHU_FILE_MAX_BYTES
+    try:
+        cos_download_url, expires, object_key = _upload_result_to_cos(run, package)
+        print(
+            f"[API] 结果 ZIP 已上传 COS: {object_key}; "
+            f"签名链接有效 {_duration_text(expires)}",
+            file=error_log or sys.stderr,
+        )
+    except Exception as exc:
+        log = error_log or sys.stderr
+        print(f"[API] COS 上传失败: {type(exc).__name__}: {exc}", file=log)
+        traceback.print_exc(file=log)
+        if is_large_package:
             _send_notification_card(
                 feishu,
                 notify_open_id,
                 run,
                 title="智书合同导入清单已完成",
-                template="green",
-                delivery="ZIP 超过飞书 30 MB 限制，已发送至您填写的邮箱。",
+                template="orange",
+                delivery="ZIP 超过飞书 30 MB 限制，COS 上传失败，请通过接口下载。",
                 package=package,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return
+        try:
+            feishu.send_file_message(notify_open_id, package)
+        except Exception as file_exc:
+            print(
+                f"[API] 飞书 ZIP 附件发送失败: {type(file_exc).__name__}: {file_exc}",
+                file=log,
+            )
+            _send_notification_card(
+                feishu,
+                notify_open_id,
+                run,
+                title="智书合同导入清单已完成",
+                template="orange",
+                delivery="COS 上传和 ZIP 飞书附件发送均失败。",
+                package=package,
+                error=f"COS: {type(exc).__name__}: {exc}; 飞书: {type(file_exc).__name__}: {file_exc}",
+                show_download=False,
             )
             return
         _send_notification_card(
@@ -361,8 +492,25 @@ def _send_notification(
             run,
             title="智书合同导入清单已完成",
             template="orange",
-            delivery="ZIP 超过飞书 30 MB 限制；未填写邮箱，请通过接口下载。",
+            delivery="结果 ZIP 已作为飞书附件发送，但 COS 上传失败。",
             package=package,
+            error=f"{type(exc).__name__}: {exc}",
+            show_download=False,
+        )
+        return
+
+    if is_large_package:
+        _send_notification_card(
+            feishu,
+            notify_open_id,
+            run,
+            title="智书合同导入清单已完成",
+            template="green",
+            delivery="ZIP 超过飞书 30 MB 限制，已上传私有 COS，请使用下方链接下载。",
+            package=package,
+            cos_download_url=cos_download_url,
+            cos_download_expires_seconds=expires,
+            show_download=False,
         )
         return
     try:
@@ -374,9 +522,12 @@ def _send_notification(
             run,
             title="智书合同导入清单已完成",
             template="orange",
-            delivery="ZIP 飞书附件发送失败，请通过接口下载。",
+            delivery="ZIP 飞书附件发送失败，已上传私有 COS，请使用下方链接下载。",
             package=package,
             error=f"{type(exc).__name__}: {exc}",
+            cos_download_url=cos_download_url,
+            cos_download_expires_seconds=expires,
+            show_download=False,
         )
         return
     _send_notification_card(
@@ -385,8 +536,11 @@ def _send_notification(
         run,
         title="智书合同导入清单已完成",
         template="green",
-        delivery="结果 ZIP 已作为飞书附件发送。",
+        delivery="结果 ZIP 已作为飞书附件发送，同时已上传私有 COS。",
         package=package,
+        cos_download_url=cos_download_url,
+        cos_download_expires_seconds=expires,
+        show_download=False,
     )
 
 
@@ -872,8 +1026,8 @@ def download_contract_mixed_add_template() -> FileResponse:
 
 1. 点击 [下载业务清单模板](/contract-mixed-add/template)；填写前三列后上传。结果 ZIP 中会生成 13 Sheet 智书导入 Excel，不需要将其作为输入上传。
 2. 填写业务清单的前三列：合同编号、关联业财订单、智书合同类型；上传 `.xlsx` 或 `.xlsm` 文件。
-3. 填入接收飞书通知的 `notify_open_id`；`notify_email` 可选，仅在 ZIP 超过 30 MB 时用于接收邮件附件。响应中的 `run_id` 可用于查询状态、日志和下载 ZIP。
-4. 机器人会以飞书卡片通知任务结果，并提供“下载结果”按钮。成功后会发送结果 ZIP 附件（飞书单文件上限 30 MB）；若超限，填写了邮箱则发送邮件附件，否则请点击卡片按钮或调用 `GET /runs/{{run_id}}/download` 下载结果。失败时请通过 `GET /runs/{{run_id}}/logs` 查看完整日志。
+3. 填入接收飞书通知的 `notify_open_id`。响应中的 `run_id` 可用于查询状态、日志和下载 ZIP。
+4. 成功结果均上传到私有 COS，飞书卡片只提供有效期可配置（默认 7 天）的“COS下载链接”。ZIP 小于等于 30 MB 时，机器人还会同时发送 ZIP 附件；超过 30 MB 时仅提供 COS下载链接。失败时请通过 `GET /runs/{{run_id}}/logs` 查看完整日志。
 
 **如何获取 Open ID：**在飞书中 `@系统咨询小助手`，询问“我的 Open ID 是多少”。只可使用该通知机器人应用对应的 `ou_...`；其他应用或其他机器人的 Open ID 会因应用隔离而无法收取消息。
 """,
@@ -898,8 +1052,8 @@ async def create_contract_mixed_add_run(
     notify_email: str | None = Form(
         default=None,
         description=(
-            "可选。仅当结果 ZIP 超过飞书 30 MB 限制时，用于接收邮件附件；"
-            "留空则通过飞书消息中的接口地址自行下载。"
+            "可选兼容字段。所有结果默认上传 COS 并在飞书卡片中提供下载链接；"
+            "此字段不再用于正常结果发送。"
         ),
         max_length=254,
         json_schema_extra={"example": ""},

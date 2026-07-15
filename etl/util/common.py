@@ -4,7 +4,8 @@
 所有清洗任务(ap_opening_payment 应付期初,以及将来的应收/预付/预收)都从这里取用,
 避免在每个任务里重复写数据库查询和映射逻辑。任务文件本身只关心"过滤 + 字段映射"。
 
-数据库账密从环境变量读取;若项目根有 .env 则自动加载(.env 不提交版本库)。
+数据库账密从环境变量读取;若项目根有 .env.local 或 .env 则自动加载。
+`.env.local` 优先且不提交版本库，适合存放仅本机使用的密钥。
 需要的变量:FW_*(泛微 vspn_xtyy 取工号)、ZT_*(中台库取供应商编码和核算主体编码)。
 """
 import os
@@ -100,8 +101,10 @@ DEFAULT_ATTACHMENT_AUTHORIZEFIELD_ID = '6461'
 
 # ============================ 配置 / 数据库 ============================
 def _load_env():
-    env = ROOT / '.env'
-    if env.exists():
+    # 外部环境变量优先；本机密钥文件优先于项目通用配置。
+    for env in (ROOT / '.env.local', ROOT / '.env'):
+        if not env.exists():
+            continue
         for line in env.read_text(encoding='utf-8').splitlines():
             line = line.strip()
             if line and not line.startswith('#') and '=' in line:

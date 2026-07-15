@@ -10,3 +10,4 @@ fastapi>=0.111
 uvicorn[standard]>=0.30
 python-multipart>=0.0.9  # FastAPI 接收 multipart/form-data Excel 上传
 httpx2>=2.0  # FastAPI/Starlette 接口测试客户端
+cos-python-sdk-v5>=1.9  # 合同结果上传至腾讯云 COS
