@@ -33,9 +33,31 @@ _MAX_RETRY = 4
 _STATUS_MAPS_CACHE = None
 _TOKEN_CACHE = None
 _MESSAGE_TOKEN_CACHE = None
+_TOKEN_DEFAULT_EXPIRE_SECONDS = 2 * 60 * 60
+_TOKEN_REFRESH_LEEWAY_SECONDS = 60
 
 
-def _request(method, path, params=None, payload=None, timeout=30, auth=True, token=None):
+def _is_invalid_access_token(error, detail):
+    return (
+        error.code == 400
+        and ('99991663' in detail or 'invalid access token' in detail.lower())
+    )
+
+
+def _clear_token_cache(kind):
+    global _TOKEN_CACHE, _MESSAGE_TOKEN_CACHE
+    if kind == 'message':
+        _MESSAGE_TOKEN_CACHE = None
+    else:
+        _TOKEN_CACHE = None
+
+
+def _token_for(kind):
+    return _message_token() if kind == 'message' else _token()
+
+
+def _request(method, path, params=None, payload=None, timeout=30, auth=True, token=None,
+             auth_kind='primary', _retried_invalid_token=False):
     """统一请求(GET/POST), 带瞬时网络/SSL 异常重试(代理环境偶发 SSL EOF)。"""
     url = FEISHU_HOST + path
     if params:
@@ -47,13 +69,29 @@ def _request(method, path, params=None, payload=None, timeout=30, auth=True, tok
         if data is not None:
             req.add_header('Content-Type', 'application/json; charset=utf-8')
         if auth:
-            req.add_header('Authorization', f'Bearer {token or _token()}')
+            req.add_header('Authorization', f'Bearer {token or _token_for(auth_kind)}')
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode('utf-8'))
         except urllib.error.HTTPError as error:
             # 4xx 多为权限、应用可用范围或收件人 ID 问题；保留飞书响应体便于定位。
             detail = error.read().decode('utf-8', errors='replace').strip()
+            if (
+                auth
+                and not _retried_invalid_token
+                and _is_invalid_access_token(error, detail)
+            ):
+                _clear_token_cache(auth_kind)
+                return _request(
+                    method,
+                    path,
+                    params=params,
+                    payload=payload,
+                    timeout=timeout,
+                    auth=auth,
+                    auth_kind=auth_kind,
+                    _retried_invalid_token=True,
+                )
             raise RuntimeError(f'飞书 API HTTP {error.code}: {detail or error.reason}') from error
         except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
             last_error = error
@@ -62,7 +100,8 @@ def _request(method, path, params=None, payload=None, timeout=30, auth=True, tok
     raise last_error
 
 
-def _request_multipart(path, fields, file_field, file_path, timeout=60, token=None):
+def _request_multipart(path, fields, file_field, file_path, timeout=60, token=None,
+                       auth_kind='primary', _retried_invalid_token=False):
     """上传飞书 IM 文件，保留与 JSON 请求相同的错误诊断与网络重试。"""
     target = Path(file_path)
     boundary = f'----HeroDigitalEtl{uuid.uuid4().hex}'
@@ -90,13 +129,27 @@ def _request_multipart(path, fields, file_field, file_path, timeout=60, token=No
     last_error = None
     for attempt in range(_MAX_RETRY):
         request = urllib.request.Request(FEISHU_HOST + path, data=data, method='POST')
-        request.add_header('Authorization', f'Bearer {token or _token()}')
+        request.add_header('Authorization', f'Bearer {token or _token_for(auth_kind)}')
         request.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 return json.loads(response.read().decode('utf-8'))
         except urllib.error.HTTPError as error:
             detail = error.read().decode('utf-8', errors='replace').strip()
+            if (
+                not _retried_invalid_token
+                and _is_invalid_access_token(error, detail)
+            ):
+                _clear_token_cache(auth_kind)
+                return _request_multipart(
+                    path,
+                    fields,
+                    file_field,
+                    file_path,
+                    timeout=timeout,
+                    auth_kind=auth_kind,
+                    _retried_invalid_token=True,
+                )
             raise RuntimeError(f'飞书文件上传 HTTP {error.code}: {detail or error.reason}') from error
         except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
             last_error = error
@@ -130,7 +183,12 @@ def _get_tenant_access_token_for(app_id, app_secret, credential_name):
     result = _request('POST', _TOKEN_PATH, payload={'app_id': app_id, 'app_secret': app_secret}, auth=False)
     if result.get('code') != 0:
         raise RuntimeError(f"飞书获取 tenant_access_token 失败: {result.get('code')} {result.get('msg')}")
-    return result['tenant_access_token']
+    try:
+        expires_in = int(result.get('expire', _TOKEN_DEFAULT_EXPIRE_SECONDS))
+    except (TypeError, ValueError):
+        expires_in = _TOKEN_DEFAULT_EXPIRE_SECONDS
+    expires_at = time.monotonic() + max(0, expires_in - _TOKEN_REFRESH_LEEWAY_SECONDS)
+    return result['tenant_access_token'], expires_at
 
 
 def _get_tenant_access_token():
@@ -143,9 +201,9 @@ def _get_tenant_access_token():
 
 def _token():
     global _TOKEN_CACHE
-    if not _TOKEN_CACHE:
+    if not _TOKEN_CACHE or _TOKEN_CACHE[1] <= time.monotonic():
         _TOKEN_CACHE = _get_tenant_access_token()
-    return _TOKEN_CACHE
+    return _TOKEN_CACHE[0]
 
 
 def _message_token():
@@ -157,13 +215,13 @@ def _message_token():
         return _token()
     if not app_id or not app_secret:
         raise RuntimeError('FEISHU_NOTIFY_APP_ID / FEISHU_NOTIFY_APP_SECRET 必须同时配置')
-    if not _MESSAGE_TOKEN_CACHE:
+    if not _MESSAGE_TOKEN_CACHE or _MESSAGE_TOKEN_CACHE[1] <= time.monotonic():
         _MESSAGE_TOKEN_CACHE = _get_tenant_access_token_for(
             app_id,
             app_secret,
             'FEISHU_NOTIFY_APP_ID / FEISHU_NOTIFY_APP_SECRET',
         )
-    return _MESSAGE_TOKEN_CACHE
+    return _MESSAGE_TOKEN_CACHE[0]
 
 
 def _check(result, tag):
@@ -189,7 +247,7 @@ def send_text_message(open_id, text):
             'msg_type': 'text',
             'content': json.dumps({'text': content}, ensure_ascii=False),
         },
-        token=_message_token(),
+        auth_kind='message',
     )
     return _check(result, '发送消息')
 
@@ -210,7 +268,7 @@ def send_interactive_card(open_id, card):
             'msg_type': 'interactive',
             'content': json.dumps(card, ensure_ascii=False),
         },
-        token=_message_token(),
+        auth_kind='message',
     )
     return _check(result, '发送卡片消息')
 
@@ -231,13 +289,12 @@ def send_file_message(open_id, file_path):
             f'飞书单文件最大支持 30 MB，当前 ZIP 为 {size / 1024 / 1024:.1f} MB: {path.name}'
         )
 
-    token = _message_token()
     upload = _request_multipart(
         _FILE_UPLOAD_PATH,
         fields={'file_type': 'stream', 'file_name': path.name},
         file_field='file',
         file_path=path,
-        token=token,
+        auth_kind='message',
     )
     file_key = _check(upload, '上传文件').get('file_key')
     if not file_key:
@@ -251,7 +308,7 @@ def send_file_message(open_id, file_path):
             'msg_type': 'file',
             'content': json.dumps({'file_key': file_key}, ensure_ascii=False),
         },
-        token=token,
+        auth_kind='message',
     )
     return _check(result, '发送文件消息')
 
