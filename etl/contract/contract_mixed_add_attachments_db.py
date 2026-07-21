@@ -140,6 +140,12 @@ def _build_general_manifest(scope_df):
 
     source_df, _, _ = mixed._resolve_general_sources(scope_df['合同key'])
     source_df = _subset_by_scope(source_df, scope_df)
+    if source_df.empty:
+        print(
+            f'[智书合同导入清单附件] {FLOW_GENERAL}: '
+            f'输入范围 {len(scope_df)} 个合同未匹配到源合同,跳过附件构建'
+        )
+        return source_df, pd.DataFrame(), pd.DataFrame()
     old_output_dir = general.OUTPUT_DIR
     try:
         general.OUTPUT_DIR = mixed.OUTPUT_DIR
@@ -165,6 +171,12 @@ def _build_anchor_manifest(scope_df):
 
     source_df, _ = mixed._resolve_anchor_sources(scope_df['合同key'])
     source_df = _subset_by_scope(source_df, scope_df)
+    if source_df.empty:
+        print(
+            f'[智书合同导入清单附件] {FLOW_ANCHOR}: '
+            f'输入范围 {len(scope_df)} 个合同未匹配到源合同,跳过附件构建'
+        )
+        return source_df, pd.DataFrame(), pd.DataFrame()
     old_output_dir = anchor.OUTPUT_DIR
     try:
         anchor.OUTPUT_DIR = mixed.OUTPUT_DIR

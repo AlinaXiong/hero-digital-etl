@@ -1172,6 +1172,12 @@ def _collect_attachment_docrefs(source_df):
 
 
 def build_contract_attachment_manifest(source_df, retention_mode='legacy'):
+    # 混合增补按输入路由查询时，某个流程范围可能没有命中任何源合同。
+    # 此时 pandas 会返回一个没有列定义的空 DataFrame；不应再索引流程字段。
+    if source_df.empty:
+        print('[合同迁移-一般流程] 附件源为空,跳过附件清单构建')
+        return pd.DataFrame(), pd.DataFrame()
+
     docrefs_by_contract, raw_effective_docids, all_docids = _timed(
         '  ├─附件docref收集(表单/赛事字段)', lambda: _collect_attachment_docrefs(source_df))
     print(f'[计时]   ├─附件 docid 总数: {len(all_docids)}', flush=True)

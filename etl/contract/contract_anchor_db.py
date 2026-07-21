@@ -766,7 +766,10 @@ def _legal_override_for_contract(contract_number, field):
     return _load_legal_receive_overrides().get(_contract_number_key(contract_number), {}).get(field, '')
 
 
-def _is_unmatched_contract_kept(row):
+def _is_unmatched_contract_kept(row, force_keep_contract_keys=frozenset()):
+    """判断无 Hand 主播档案的合同是否仍需导入主播流程。"""
+    if _contract_number_key(row.get('合同编号')) in force_keep_contract_keys:
+        return True
     end_date = pd.to_datetime(row.get('合同有效期截止时间'), errors='coerce')
     end_year = int(end_date.year) if not pd.isna(end_date) else None
     return (
@@ -2338,8 +2341,19 @@ def _build_hand_exact_anchor_id_set(card_values):
     return matched_ids
 
 
-def resolve_source_values(source_df):
+def resolve_source_values(source_df, force_keep_contract_numbers=()):
+    """解析主播流程源数据。
+
+    ``force_keep_contract_numbers`` 仅供混合增补输入清单显式路由到主播
+    流程的合同使用：无 Hand 主播档案时仍保留合同，主播相关字段保持现有
+    的空值/替换逻辑。指定合同、我方主体和驳回状态的硬性排除不受影响。
+    """
     df = source_df.copy()
+    force_keep_contract_keys = {
+        _contract_number_key(value)
+        for value in force_keep_contract_numbers
+        if _contract_number_key(value)
+    }
     option_maps = c.build_fw_select_option_maps(
         FW_TABLE,
         ['htlx', 'htejlx', 'htzt', 'szpt', 'bglx'],
@@ -2558,7 +2572,10 @@ def resolve_source_values(source_df):
     eligible_mask = ~(excluded_our_party_mask | excluded_contract_mask | rejected_mask)
     hand_matched_df = df.loc[eligible_mask & ~no_hand_anchor_mask].copy()
     hand_unmatched_df = df.loc[eligible_mask & no_hand_anchor_mask].copy()
-    unmatched_keep_mask = hand_unmatched_df.apply(_is_unmatched_contract_kept, axis=1)
+    unmatched_keep_mask = hand_unmatched_df.apply(
+        lambda row: _is_unmatched_contract_kept(row, force_keep_contract_keys),
+        axis=1,
+    )
     retained_unmatched_df = hand_unmatched_df.loc[unmatched_keep_mask].copy()
     excluded_unmatched_df = hand_unmatched_df.loc[~unmatched_keep_mask].copy()
     excluded_final_candidate_count = int((
@@ -2586,7 +2603,13 @@ def resolve_source_values(source_df):
     )
 
     hand_matched_df['主播处理分组'] = 'Hand生产可查'
-    retained_unmatched_df['主播处理分组'] = 'Hand生产不可查_条件保留'
+    retained_unmatched_df['主播处理分组'] = retained_unmatched_df['合同编号'].map(
+        lambda value: (
+            '输入清单指定主播流程_Hand不可查'
+            if _contract_number_key(value) in force_keep_contract_keys
+            else 'Hand生产不可查_条件保留'
+        )
+    )
     hand_matched_df = _apply_contract_creator_rules(
         hand_matched_df,
         status_by_number,

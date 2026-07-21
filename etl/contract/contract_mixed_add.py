@@ -349,10 +349,23 @@ def _selected_sql_without_base_where(base_sql):
 
 
 def _selected_anchor_sql():
+    """查询路由到主播流程的指定合同，允许输入清单显式覆盖泛微合同类型。"""
     marker = 'ORDER BY h.htbh, h.id'
-    if marker not in anchor.SOURCE_SQL:
-        raise RuntimeError('主播源 SQL 结构已变化,找不到 ORDER BY 注入点')
-    return anchor.SOURCE_SQL.replace(marker, '  AND h.htbh IN %(contract_codes)s\n' + marker)
+    type_and_status_filter = (
+        'WHERE h.htlx = %(anchor_contract_type_code)s\n'
+        '  AND h.htzt IN %(migration_status_codes)s'
+    )
+    if marker not in anchor.SOURCE_SQL or type_and_status_filter not in anchor.SOURCE_SQL:
+        raise RuntimeError('主播源 SQL 结构已变化,找不到合同类型/状态筛选或 ORDER BY 注入点')
+
+    # 混合增补的路由已由输入清单与泛微类型共同决定。输入清单显式标为
+    # “主播”的一般合同也必须能使用主播模板，故此处仅保留状态和合同编号筛选。
+    sql = anchor.SOURCE_SQL.replace(
+        type_and_status_filter,
+        'WHERE h.htzt IN %(migration_status_codes)s',
+        1,
+    )
+    return sql.replace(marker, '  AND h.htbh IN %(contract_codes)s\n' + marker, 1)
 
 
 def _query_selected_source(base_sql, contract_keys, source_label):
@@ -382,7 +395,6 @@ def _query_selected_anchor_source(contract_keys):
             'vspn_xtyy',
             sql,
             {
-                'anchor_contract_type_code': anchor.ANCHOR_CONTRACT_TYPE_CODE,
                 'migration_status_codes': anchor.MIGRATION_STATUS_CODES,
                 'contract_codes': tuple(batch),
             },
@@ -508,7 +520,14 @@ def _resolve_anchor_sources(contract_keys):
     raw = _query_selected_anchor_source(contract_keys)
     if raw.empty:
         return pd.DataFrame(), raw
-    resolved = anchor.resolve_source_values(raw)
+    force_keep_contract_numbers = raw.loc[
+        raw['合同类型ID'].map(c.format_code) != str(anchor.ANCHOR_CONTRACT_TYPE_CODE),
+        '合同编号',
+    ]
+    resolved = anchor.resolve_source_values(
+        raw,
+        force_keep_contract_numbers=force_keep_contract_numbers,
+    )
     return resolved, raw
 
 
