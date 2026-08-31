@@ -16,10 +16,19 @@
 无匹配、同一客商类型内重复匹配、缺少附件关联键都会写入结果清单而不会上传。
 同一标识同时唯一匹配供应商和客户时，会分别上传到两者的营业执照附件页。
 
+传入 ``--ocr-only`` 时不上传附件，而是下载泛微 ``yyzzsmj`` 附件并调用生产
+汉得营业执照 OCR；每个泛微客商的匹配、附件存在性和 OCR 结果会写入 SQLite。
+``--execute`` 也会执行该 OCR 校验，但不会因为 OCR 异常中断附件上传。
+
+传入 ``--download-business-licenses`` 时，只把 ``yyzzsmj`` 营业执照下载到
+本地，并写入 SQLite 豆包识别队列；企业豆包识别后可用
+``--import-doubao-results <JSONL 文件>`` 将逐条 JSON 结果回写该队列。
+
 运行前配置（项目根目录 .env.local 优先）：
 
     HFBS_UAT_ACCESS_TOKEN=<UAT 登录 Bearer Token，必填>
     WEAVER_CONTRACT_ATTACHMENT_COOKIE=<泛微 Cookie，执行上传时必填>
+    HFINS_PROD_OCR_ACCESS_TOKEN=<生产汉得 OCR Token，OCR 时必填>
 
 可选配置：
 
@@ -28,12 +37,16 @@
     HFBS_UAT_PAGE_SIZE=200
     HFBS_UAT_TIMEOUT_SECONDS=90
     HFBS_UAT_UPLOAD_RETRIES=3
+    HFINS_PROD_OCR_URL=http://api.link.heroesports.com/hfins/v2/0/ocr/recognize/business-file
 
 示例：
 
     python etl/util/sync_weaver_partner_attachments_to_hfbs_uat.py
     python etl/util/sync_weaver_partner_attachments_to_hfbs_uat.py --source-id 12345
     python etl/util/sync_weaver_partner_attachments_to_hfbs_uat.py --execute
+    python etl/util/sync_weaver_partner_attachments_to_hfbs_uat.py --ocr-only
+    python etl/util/sync_weaver_partner_attachments_to_hfbs_uat.py --download-business-licenses
+    python etl/util/sync_weaver_partner_attachments_to_hfbs_uat.py --import-doubao-results doubao_result.jsonl
 
 @author xiongyilin@heroesports.com
 @since 2026-08-31
@@ -45,6 +58,7 @@ import logging
 import mimetypes
 import os
 import re
+import sqlite3
 import sys
 import time
 import unicodedata
@@ -71,6 +85,7 @@ DEFAULT_PAGE_SIZE = 200
 DEFAULT_TIMEOUT_SECONDS = 90
 DEFAULT_UPLOAD_RETRIES = 3
 DEFAULT_MAX_FILE_BYTES = 50 * 1024 * 1024
+DEFAULT_PROD_OCR_URL = 'http://api.link.heroesports.com/hfins/v2/0/ocr/recognize/business-file'
 UAT_TOKEN_ENV = 'HFBS_UAT_ACCESS_TOKEN'
 UAT_BASE_URL_ENV = 'HFBS_UAT_BASE_URL'
 UAT_ORGANIZATION_ID_ENV = 'HFBS_UAT_ORGANIZATION_ID'
@@ -78,6 +93,17 @@ UAT_PAGE_SIZE_ENV = 'HFBS_UAT_PAGE_SIZE'
 UAT_TIMEOUT_ENV = 'HFBS_UAT_TIMEOUT_SECONDS'
 UAT_UPLOAD_RETRIES_ENV = 'HFBS_UAT_UPLOAD_RETRIES'
 UAT_MAX_FILE_BYTES_ENV = 'HFBS_UAT_MAX_FILE_BYTES'
+PROD_OCR_TOKEN_ENV = 'HFINS_PROD_OCR_ACCESS_TOKEN'
+PROD_OCR_URL_ENV = 'HFINS_PROD_OCR_URL'
+OCR_AUDIT_DB_NAME = '泛微客商营业执照OCR结果.sqlite'
+BUSINESS_LICENSE_FIELD = 'yyzzsmj'
+BUSINESS_LICENSE_DOWNLOAD_DIR_NAME = '营业执照附件'
+DOUBAO_QUEUE_TABLE = 'weaver_partner_business_license_doubao_queue'
+OCR_CACHEABLE_STATUSES = frozenset({
+    'business_license_ok',
+    'business_license_problem',
+    'business_license_identifier_mismatch',
+})
 
 ATTACHMENT_FIELDS: Tuple[Tuple[str, str], ...] = (
     ('gsjjdzb', '公司简介电子版'),
@@ -135,6 +161,7 @@ RESULT_COLUMNS = (
 )
 DOC_ID_RE = re.compile(r'\d+')
 IDENTIFIER_NORMALIZE_RE = re.compile(r'[^0-9A-Za-z]')
+WINDOWS_FILENAME_INVALID_RE = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
 
 
 @dataclass(frozen=True)
@@ -598,6 +625,49 @@ def _download_weaver_attachment(
     return data
 
 
+def _safe_local_path_component(value: str, fallback: str) -> str:
+    value = WINDOWS_FILENAME_INVALID_RE.sub('_', _text(value)).strip().rstrip('.')
+    return value or fallback
+
+
+def _business_license_local_path(source: SourceAttachment, meta: AttachmentMeta) -> Path:
+    source_dir = _safe_local_path_component(source.source_id, 'unknown_source')
+    file_name = _safe_local_path_component(
+        meta.attachment_name,
+        f'weaver_doc_{meta.docid}_file_{meta.imagefileid}',
+    )
+    return (
+        OUTPUT_DIR
+        / BUSINESS_LICENSE_DOWNLOAD_DIR_NAME
+        / source_dir
+        / f'{meta.docid}_{meta.imagefileid}_{file_name}'
+    )
+
+
+def _download_business_license_to_local(
+    source: SourceAttachment,
+    meta: AttachmentMeta,
+    cookie: str,
+    timeout_seconds: int,
+    max_file_bytes: int,
+) -> Tuple[Path, str, int]:
+    """幂等下载营业执照；文件地址固定，避免重复下载同一个 IMAGEFILEID。"""
+    target_path = _business_license_local_path(source, meta)
+    if target_path.is_file() and target_path.stat().st_size > 0:
+        return target_path.resolve(), 'existing', target_path.stat().st_size
+
+    data = _download_weaver_attachment(cookie, meta, timeout_seconds, max_file_bytes)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target_path.with_name(f'{target_path.name}.part-{os.getpid()}')
+    try:
+        temp_path.write_bytes(data)
+        temp_path.replace(target_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+    return target_path.resolve(), 'downloaded', len(data)
+
+
 def _multipart_body(filename: str, data: bytes, order_number: str) -> Tuple[bytes, str]:
     boundary = f'----HeroAttachmentSync{time.time_ns()}'
     mime_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
@@ -617,6 +687,71 @@ def _multipart_body(filename: str, data: bytes, order_number: str) -> Tuple[byte
         f'--{boundary}--\r\n'.encode(),
     ]
     return b''.join(chunks), f'multipart/form-data; boundary={boundary}'
+
+
+def _file_multipart_body(filename: str, data: bytes) -> Tuple[bytes, str]:
+    """构造仅含 ``file`` 字段的 multipart 请求，用于生产营业执照 OCR。"""
+    boundary = f'----HeroBusinessLicenseOcr{time.time_ns()}'
+    mime_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+    chunks = [
+        f'--{boundary}\r\n'.encode(),
+        (
+            'Content-Disposition: form-data; name="file"; '
+            f'filename="{filename.replace(chr(34), "_")}"\r\n'
+        ).encode('utf-8'),
+        f'Content-Type: {mime_type}\r\n\r\n'.encode(),
+        data,
+        b'\r\n',
+        f'--{boundary}--\r\n'.encode(),
+    ]
+    return b''.join(chunks), f'multipart/form-data; boundary={boundary}'
+
+
+def _with_access_token_query(url: str, access_token: str) -> str:
+    """生产 OCR 前端以 query access_token 鉴权；去重后再追加当前 Token。"""
+    parsed = urllib.parse.urlsplit(url)
+    query_items = [
+        (key, value)
+        for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        if key != 'access_token'
+    ]
+    query_items.append(('access_token', access_token))
+    return urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query_items)))
+
+
+def _request_production_business_license_ocr(
+    ocr_url: str,
+    access_token: str,
+    meta: AttachmentMeta,
+    data: bytes,
+    timeout_seconds: int,
+) -> Tuple[object, int]:
+    """调用生产汉得营业执照 OCR，不将 Token 或文件内容写入日志。"""
+    request_url = _with_access_token_query(ocr_url, access_token)
+    body, content_type = _file_multipart_body(meta.attachment_name, data)
+    headers = _authorization_headers(access_token)
+    headers['Content-Type'] = content_type
+    headers['Content-Length'] = str(len(body))
+    request = urllib.request.Request(request_url, data=body, headers=headers, method='POST')
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            response_body = response.read()
+            status_code = response.getcode()
+    except urllib.error.HTTPError as exc:
+        raise UatRequestError(f'生产 OCR HTTP {exc.code}: {_response_text(exc.read())}', exc.code) from exc
+    except urllib.error.URLError as exc:
+        raise UatRequestError(f'生产 OCR 网络错误: {exc.reason}') from exc
+
+    try:
+        payload = json.loads(response_body.decode('utf-8'))
+    except json.JSONDecodeError as exc:
+        raise UatRequestError(f'生产 OCR 返回非 JSON: {_response_text(response_body)}', status_code) from exc
+    if isinstance(payload, dict) and payload.get('failed'):
+        raise UatRequestError(
+            _text(payload.get('message')) or _text(payload.get('detailsMessage')) or '生产 OCR 调用失败',
+            status_code,
+        )
+    return payload, status_code
 
 
 def _fetch_existing_attachment_names(
@@ -769,6 +904,453 @@ def _retry_upload(
     raise last_error or RuntimeError('未知上传失败')
 
 
+def _source_certificate_number(source: SourceAttachment) -> str:
+    """保留源表证件号/税号原值，仅写入本机 SQLite 审计库，不写入运行日志。"""
+    return ' | '.join(dict.fromkeys(value for _, value in source.identifier_values if _text(value)))
+
+
+def _match_audit_values(outcome: MatchOutcome) -> Tuple[str, str, str]:
+    match_result = outcome.reason or ('matched' if outcome.matches else 'identifier_not_found')
+    target_summaries = []
+    for match in outcome.matches:
+        target = match.target
+        target_summaries.append(
+            f'{target.target_type}:{target.code or target.primary_id}:{target.name}'
+        )
+    if outcome.ambiguous_target_types:
+        ambiguous = '、'.join(
+            '供应商' if target_type == 'vender' else '客户'
+            for target_type in outcome.ambiguous_target_types
+        )
+        detail = f'{ambiguous}存在多条匹配；唯一匹配目标：{"; ".join(target_summaries) or "无"}'
+    elif target_summaries:
+        detail = f'唯一匹配目标：{"; ".join(target_summaries)}'
+    else:
+        detail = '未找到 UAT 客商' if match_result == 'identifier_not_found' else '同一客商类型匹配到多条 UAT 客商'
+    return match_result, detail, '; '.join(target_summaries)
+
+
+def _ocr_items(payload: object) -> List[dict]:
+    """兼容 HZero 网关直返列表及 ``data`` 包装两种 OCR 响应。"""
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        data = payload.get('data')
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict):
+            return [data]
+    return []
+
+
+def _evaluate_business_license_ocr(payload: object, source: SourceAttachment) -> dict:
+    """把生产 OCR 返回归类为正常、营业执照有问题或响应异常。"""
+    items = _ocr_items(payload)
+    item = next((candidate for candidate in items if _text(candidate.get('ocrType')) == 'BUSINESS_LICENSE'), None)
+    if item is None and items:
+        item = items[0]
+    if item is None:
+        return {
+            'ocr_status': 'business_license_problem',
+            'ocr_is_business_license': False,
+            'ocr_identifier_match': 'not_available',
+            'ocr_type': '',
+            'ocr_message': '生产 OCR 未返回识别结果',
+            'ocr_result_json': json.dumps(payload, ensure_ascii=False, default=str),
+        }
+
+    ocr_type = _text(item.get('ocrType'))
+    result_info = item.get('resultInfo') if isinstance(item.get('resultInfo'), dict) else {}
+    ocr_message = _text(item.get('message'))
+    has_result_values = any(_text(value) for value in result_info.values())
+    ocr_uscc = _text(result_info.get('uscc'))
+    source_identifiers = {
+        _normalize_identifier(value) for _, value in source.identifier_values if _normalize_identifier(value)
+    }
+    if ocr_uscc:
+        ocr_identifier_match = (
+            'matched_source_identifier'
+            if _normalize_identifier(ocr_uscc) in source_identifiers
+            else 'mismatched_source_identifier'
+        )
+    elif source_identifiers:
+        ocr_identifier_match = 'ocr_identifier_not_returned'
+    else:
+        ocr_identifier_match = 'source_identifier_not_available'
+
+    if ocr_type != 'BUSINESS_LICENSE' or not has_result_values:
+        ocr_status = 'business_license_problem'
+    elif ocr_identifier_match == 'mismatched_source_identifier':
+        ocr_status = 'business_license_identifier_mismatch'
+    else:
+        ocr_status = 'business_license_ok'
+    if not ocr_message and ocr_status != 'business_license_ok':
+        ocr_message = f'ocrType={ocr_type or "未返回"}，未取得有效营业执照识别字段'
+    return {
+        'ocr_status': ocr_status,
+        'ocr_is_business_license': ocr_type == 'BUSINESS_LICENSE' and has_result_values,
+        'ocr_identifier_match': ocr_identifier_match,
+        'ocr_type': ocr_type,
+        'ocr_message': ocr_message,
+        'ocr_result_json': json.dumps(payload, ensure_ascii=False, default=str),
+    }
+
+
+def _init_ocr_audit_db(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        '''
+        CREATE TABLE IF NOT EXISTS weaver_partner_business_license_ocr_result (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            called_at TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            source_name TEXT,
+            certificate_number TEXT,
+            match_result TEXT NOT NULL,
+            match_detail TEXT,
+            matched_targets TEXT,
+            has_business_license INTEGER NOT NULL,
+            source_docid INTEGER NOT NULL DEFAULT 0,
+            weaver_imagefileid INTEGER NOT NULL DEFAULT 0,
+            attachment_name TEXT,
+            ocr_called INTEGER NOT NULL,
+            ocr_cache_hit INTEGER NOT NULL DEFAULT 0,
+            ocr_status TEXT NOT NULL,
+            ocr_is_business_license INTEGER,
+            ocr_identifier_match TEXT,
+            ocr_type TEXT,
+            ocr_message TEXT,
+            ocr_result_json TEXT,
+            ocr_http_status INTEGER
+        )
+        '''
+    )
+    columns = {
+        _text(row[1])
+        for row in connection.execute('PRAGMA table_info(weaver_partner_business_license_ocr_result)')
+    }
+    if 'ocr_cache_hit' not in columns:
+        connection.execute(
+            'ALTER TABLE weaver_partner_business_license_ocr_result '
+            'ADD COLUMN ocr_cache_hit INTEGER NOT NULL DEFAULT 0'
+        )
+    connection.execute(
+        '''
+        CREATE INDEX IF NOT EXISTS idx_weaver_partner_license_ocr_source
+        ON weaver_partner_business_license_ocr_result (source_id, called_at)
+        '''
+    )
+
+
+def _init_doubao_queue_db(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        f'''
+        CREATE TABLE IF NOT EXISTS {DOUBAO_QUEUE_TABLE} (
+            source_id TEXT NOT NULL,
+            source_docid INTEGER NOT NULL,
+            weaver_imagefileid INTEGER NOT NULL,
+            source_name TEXT,
+            certificate_number TEXT,
+            match_result TEXT NOT NULL,
+            match_detail TEXT,
+            matched_targets TEXT,
+            attachment_name TEXT,
+            business_license_local_path TEXT,
+            download_status TEXT NOT NULL,
+            file_size INTEGER,
+            doubao_status TEXT NOT NULL DEFAULT 'pending',
+            doubao_is_business_license INTEGER,
+            doubao_message TEXT,
+            doubao_result_json TEXT,
+            doubao_updated_at TEXT,
+            PRIMARY KEY (source_id, source_docid, weaver_imagefileid)
+        )
+        '''
+    )
+    connection.execute(
+        f'''
+        CREATE INDEX IF NOT EXISTS idx_weaver_partner_doubao_queue_status
+        ON {DOUBAO_QUEUE_TABLE} (doubao_status, source_id)
+        '''
+    )
+
+
+def _upsert_doubao_queue_row(
+    connection: sqlite3.Connection,
+    source: SourceAttachment,
+    outcome: MatchOutcome,
+    meta: Optional[AttachmentMeta],
+    download_status: str,
+    local_path: Optional[Path] = None,
+    file_size: Optional[int] = None,
+) -> None:
+    match_result, match_detail, matched_targets = _match_audit_values(outcome)
+    source_docid = meta.docid if meta else source.docid
+    imagefileid = meta.imagefileid if meta else 0
+    attachment_name = meta.attachment_name if meta else ''
+    connection.execute(
+        f'''
+        INSERT INTO {DOUBAO_QUEUE_TABLE} (
+            source_id, source_docid, weaver_imagefileid, source_name, certificate_number,
+            match_result, match_detail, matched_targets, attachment_name,
+            business_license_local_path, download_status, file_size, doubao_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_id, source_docid, weaver_imagefileid) DO UPDATE SET
+            source_name = excluded.source_name,
+            certificate_number = excluded.certificate_number,
+            match_result = excluded.match_result,
+            match_detail = excluded.match_detail,
+            matched_targets = excluded.matched_targets,
+            attachment_name = excluded.attachment_name,
+            business_license_local_path = excluded.business_license_local_path,
+            download_status = excluded.download_status,
+            file_size = excluded.file_size,
+            doubao_status = CASE
+                WHEN excluded.download_status = 'download_failed' THEN 'download_failed'
+                WHEN {DOUBAO_QUEUE_TABLE}.doubao_status = 'completed' THEN 'completed'
+                ELSE 'pending'
+            END
+        ''',
+        (
+            source.source_id,
+            source_docid,
+            imagefileid,
+            source.source_name,
+            _source_certificate_number(source),
+            match_result,
+            match_detail,
+            matched_targets,
+            attachment_name,
+            str(local_path) if local_path else '',
+            download_status,
+            file_size,
+            'download_failed' if download_status == 'download_failed' else 'pending',
+        ),
+    )
+
+
+def _optional_bool(value) -> Optional[bool]:
+    if value is None or _text(value) == '':
+        return None
+    if isinstance(value, bool):
+        return value
+    normalized = _text(value).lower()
+    if normalized in ('1', 'true', 'yes', 'y', '是'):
+        return True
+    if normalized in ('0', 'false', 'no', 'n', '否'):
+        return False
+    raise ValueError(f'无法识别布尔值: {value}')
+
+
+def _import_doubao_results(result_file: Path, logger: logging.Logger) -> Path:
+    """导入企业豆包逐行 JSON 识别结果，按泛微附件唯一键更新本地 SQLite 队列。"""
+    if not result_file.is_file():
+        raise RuntimeError(f'豆包结果文件不存在: {result_file}')
+    db_path = OUTPUT_DIR / OCR_AUDIT_DB_NAME
+    imported = 0
+    skipped = 0
+    with sqlite3.connect(db_path) as connection:
+        _init_doubao_queue_db(connection)
+        for line_number, line in enumerate(result_file.read_text(encoding='utf-8-sig').splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+                if not isinstance(payload, dict):
+                    raise ValueError('每行必须是 JSON 对象')
+                source_id = _text(payload.get('source_id'))
+                source_docid = int(payload.get('source_docid'))
+                imagefileid = int(payload.get('weaver_imagefileid'))
+                if not source_id or source_docid <= 0 or imagefileid <= 0:
+                    raise ValueError('缺少 source_id/source_docid/weaver_imagefileid')
+                status = _text(payload.get('doubao_status')) or 'completed'
+                is_business_license = _optional_bool(payload.get('is_business_license'))
+                message = _text(payload.get('message'))
+                result = payload.get('result', payload.get('ocr_result'))
+                result_json = json.dumps(result, ensure_ascii=False, default=str) if result is not None else ''
+                cursor = connection.execute(
+                    f'''
+                    UPDATE {DOUBAO_QUEUE_TABLE}
+                    SET doubao_status = ?, doubao_is_business_license = ?, doubao_message = ?,
+                        doubao_result_json = ?, doubao_updated_at = ?
+                    WHERE source_id = ? AND source_docid = ? AND weaver_imagefileid = ?
+                    ''',
+                    (
+                        status,
+                        None if is_business_license is None else int(is_business_license),
+                        message,
+                        result_json,
+                        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        source_id,
+                        source_docid,
+                        imagefileid,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError('SQLite 队列中未找到对应的营业执照附件')
+                imported += 1
+            except Exception as exc:
+                skipped += 1
+                logger.warning('[doubao_import_skipped] line=%s %s', line_number, exc)
+        connection.commit()
+    logger.info('豆包结果导入完成: imported=%s skipped=%s sqlite=%s', imported, skipped, db_path)
+    return db_path
+
+
+def _write_ocr_audit_row(
+    connection: sqlite3.Connection,
+    run_id: str,
+    source: SourceAttachment,
+    outcome: MatchOutcome,
+    has_business_license: bool,
+    ocr_record: dict,
+    meta: Optional[AttachmentMeta] = None,
+    source_docid: int = 0,
+    http_status: Optional[int] = None,
+) -> None:
+    match_result, match_detail, matched_targets = _match_audit_values(outcome)
+    connection.execute(
+        '''
+        INSERT INTO weaver_partner_business_license_ocr_result (
+            run_id, called_at, source_id, source_name, certificate_number,
+            match_result, match_detail, matched_targets, has_business_license,
+            source_docid, weaver_imagefileid, attachment_name, ocr_called,
+            ocr_cache_hit, ocr_status, ocr_is_business_license, ocr_identifier_match, ocr_type,
+            ocr_message, ocr_result_json, ocr_http_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+        (
+            run_id,
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            source.source_id,
+            source.source_name,
+            _source_certificate_number(source),
+            match_result,
+            match_detail,
+            matched_targets,
+            int(has_business_license),
+            meta.docid if meta else source_docid,
+            meta.imagefileid if meta else 0,
+            meta.attachment_name if meta else '',
+            int(bool(ocr_record.get('ocr_called'))),
+            int(bool(ocr_record.get('ocr_cache_hit'))),
+            _text(ocr_record.get('ocr_status')),
+            (
+                int(bool(ocr_record['ocr_is_business_license']))
+                if ocr_record.get('ocr_is_business_license') is not None else None
+            ),
+            _text(ocr_record.get('ocr_identifier_match')),
+            _text(ocr_record.get('ocr_type')),
+            _text(ocr_record.get('ocr_message')),
+            _text(ocr_record.get('ocr_result_json')),
+            http_status,
+        ),
+    )
+
+
+def _load_cached_business_license_ocr(
+    connection: sqlite3.Connection,
+    source: SourceAttachment,
+    meta: AttachmentMeta,
+) -> Optional[dict]:
+    """同一泛微 IMAGEFILEID 已有有效结论时复用，避免重复产生生产 OCR 费用。"""
+    placeholders = ', '.join('?' for _ in OCR_CACHEABLE_STATUSES)
+    row = connection.execute(
+        f'''
+        SELECT ocr_status, ocr_is_business_license, ocr_identifier_match,
+               ocr_type, ocr_message, ocr_result_json
+        FROM weaver_partner_business_license_ocr_result
+        WHERE source_id = ?
+          AND source_docid = ?
+          AND weaver_imagefileid = ?
+          AND ocr_status IN ({placeholders})
+        ORDER BY id DESC
+        LIMIT 1
+        ''',
+        (source.source_id, meta.docid, meta.imagefileid, *sorted(OCR_CACHEABLE_STATUSES)),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        'ocr_called': False,
+        'ocr_cache_hit': True,
+        'ocr_status': _text(row[0]),
+        'ocr_is_business_license': None if row[1] is None else bool(row[1]),
+        'ocr_identifier_match': _text(row[2]),
+        'ocr_type': _text(row[3]),
+        'ocr_message': _text(row[4]),
+        'ocr_result_json': _text(row[5]),
+    }
+
+
+def _get_business_license_ocr_result(
+    connection: sqlite3.Connection,
+    source: SourceAttachment,
+    meta: AttachmentMeta,
+    ocr_enabled: bool,
+    ocr_url: str,
+    ocr_access_token: str,
+    cookie: str,
+    timeout_seconds: int,
+    max_file_bytes: int,
+) -> Tuple[dict, Optional[int], Optional[bytes]]:
+    """取缓存或调用 OCR；新下载的内存 bytes 返回给同轮 UAT 上传复用。"""
+    if not ocr_enabled:
+        return (
+            {
+                'ocr_called': False,
+                'ocr_status': 'ocr_not_called',
+                'ocr_message': 'dry-run 未调用生产 OCR；请使用 --ocr-only 或 --execute',
+            },
+            None,
+            None,
+        )
+
+    cached = _load_cached_business_license_ocr(connection, source, meta)
+    if cached is not None:
+        return cached, None, None
+
+    try:
+        file_data = _download_weaver_attachment(cookie, meta, timeout_seconds, max_file_bytes)
+    except Exception as exc:  # 单个附件异常不可中断整批 OCR。
+        return (
+            {
+                'ocr_called': True,
+                'ocr_status': 'ocr_download_or_call_failed',
+                'ocr_message': str(exc),
+            },
+            None,
+            None,
+        )
+    try:
+        ocr_payload, http_status = _request_production_business_license_ocr(
+            ocr_url, ocr_access_token, meta, file_data, timeout_seconds,
+        )
+        ocr_record = _evaluate_business_license_ocr(ocr_payload, source)
+        ocr_record['ocr_called'] = True
+        return ocr_record, http_status, file_data
+    except UatRequestError as exc:
+        return (
+            {
+                'ocr_called': True,
+                'ocr_status': 'ocr_call_failed',
+                'ocr_message': str(exc),
+            },
+            exc.status_code,
+            file_data,
+        )
+    except Exception as exc:  # 单个附件异常不可中断整批 OCR。
+        return (
+            {
+                'ocr_called': True,
+                'ocr_status': 'ocr_download_or_call_failed',
+                'ocr_message': str(exc),
+            },
+            None,
+            file_data,
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='泛微客商附件同步到业财 UAT 营业执照页')
     parser.add_argument(
@@ -777,6 +1359,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument('--limit', type=int, default=0, help='最多处理多少个泛微客商 ID（0 表示全部）')
     parser.add_argument('--execute', action='store_true', help='真正下载泛微附件并上传 UAT；默认仅 dry-run')
+    parser.add_argument(
+        '--ocr-only', action='store_true',
+        help='仅调用生产汉得 OCR 校验 yyzzsmj 营业执照附件，不上传 UAT',
+    )
+    parser.add_argument(
+        '--download-business-licenses', action='store_true',
+        help='仅下载 yyzzsmj 营业执照到本地，并写入 SQLite 豆包识别队列，不上传 UAT、不调用汉得 OCR',
+    )
+    parser.add_argument(
+        '--import-doubao-results', type=Path,
+        help='导入企业豆包逐行 JSON（JSONL）识别结果并回写 SQLite 队列',
+    )
     parser.add_argument(
         '--allow-primary-key-unique-code', action='store_true',
         help='UAT 列表未返回 headerId 时，允许使用 customerId/venderId 作为附件 uniqueCode（默认禁止）',
@@ -792,13 +1386,27 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
     args = build_parser().parse_args(argv)
     run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
     logger, log_file = _setup_logger(run_id)
+    if args.import_doubao_results:
+        if args.execute or args.ocr_only or args.download_business_licenses or args.source_id or args.limit:
+            raise RuntimeError('--import-doubao-results 不能与下载、OCR、上传或筛选参数同时使用。')
+        return _import_doubao_results(args.import_doubao_results, logger)
+    if args.execute and args.ocr_only:
+        raise RuntimeError('--execute 与 --ocr-only 不能同时使用；--execute 已自动执行营业执照 OCR。')
+    if args.download_business_licenses and (args.execute or args.ocr_only):
+        raise RuntimeError('--download-business-licenses 仅用于生成豆包离线识别队列，不能与 --execute 或 --ocr-only 同时使用。')
     result_file = OUTPUT_DIR / f'同步结果_{run_id}.csv'
+    ocr_audit_db = OUTPUT_DIR / OCR_AUDIT_DB_NAME
     access_token = os.getenv(UAT_TOKEN_ENV, '').strip()
     if not access_token:
         raise RuntimeError(f'缺少 {UAT_TOKEN_ENV}；请配置 UAT Bearer Token 后重试。')
     cookie = os.getenv(c.ATTACHMENT_COOKIE_ENV, '').strip()
-    if args.execute and not cookie:
-        raise RuntimeError(f'缺少 {c.ATTACHMENT_COOKIE_ENV}；执行上传前必须配置有效泛微 Cookie。')
+    ocr_enabled = args.execute or args.ocr_only
+    business_license_download_enabled = args.download_business_licenses
+    if (args.execute or ocr_enabled or business_license_download_enabled) and not cookie:
+        raise RuntimeError(f'缺少 {c.ATTACHMENT_COOKIE_ENV}；下载附件或 OCR 前必须配置有效泛微 Cookie。')
+    ocr_access_token = os.getenv(PROD_OCR_TOKEN_ENV, '').strip()
+    if ocr_enabled and not ocr_access_token:
+        raise RuntimeError(f'缺少 {PROD_OCR_TOKEN_ENV}；生产 OCR 校验前必须配置有效 Token。')
 
     base_url = os.getenv(UAT_BASE_URL_ENV, DEFAULT_UAT_BASE_URL).strip().rstrip('/')
     organization_id = os.getenv(UAT_ORGANIZATION_ID_ENV, DEFAULT_UAT_ORGANIZATION_ID).strip()
@@ -806,9 +1414,17 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
     timeout_seconds = _positive_int_env(UAT_TIMEOUT_ENV, DEFAULT_TIMEOUT_SECONDS, maximum=300)
     upload_retries = _positive_int_env(UAT_UPLOAD_RETRIES_ENV, DEFAULT_UPLOAD_RETRIES, maximum=10)
     max_file_bytes = _positive_int_env(UAT_MAX_FILE_BYTES_ENV, DEFAULT_MAX_FILE_BYTES, maximum=500 * 1024 * 1024)
+    ocr_url = os.getenv(PROD_OCR_URL_ENV, DEFAULT_PROD_OCR_URL).strip() or DEFAULT_PROD_OCR_URL
     logger.info(
-        '开始同步: mode=%s base_url=%s org=%s page_size=%s source_ids=%s',
-        'execute' if args.execute else 'dry-run', base_url, organization_id, page_size,
+        '开始同步: mode=%s ocr=%s base_url=%s org=%s page_size=%s source_ids=%s',
+        (
+            'execute' if args.execute else (
+                'ocr-only' if args.ocr_only else (
+                    'download-business-licenses' if business_license_download_enabled else 'dry-run'
+                )
+            )
+        ),
+        'enabled' if ocr_enabled else 'not-called', base_url, organization_id, page_size,
         ','.join(args.source_id) if args.source_id else 'all',
     )
 
@@ -832,20 +1448,215 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
 
     matched_sources: List[SourceAttachment] = []
     match_results: Dict[SourceAttachment, MatchOutcome] = {}
+    sources_by_id: Dict[str, List[SourceAttachment]] = defaultdict(list)
+    business_license_sources_by_id: Dict[str, List[SourceAttachment]] = defaultdict(list)
     for source in source_attachments:
         outcome = _match_targets(source, identifier_index)
         match_results[source] = outcome
+        sources_by_id[source.source_id].append(source)
+        if source.field_name == BUSINESS_LICENSE_FIELD:
+            business_license_sources_by_id[source.source_id].append(source)
         if outcome.matches:
             matched_sources.append(source)
-    attachment_metadata = _load_attachment_metadata(item.docid for item in matched_sources)
+    metadata_docids = {item.docid for item in matched_sources}
+    metadata_docids.update(
+        item.docid for item in source_attachments if item.field_name == BUSINESS_LICENSE_FIELD
+    )
+    attachment_metadata = _load_attachment_metadata(metadata_docids)
+
+    ocr_status_counts: Counter = Counter()
+    with sqlite3.connect(ocr_audit_db) as ocr_connection:
+        _init_ocr_audit_db(ocr_connection)
+        _init_doubao_queue_db(ocr_connection)
+        for source_id, source_items in sources_by_id.items():
+            source = source_items[0]
+            outcome = match_results[source]
+            business_license_sources = business_license_sources_by_id.get(source_id, [])
+            if not business_license_sources:
+                _write_ocr_audit_row(
+                    ocr_connection,
+                    run_id,
+                    source,
+                    outcome,
+                    has_business_license=False,
+                    ocr_record={
+                        'ocr_called': False,
+                        'ocr_status': 'no_business_license',
+                        'ocr_message': '泛微 yyzzsmj 字段未找到营业执照附件',
+                    },
+                )
+                ocr_status_counts['no_business_license'] += 1
+                continue
+
+            # --execute 时在后续逐个附件上传前 OCR，才能复用同一份内存 bytes。
+            if args.execute:
+                continue
+
+            for business_license_source in business_license_sources:
+                license_metas = attachment_metadata.get(business_license_source.docid, [])
+                if not license_metas:
+                    if business_license_download_enabled:
+                        _upsert_doubao_queue_row(
+                            ocr_connection,
+                            business_license_source,
+                            outcome,
+                            meta=None,
+                            download_status='missing_docimagefile',
+                        )
+                    _write_ocr_audit_row(
+                        ocr_connection,
+                        run_id,
+                        business_license_source,
+                        outcome,
+                        has_business_license=True,
+                        source_docid=business_license_source.docid,
+                        ocr_record={
+                            'ocr_called': False,
+                            'ocr_status': 'missing_docimagefile',
+                            'ocr_message': '泛微 docimagefile/imagefile 未找到营业执照附件元数据',
+                        },
+                    )
+                    ocr_status_counts['missing_docimagefile'] += 1
+                    continue
+
+                for meta in license_metas:
+                    if business_license_download_enabled:
+                        try:
+                            local_path, download_status, file_size = _download_business_license_to_local(
+                                business_license_source,
+                                meta,
+                                cookie,
+                                timeout_seconds,
+                                max_file_bytes,
+                            )
+                            logger.info(
+                                '[business_license_download:%s] source=%s doc=%s file=%s path=%s',
+                                download_status,
+                                business_license_source.source_id,
+                                meta.docid,
+                                meta.attachment_name,
+                                local_path,
+                            )
+                        except Exception as exc:  # 单个下载失败不影响其余营业执照。
+                            local_path = None
+                            download_status = 'download_failed'
+                            file_size = None
+                            logger.warning(
+                                '[business_license_download_failed] source=%s doc=%s file=%s %s',
+                                business_license_source.source_id,
+                                meta.docid,
+                                meta.attachment_name,
+                                exc,
+                            )
+                        _upsert_doubao_queue_row(
+                            ocr_connection,
+                            business_license_source,
+                            outcome,
+                            meta,
+                            download_status,
+                            local_path,
+                            file_size,
+                        )
+                    ocr_record, http_status, _ = _get_business_license_ocr_result(
+                        ocr_connection,
+                        business_license_source,
+                        meta,
+                        ocr_enabled,
+                        ocr_url,
+                        ocr_access_token,
+                        cookie,
+                        timeout_seconds,
+                        max_file_bytes,
+                    )
+                    _write_ocr_audit_row(
+                        ocr_connection,
+                        run_id,
+                        business_license_source,
+                        outcome,
+                        has_business_license=True,
+                        meta=meta,
+                        ocr_record=ocr_record,
+                        http_status=http_status,
+                    )
+                    ocr_status_counts[_text(ocr_record.get('ocr_status'))] += 1
+                    logger.info(
+                        '[OCR:%s] source=%s doc=%s file=%s',
+                        ocr_record.get('ocr_status'),
+                        business_license_source.source_id,
+                        meta.docid,
+                        meta.attachment_name,
+                    )
+        ocr_connection.commit()
+    if not args.execute:
+        logger.info('营业执照 OCR 审计完成: %s', dict(sorted(ocr_status_counts.items())))
+        logger.info('营业执照 OCR SQLite: %s', ocr_audit_db)
 
     existing_names_cache: Dict[Tuple[str, str, str], Set[str]] = {}
     status_counts: Counter = Counter()
+    execute_ocr_connection: Optional[sqlite3.Connection] = None
+    if args.execute:
+        execute_ocr_connection = sqlite3.connect(ocr_audit_db)
+        _init_ocr_audit_db(execute_ocr_connection)
+    # 每条营业执照只在其 OCR 到 UAT 上传之间短暂保留，避免整批附件占满内存。
+    ocr_upload_memory: Dict[Tuple[str, int, int], bytes] = {}
     with open(result_file, 'w', encoding='utf-8-sig', newline='') as result_handle:
         writer = csv.DictWriter(result_handle, fieldnames=RESULT_COLUMNS)
         writer.writeheader()
         for source in source_attachments:
             outcome = match_results[source]
+            if args.execute and source.field_name == BUSINESS_LICENSE_FIELD:
+                if execute_ocr_connection is None:
+                    raise RuntimeError('生产 OCR SQLite 连接未初始化')
+                license_metas = attachment_metadata.get(source.docid, [])
+                if not license_metas:
+                    ocr_record = {
+                        'ocr_called': False,
+                        'ocr_status': 'missing_docimagefile',
+                        'ocr_message': '泛微 docimagefile/imagefile 未找到营业执照附件元数据',
+                    }
+                    _write_ocr_audit_row(
+                        execute_ocr_connection,
+                        run_id,
+                        source,
+                        outcome,
+                        has_business_license=True,
+                        source_docid=source.docid,
+                        ocr_record=ocr_record,
+                    )
+                    ocr_status_counts['missing_docimagefile'] += 1
+                for ocr_meta in license_metas:
+                    ocr_record, ocr_http_status, file_data = _get_business_license_ocr_result(
+                        execute_ocr_connection,
+                        source,
+                        ocr_meta,
+                        True,
+                        ocr_url,
+                        ocr_access_token,
+                        cookie,
+                        timeout_seconds,
+                        max_file_bytes,
+                    )
+                    _write_ocr_audit_row(
+                        execute_ocr_connection,
+                        run_id,
+                        source,
+                        outcome,
+                        has_business_license=True,
+                        meta=ocr_meta,
+                        ocr_record=ocr_record,
+                        http_status=ocr_http_status,
+                    )
+                    ocr_status_counts[_text(ocr_record.get('ocr_status'))] += 1
+                    if file_data is not None:
+                        ocr_upload_memory[(source.source_id, ocr_meta.docid, ocr_meta.imagefileid)] = file_data
+                    logger.info(
+                        '[OCR:%s%s] source=%s doc=%s file=%s',
+                        ocr_record.get('ocr_status'),
+                        ':cache' if ocr_record.get('ocr_cache_hit') else '',
+                        source.source_id,
+                        ocr_meta.docid,
+                        ocr_meta.attachment_name,
+                    )
             if not outcome.matches:
                 message = (
                     '未找到 UAT 客商，未上传'
@@ -855,6 +1666,9 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                 row = _result_row(source, outcome.reason, message)
                 _write_result(writer, logger, row)
                 status_counts[row['status']] += 1
+                if source.field_name == BUSINESS_LICENSE_FIELD:
+                    for meta in attachment_metadata.get(source.docid, []):
+                        ocr_upload_memory.pop((source.source_id, meta.docid, meta.imagefileid), None)
                 continue
 
             if outcome.reason == 'identifier_ambiguous_partial':
@@ -944,7 +1758,12 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                         continue
 
                     try:
-                        file_data = _download_weaver_attachment(cookie, meta, timeout_seconds, max_file_bytes)
+                        memory_key = (source.source_id, meta.docid, meta.imagefileid)
+                        file_data = ocr_upload_memory.get(memory_key)
+                        if file_data is None:
+                            file_data = _download_weaver_attachment(
+                                cookie, meta, timeout_seconds, max_file_bytes,
+                            )
                         status_code = _retry_upload(
                             base_url, organization_id, access_token, target, upload_meta, file_data,
                             timeout_seconds, upload_retries,
@@ -972,6 +1791,15 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                     _write_result(writer, logger, row)
                     status_counts[row['status']] += 1
 
+            if source.field_name == BUSINESS_LICENSE_FIELD:
+                for meta in attachment_metadata.get(source.docid, []):
+                    ocr_upload_memory.pop((source.source_id, meta.docid, meta.imagefileid), None)
+
+    if execute_ocr_connection is not None:
+        execute_ocr_connection.commit()
+        execute_ocr_connection.close()
+        logger.info('营业执照 OCR 审计完成: %s', dict(sorted(ocr_status_counts.items())))
+        logger.info('营业执照 OCR SQLite: %s', ocr_audit_db)
     logger.info('同步完成: %s', dict(sorted(status_counts.items())))
     logger.info('结果清单: %s', result_file)
     logger.info('运行日志: %s', log_file)
