@@ -2360,10 +2360,16 @@ def run():
 
     # 2. 构建六个 sheet 输出:原三类保持独立,MCN 三类追加在后。
     base_issue_source_df = _with_resolved_project_fields(base_source_df)
-    base_output_df = _apply_order_project_columns(
-        build_output(base_source_df),
-        base_issue_source_df,
-        use_fixed_order_mapping=True,
+    # MCN-only runs intentionally have no 赛事对公付款 rows. Keep the base tab
+    # empty instead of passing a column-less DataFrame into build_output().
+    base_output_df = (
+        _apply_order_project_columns(
+            build_output(base_source_df),
+            base_issue_source_df,
+            use_fixed_order_mapping=True,
+        )
+        if not base_source_df.empty
+        else pd.DataFrame(columns=OUTPUT_COLUMNS)
     )
     if '申请人' not in base_issue_source_df.columns and '经办人' in base_issue_source_df.columns:
         base_issue_source_df['申请人'] = base_issue_source_df['经办人']
@@ -2374,7 +2380,14 @@ def run():
         ]
     if '供应商' not in base_issue_source_df.columns:
         base_issue_source_df['供应商'] = ''
-    batch_output_df = build_batch_output(batch_source_df)
+    if '银行账号' not in base_issue_source_df.columns:
+        base_issue_source_df['银行账号'] = ''
+    # 批量费用同样只处理赛事范围; MCN-only 时保留空 tab。
+    batch_output_df = (
+        build_batch_output(batch_source_df)
+        if not batch_source_df.empty
+        else pd.DataFrame(columns=BATCH_OUTPUT_COLUMNS)
+    )
     external_output_df, external_issue_source_df = build_external_cost_output(external_source_df)
 
     mcn_sheet_specs = [
