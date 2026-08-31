@@ -1037,6 +1037,14 @@ def _evaluate_business_license_ocr(payload: object, source: SourceAttachment) ->
     }
 
 
+def _connect_sqlite_autocommit(db_path: Path) -> sqlite3.Connection:
+    """打开自动提交连接，保证长时间下载过程中每条状态都已落盘。"""
+    connection = sqlite3.connect(db_path, isolation_level=None)
+    # 避免有人同时查看/导入结果时，短暂的 SQLite 锁直接导致写入失败。
+    connection.execute('PRAGMA busy_timeout = 30000')
+    return connection
+
+
 def _init_ocr_audit_db(connection: sqlite3.Connection) -> None:
     connection.execute(
         '''
@@ -1226,7 +1234,7 @@ def _import_doubao_results(result_file: Path, logger: logging.Logger) -> Path:
     db_path = OUTPUT_DIR / OCR_AUDIT_DB_NAME
     imported = 0
     skipped = 0
-    with sqlite3.connect(db_path) as connection:
+    with _connect_sqlite_autocommit(db_path) as connection:
         _init_doubao_queue_db(connection)
         for line_number, line in enumerate(result_file.read_text(encoding='utf-8-sig').splitlines(), start=1):
             if not line.strip():
@@ -1271,7 +1279,6 @@ def _import_doubao_results(result_file: Path, logger: logging.Logger) -> Path:
             except Exception as exc:
                 skipped += 1
                 logger.warning('[doubao_import_skipped] line=%s %s', line_number, exc)
-        connection.commit()
     logger.info('豆包结果导入完成: imported=%s skipped=%s sqlite=%s', imported, skipped, db_path)
     return db_path
 
@@ -1572,7 +1579,7 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
     attachment_metadata = _load_attachment_metadata(metadata_docids)
 
     ocr_status_counts: Counter = Counter()
-    with sqlite3.connect(ocr_audit_db) as ocr_connection:
+    with _connect_sqlite_autocommit(ocr_audit_db) as ocr_connection:
         _init_ocr_audit_db(ocr_connection)
         _init_doubao_queue_db(ocr_connection)
         for source_id, source_items in sources_by_id.items():
@@ -1767,7 +1774,6 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                         local_path,
                         file_size,
                     )
-        ocr_connection.commit()
     if not args.execute:
         logger.info('营业执照 OCR 审计完成: %s', dict(sorted(ocr_status_counts.items())))
         logger.info('营业执照 OCR SQLite: %s', ocr_audit_db)
@@ -1776,7 +1782,7 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
     status_counts: Counter = Counter()
     execute_ocr_connection: Optional[sqlite3.Connection] = None
     if args.execute:
-        execute_ocr_connection = sqlite3.connect(ocr_audit_db)
+        execute_ocr_connection = _connect_sqlite_autocommit(ocr_audit_db)
         _init_ocr_audit_db(execute_ocr_connection)
     # 每条营业执照只在其 OCR 到 UAT 上传之间短暂保留，避免整批附件占满内存。
     ocr_upload_memory: Dict[Tuple[str, int, int], bytes] = {}
@@ -1977,7 +1983,6 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                     ocr_upload_memory.pop((source.source_id, meta.docid, meta.imagefileid), None)
 
     if execute_ocr_connection is not None:
-        execute_ocr_connection.commit()
         execute_ocr_connection.close()
         logger.info('营业执照 OCR 审计完成: %s', dict(sorted(ocr_status_counts.items())))
         logger.info('营业执照 OCR SQLite: %s', ocr_audit_db)
