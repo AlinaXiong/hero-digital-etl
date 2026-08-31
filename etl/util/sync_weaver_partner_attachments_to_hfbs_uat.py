@@ -20,8 +20,9 @@
 汉得营业执照 OCR；每个泛微客商的匹配、附件存在性和 OCR 结果会写入 SQLite。
 ``--execute`` 也会执行该 OCR 校验，但不会因为 OCR 异常中断附件上传。
 
-传入 ``--download-business-licenses`` 时，只把 ``yyzzsmj`` 营业执照下载到
-本地，并写入 SQLite 豆包识别队列；企业豆包识别后可用
+传入 ``--download-business-licenses`` / ``--download-identity-cards`` 时，把
+``yyzzsmj`` 营业执照 / ``sfzfyj`` 身份证复印件下载到本地，并写入 SQLite
+豆包识别队列；企业豆包识别后可用
 ``--import-doubao-results <JSONL 文件>`` 将逐条 JSON 结果回写该队列。
 
 运行前配置（项目根目录 .env.local 优先）：
@@ -46,6 +47,7 @@
     python etl/util/sync_weaver_partner_attachments_to_hfbs_uat.py --execute
     python etl/util/sync_weaver_partner_attachments_to_hfbs_uat.py --ocr-only
     python etl/util/sync_weaver_partner_attachments_to_hfbs_uat.py --download-business-licenses
+    python etl/util/sync_weaver_partner_attachments_to_hfbs_uat.py --download-identity-cards
     python etl/util/sync_weaver_partner_attachments_to_hfbs_uat.py --import-doubao-results doubao_result.jsonl
 
 @author xiongyilin@heroesports.com
@@ -98,6 +100,8 @@ PROD_OCR_URL_ENV = 'HFINS_PROD_OCR_URL'
 OCR_AUDIT_DB_NAME = '泛微客商营业执照OCR结果.sqlite'
 BUSINESS_LICENSE_FIELD = 'yyzzsmj'
 BUSINESS_LICENSE_DOWNLOAD_DIR_NAME = '营业执照附件'
+IDENTITY_CARD_FIELD = 'sfzfyj'
+IDENTITY_CARD_DOWNLOAD_DIR_NAME = '身份证附件'
 DOUBAO_QUEUE_TABLE = 'weaver_partner_business_license_doubao_queue'
 OCR_CACHEABLE_STATUSES = frozenset({
     'business_license_ok',
@@ -115,6 +119,9 @@ ATTACHMENT_FIELDS: Tuple[Tuple[str, str], ...] = (
     ('gsqdxz', '公司清单鲜章'),
 )
 ATTACHMENT_FIELD_LABELS = dict(ATTACHMENT_FIELDS)
+IDENTITY_CARD_ATTACHMENT_FIELDS: Tuple[Tuple[str, str], ...] = (
+    (IDENTITY_CARD_FIELD, '身份证复印件'),
+)
 IDENTIFIER_SOURCE_FIELDS: Tuple[Tuple[str, str], ...] = (
     ('sh', '证件号/税号'),
     ('khsh', '纳税人识别号'),
@@ -172,6 +179,8 @@ class SourceAttachment:
     field_name: str
     field_label: str
     docid: int
+    legal_representative: str = ''
+    identity_number: str = ''
 
 
 @dataclass(frozen=True)
@@ -297,20 +306,32 @@ def _setup_logger(run_id: str) -> Tuple[logging.Logger, Path]:
     return logger, log_file
 
 
-def _validate_source_fields() -> None:
+def _validate_source_fields(include_identity_cards: bool = False) -> None:
     expected_fields = {
         'khmc': '企业名称',
         'sh': '税号',
         'khsh': '纳税人识别号',
     }
     expected_fields.update(ATTACHMENT_FIELD_LABELS)
+    if include_identity_cards:
+        expected_fields.update({
+            IDENTITY_CARD_FIELD: '身份证复印件',
+            'sfzh': '身份证号',
+            'frdb': '法人代表',
+        })
     c.validate_fw_fields('uf_khgys', {'': expected_fields})
 
 
-def _load_source_attachments(source_ids: Sequence[str]) -> List[SourceAttachment]:
-    attachment_selects = ', '.join(f'k.{field_name}' for field_name, _ in ATTACHMENT_FIELDS)
+def _load_source_attachments(
+    source_ids: Sequence[str],
+    include_identity_cards: bool = False,
+) -> List[SourceAttachment]:
+    source_attachment_fields = ATTACHMENT_FIELDS + (
+        IDENTITY_CARD_ATTACHMENT_FIELDS if include_identity_cards else ()
+    )
+    attachment_selects = ', '.join(f'k.{field_name}' for field_name, _ in source_attachment_fields)
     attachment_conditions = ' OR '.join(
-        f"COALESCE(TRIM(k.{field_name}), '') <> ''" for field_name, _ in ATTACHMENT_FIELDS
+        f"COALESCE(TRIM(k.{field_name}), '') <> ''" for field_name, _ in source_attachment_fields
     )
     params: List[str] = []
     where_parts = [f'({attachment_conditions})']
@@ -321,7 +342,7 @@ def _load_source_attachments(source_ids: Sequence[str]) -> List[SourceAttachment
         'FW',
         'vspn_xtyy',
         f'''
-        SELECT k.id, k.khmc, k.sh, k.khsh, {attachment_selects}
+            SELECT k.id, k.khmc, k.sh, k.khsh, k.frdb, k.sfzh, {attachment_selects}
         FROM uf_khgys k
         WHERE {' AND '.join(where_parts)}
         ORDER BY k.id
@@ -336,7 +357,7 @@ def _load_source_attachments(source_ids: Sequence[str]) -> List[SourceAttachment
             for field_name, _ in IDENTIFIER_SOURCE_FIELDS
             if _normalize_identifier(row.get(field_name))
         )
-        for field_name, field_label in ATTACHMENT_FIELDS:
+        for field_name, field_label in source_attachment_fields:
             for docid in _extract_docids(row.get(field_name)):
                 attachments.append(
                     SourceAttachment(
@@ -346,6 +367,8 @@ def _load_source_attachments(source_ids: Sequence[str]) -> List[SourceAttachment
                         field_name=field_name,
                         field_label=field_label,
                         docid=docid,
+                        legal_representative=_text(row.get('frdb')),
+                        identity_number=_text(row.get('sfzh')),
                     )
                 )
     return attachments
@@ -630,7 +653,22 @@ def _safe_local_path_component(value: str, fallback: str) -> str:
     return value or fallback
 
 
-def _business_license_local_path(source: SourceAttachment, meta: AttachmentMeta) -> Path:
+def _document_type(source: SourceAttachment) -> str:
+    return 'identity_card' if source.field_name == IDENTITY_CARD_FIELD else 'business_license'
+
+
+def _document_expected_name(source: SourceAttachment) -> str:
+    if _document_type(source) == 'identity_card':
+        # 泛微 uf_khgys.frdb 在现有身份证附件数据中为空，个人客商名称存于 khmc。
+        return source.legal_representative or source.source_name
+    return source.source_name
+
+
+def _document_expected_identifier(source: SourceAttachment) -> str:
+    return source.identity_number if _document_type(source) == 'identity_card' else _source_certificate_number(source)
+
+
+def _document_local_path(source: SourceAttachment, meta: AttachmentMeta) -> Path:
     source_dir = _safe_local_path_component(source.source_id, 'unknown_source')
     file_name = _safe_local_path_component(
         meta.attachment_name,
@@ -638,21 +676,24 @@ def _business_license_local_path(source: SourceAttachment, meta: AttachmentMeta)
     )
     return (
         OUTPUT_DIR
-        / BUSINESS_LICENSE_DOWNLOAD_DIR_NAME
+        / (
+            IDENTITY_CARD_DOWNLOAD_DIR_NAME
+            if _document_type(source) == 'identity_card' else BUSINESS_LICENSE_DOWNLOAD_DIR_NAME
+        )
         / source_dir
         / f'{meta.docid}_{meta.imagefileid}_{file_name}'
     )
 
 
-def _download_business_license_to_local(
+def _download_document_to_local(
     source: SourceAttachment,
     meta: AttachmentMeta,
     cookie: str,
     timeout_seconds: int,
     max_file_bytes: int,
 ) -> Tuple[Path, str, int]:
-    """幂等下载营业执照；文件地址固定，避免重复下载同一个 IMAGEFILEID。"""
-    target_path = _business_license_local_path(source, meta)
+    """幂等下载营业执照或身份证；文件地址固定，避免重复下载同一个 IMAGEFILEID。"""
+    target_path = _document_local_path(source, meta)
     if target_path.is_file() and target_path.stat().st_size > 0:
         return target_path.resolve(), 'existing', target_path.stat().st_size
 
@@ -1049,17 +1090,21 @@ def _init_doubao_queue_db(connection: sqlite3.Connection) -> None:
             source_id TEXT NOT NULL,
             source_docid INTEGER NOT NULL,
             weaver_imagefileid INTEGER NOT NULL,
+            document_type TEXT NOT NULL DEFAULT 'business_license',
             source_name TEXT,
             certificate_number TEXT,
+            expected_name TEXT,
+            expected_identifier TEXT,
             match_result TEXT NOT NULL,
             match_detail TEXT,
             matched_targets TEXT,
             attachment_name TEXT,
-            business_license_local_path TEXT,
+            local_file_path TEXT,
             download_status TEXT NOT NULL,
             file_size INTEGER,
             doubao_status TEXT NOT NULL DEFAULT 'pending',
             doubao_is_business_license INTEGER,
+            doubao_is_identity_card INTEGER,
             doubao_message TEXT,
             doubao_result_json TEXT,
             doubao_updated_at TEXT,
@@ -1067,6 +1112,31 @@ def _init_doubao_queue_db(connection: sqlite3.Connection) -> None:
         )
         '''
     )
+    columns = {
+        _text(row[1])
+        for row in connection.execute(f'PRAGMA table_info({DOUBAO_QUEUE_TABLE})')
+    }
+    migrations = {
+        'document_type': "TEXT NOT NULL DEFAULT 'business_license'",
+        'expected_name': 'TEXT',
+        'expected_identifier': 'TEXT',
+        'local_file_path': 'TEXT',
+        'doubao_is_identity_card': 'INTEGER',
+    }
+    for column_name, column_definition in migrations.items():
+        if column_name not in columns:
+            connection.execute(
+                f'ALTER TABLE {DOUBAO_QUEUE_TABLE} ADD COLUMN {column_name} {column_definition}'
+            )
+    if 'business_license_local_path' in columns:
+        connection.execute(
+            f'''
+            UPDATE {DOUBAO_QUEUE_TABLE}
+            SET local_file_path = business_license_local_path
+            WHERE COALESCE(local_file_path, '') = ''
+              AND COALESCE(business_license_local_path, '') <> ''
+            '''
+        )
     connection.execute(
         f'''
         CREATE INDEX IF NOT EXISTS idx_weaver_partner_doubao_queue_status
@@ -1091,18 +1161,22 @@ def _upsert_doubao_queue_row(
     connection.execute(
         f'''
         INSERT INTO {DOUBAO_QUEUE_TABLE} (
-            source_id, source_docid, weaver_imagefileid, source_name, certificate_number,
+            source_id, source_docid, weaver_imagefileid, document_type,
+            source_name, certificate_number, expected_name, expected_identifier,
             match_result, match_detail, matched_targets, attachment_name,
-            business_license_local_path, download_status, file_size, doubao_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            local_file_path, download_status, file_size, doubao_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source_id, source_docid, weaver_imagefileid) DO UPDATE SET
+            document_type = excluded.document_type,
             source_name = excluded.source_name,
             certificate_number = excluded.certificate_number,
+            expected_name = excluded.expected_name,
+            expected_identifier = excluded.expected_identifier,
             match_result = excluded.match_result,
             match_detail = excluded.match_detail,
             matched_targets = excluded.matched_targets,
             attachment_name = excluded.attachment_name,
-            business_license_local_path = excluded.business_license_local_path,
+            local_file_path = excluded.local_file_path,
             download_status = excluded.download_status,
             file_size = excluded.file_size,
             doubao_status = CASE
@@ -1115,8 +1189,11 @@ def _upsert_doubao_queue_row(
             source.source_id,
             source_docid,
             imagefileid,
+            _document_type(source),
             source.source_name,
             _source_certificate_number(source),
+            _document_expected_name(source),
+            _document_expected_identifier(source),
             match_result,
             match_detail,
             matched_targets,
@@ -1165,19 +1242,21 @@ def _import_doubao_results(result_file: Path, logger: logging.Logger) -> Path:
                     raise ValueError('缺少 source_id/source_docid/weaver_imagefileid')
                 status = _text(payload.get('doubao_status')) or 'completed'
                 is_business_license = _optional_bool(payload.get('is_business_license'))
+                is_identity_card = _optional_bool(payload.get('is_identity_card'))
                 message = _text(payload.get('message'))
                 result = payload.get('result', payload.get('ocr_result'))
                 result_json = json.dumps(result, ensure_ascii=False, default=str) if result is not None else ''
                 cursor = connection.execute(
                     f'''
                     UPDATE {DOUBAO_QUEUE_TABLE}
-                    SET doubao_status = ?, doubao_is_business_license = ?, doubao_message = ?,
+                    SET doubao_status = ?, doubao_is_business_license = ?, doubao_is_identity_card = ?, doubao_message = ?,
                         doubao_result_json = ?, doubao_updated_at = ?
                     WHERE source_id = ? AND source_docid = ? AND weaver_imagefileid = ?
                     ''',
                     (
                         status,
                         None if is_business_license is None else int(is_business_license),
+                        None if is_identity_card is None else int(is_identity_card),
                         message,
                         result_json,
                         datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -1187,7 +1266,7 @@ def _import_doubao_results(result_file: Path, logger: logging.Logger) -> Path:
                     ),
                 )
                 if cursor.rowcount != 1:
-                    raise ValueError('SQLite 队列中未找到对应的营业执照附件')
+                    raise ValueError('SQLite 队列中未找到对应的附件')
                 imported += 1
             except Exception as exc:
                 skipped += 1
@@ -1368,6 +1447,10 @@ def build_parser() -> argparse.ArgumentParser:
         help='仅下载 yyzzsmj 营业执照到本地，并写入 SQLite 豆包识别队列，不上传 UAT、不调用汉得 OCR',
     )
     parser.add_argument(
+        '--download-identity-cards', action='store_true',
+        help='仅下载 sfzfyj 身份证复印件到本地，并写入 SQLite 豆包识别队列，不上传 UAT、不调用汉得 OCR',
+    )
+    parser.add_argument(
         '--import-doubao-results', type=Path,
         help='导入企业豆包逐行 JSON（JSONL）识别结果并回写 SQLite 队列',
     )
@@ -1387,13 +1470,19 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
     run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
     logger, log_file = _setup_logger(run_id)
     if args.import_doubao_results:
-        if args.execute or args.ocr_only or args.download_business_licenses or args.source_id or args.limit:
+        if (
+            args.execute or args.ocr_only or args.download_business_licenses
+            or args.download_identity_cards or args.source_id or args.limit
+        ):
             raise RuntimeError('--import-doubao-results 不能与下载、OCR、上传或筛选参数同时使用。')
         return _import_doubao_results(args.import_doubao_results, logger)
     if args.execute and args.ocr_only:
         raise RuntimeError('--execute 与 --ocr-only 不能同时使用；--execute 已自动执行营业执照 OCR。')
-    if args.download_business_licenses and (args.execute or args.ocr_only):
-        raise RuntimeError('--download-business-licenses 仅用于生成豆包离线识别队列，不能与 --execute 或 --ocr-only 同时使用。')
+    if (args.download_business_licenses or args.download_identity_cards) and (args.execute or args.ocr_only):
+        raise RuntimeError(
+            '--download-business-licenses / --download-identity-cards 仅用于生成豆包离线识别队列，'
+            '不能与 --execute 或 --ocr-only 同时使用。'
+        )
     result_file = OUTPUT_DIR / f'同步结果_{run_id}.csv'
     ocr_audit_db = OUTPUT_DIR / OCR_AUDIT_DB_NAME
     access_token = os.getenv(UAT_TOKEN_ENV, '').strip()
@@ -1402,7 +1491,9 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
     cookie = os.getenv(c.ATTACHMENT_COOKIE_ENV, '').strip()
     ocr_enabled = args.execute or args.ocr_only
     business_license_download_enabled = args.download_business_licenses
-    if (args.execute or ocr_enabled or business_license_download_enabled) and not cookie:
+    identity_card_download_enabled = args.download_identity_cards
+    document_download_enabled = business_license_download_enabled or identity_card_download_enabled
+    if (args.execute or ocr_enabled or document_download_enabled) and not cookie:
         raise RuntimeError(f'缺少 {c.ATTACHMENT_COOKIE_ENV}；下载附件或 OCR 前必须配置有效泛微 Cookie。')
     ocr_access_token = os.getenv(PROD_OCR_TOKEN_ENV, '').strip()
     if ocr_enabled and not ocr_access_token:
@@ -1420,7 +1511,15 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
         (
             'execute' if args.execute else (
                 'ocr-only' if args.ocr_only else (
-                    'download-business-licenses' if business_license_download_enabled else 'dry-run'
+                    (
+                        'download-business-licenses+identity-cards'
+                        if business_license_download_enabled and identity_card_download_enabled
+                        else (
+                            'download-business-licenses'
+                            if business_license_download_enabled
+                            else ('download-identity-cards' if identity_card_download_enabled else 'dry-run')
+                        )
+                    )
                 )
             )
         ),
@@ -1428,8 +1527,11 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
         ','.join(args.source_id) if args.source_id else 'all',
     )
 
-    _validate_source_fields()
-    source_attachments = _load_source_attachments(args.source_id)
+    _validate_source_fields(include_identity_cards=identity_card_download_enabled)
+    source_attachments = _load_source_attachments(
+        args.source_id,
+        include_identity_cards=identity_card_download_enabled,
+    )
     source_ids_in_order = list(dict.fromkeys(item.source_id for item in source_attachments))
     if args.limit > 0:
         allowed_source_ids = set(source_ids_in_order[:args.limit])
@@ -1450,17 +1552,22 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
     match_results: Dict[SourceAttachment, MatchOutcome] = {}
     sources_by_id: Dict[str, List[SourceAttachment]] = defaultdict(list)
     business_license_sources_by_id: Dict[str, List[SourceAttachment]] = defaultdict(list)
+    identity_card_sources_by_id: Dict[str, List[SourceAttachment]] = defaultdict(list)
     for source in source_attachments:
         outcome = _match_targets(source, identifier_index)
         match_results[source] = outcome
         sources_by_id[source.source_id].append(source)
         if source.field_name == BUSINESS_LICENSE_FIELD:
             business_license_sources_by_id[source.source_id].append(source)
+        if source.field_name == IDENTITY_CARD_FIELD:
+            identity_card_sources_by_id[source.source_id].append(source)
         if outcome.matches:
             matched_sources.append(source)
     metadata_docids = {item.docid for item in matched_sources}
     metadata_docids.update(
-        item.docid for item in source_attachments if item.field_name == BUSINESS_LICENSE_FIELD
+        item.docid
+        for item in source_attachments
+        if item.field_name in (BUSINESS_LICENSE_FIELD, IDENTITY_CARD_FIELD)
     )
     attachment_metadata = _load_attachment_metadata(metadata_docids)
 
@@ -1472,6 +1579,7 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
             source = source_items[0]
             outcome = match_results[source]
             business_license_sources = business_license_sources_by_id.get(source_id, [])
+            identity_card_sources = identity_card_sources_by_id.get(source_id, [])
             if not business_license_sources:
                 _write_ocr_audit_row(
                     ocr_connection,
@@ -1486,7 +1594,8 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                     },
                 )
                 ocr_status_counts['no_business_license'] += 1
-                continue
+                if not identity_card_download_enabled or not identity_card_sources:
+                    continue
 
             # --execute 时在后续逐个附件上传前 OCR，才能复用同一份内存 bytes。
             if args.execute:
@@ -1521,8 +1630,15 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
 
                 for meta in license_metas:
                     if business_license_download_enabled:
+                        _upsert_doubao_queue_row(
+                            ocr_connection,
+                            business_license_source,
+                            outcome,
+                            meta,
+                            download_status='downloading',
+                        )
                         try:
-                            local_path, download_status, file_size = _download_business_license_to_local(
+                            local_path, download_status, file_size = _download_document_to_local(
                                 business_license_source,
                                 meta,
                                 cookie,
@@ -1585,6 +1701,71 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                         business_license_source.source_id,
                         meta.docid,
                         meta.attachment_name,
+                    )
+
+            if not identity_card_download_enabled:
+                continue
+
+            for identity_card_source in identity_card_sources:
+                identity_metas = attachment_metadata.get(identity_card_source.docid, [])
+                if not identity_metas:
+                    _upsert_doubao_queue_row(
+                        ocr_connection,
+                        identity_card_source,
+                        outcome,
+                        meta=None,
+                        download_status='missing_docimagefile',
+                    )
+                    logger.warning(
+                        '[identity_card_metadata_missing] source=%s doc=%s 泛微 docimagefile/imagefile 未找到身份证附件元数据',
+                        identity_card_source.source_id,
+                        identity_card_source.docid,
+                    )
+                    continue
+
+                for meta in identity_metas:
+                    _upsert_doubao_queue_row(
+                        ocr_connection,
+                        identity_card_source,
+                        outcome,
+                        meta,
+                        download_status='downloading',
+                    )
+                    try:
+                        local_path, download_status, file_size = _download_document_to_local(
+                            identity_card_source,
+                            meta,
+                            cookie,
+                            timeout_seconds,
+                            max_file_bytes,
+                        )
+                        logger.info(
+                            '[identity_card_download:%s] source=%s doc=%s file=%s path=%s',
+                            download_status,
+                            identity_card_source.source_id,
+                            meta.docid,
+                            meta.attachment_name,
+                            local_path,
+                        )
+                    except Exception as exc:  # 单个下载失败不影响其余身份证附件。
+                        local_path = None
+                        download_status = 'download_failed'
+                        file_size = None
+                        logger.warning(
+                            '[identity_card_download_failed] source=%s doc=%s file=%s %s',
+                            identity_card_source.source_id,
+                            meta.docid,
+                            meta.attachment_name,
+                            exc,
+                        )
+                    _upsert_doubao_queue_row(
+                        ocr_connection,
+                        identity_card_source,
+                        outcome,
+                        meta,
+                        download_status,
+                        local_path,
+                        file_size,
                     )
         ocr_connection.commit()
     if not args.execute:
