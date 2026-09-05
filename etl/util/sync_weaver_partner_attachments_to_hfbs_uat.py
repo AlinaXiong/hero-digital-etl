@@ -12,13 +12,13 @@
 * gsqdxz：公司清单鲜章
 
 默认仅生成匹配日志（dry-run），必须显式传入 ``--execute`` 才会下载泛微
-文件并上传 UAT。仅对「一个泛微客商 -> 一个 UAT 客商」的精确匹配执行上传；
-无匹配、同一客商类型内重复匹配、缺少附件关联键都会写入结果清单而不会上传。
-同一标识同时唯一匹配供应商和客户时，会分别上传到两者的营业执照附件页。
+文件并上传 UAT。仅对证件号/税号精确匹配且明确处于启用状态的 UAT 客商上传；
+同一标识命中多个已启用客户或供应商时会全部上传，禁用记录、无匹配记录、
+缺少附件关联键的记录会写入结果清单而不会上传。
 
 传入 ``--ocr-only`` 时不上传附件，而是下载泛微 ``yyzzsmj`` 附件并调用生产
 汉得营业执照 OCR；每个泛微客商的匹配、附件存在性和 OCR 结果会写入 SQLite。
-``--execute`` 也会执行该 OCR 校验，但不会因为 OCR 异常中断附件上传。
+``--execute`` 使用豆包及人工复核后的本地通过版本上传，不再重复调用生产 OCR。
 
 传入 ``--download-business-licenses`` / ``--download-identity-cards`` 时，把
 ``yyzzsmj`` 营业执照 / ``sfzfyj`` 身份证复印件下载到本地，并写入 SQLite
@@ -306,6 +306,34 @@ def _setup_logger(run_id: str) -> Tuple[logging.Logger, Path]:
     return logger, log_file
 
 
+def _load_successful_uploads(
+    output_dir: Path,
+) -> Dict[Tuple[str, str, str, int, int], str]:
+    """从历史结果清单恢复成功上传记录，重复运行时避免再次上传同一目标附件。"""
+    successful: Dict[Tuple[str, str, str, int, int], str] = {}
+    for result_path in sorted(output_dir.glob('同步结果_*.csv')):
+        try:
+            with result_path.open(encoding='utf-8-sig', newline='') as result_handle:
+                for row in csv.DictReader(result_handle):
+                    if row.get('status') not in ('uploaded', 'uploaded_renamed'):
+                        continue
+                    try:
+                        key = (
+                            _text(row.get('target_type')),
+                            _text(row.get('target_unique_code')),
+                            _text(row.get('source_id')),
+                            int(_text(row.get('source_docid'))),
+                            int(_text(row.get('weaver_imagefileid'))),
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                    if all(key[:3]) and key[3] > 0 and key[4] > 0:
+                        successful[key] = _text(row.get('attachment_name'))
+        except (OSError, UnicodeError, csv.Error):
+            continue
+    return successful
+
+
 def _validate_source_fields(include_identity_cards: bool = False) -> None:
     expected_fields = {
         'khmc': '企业名称',
@@ -509,6 +537,14 @@ def _target_name(record: dict, name_fields: Sequence[str]) -> str:
     return next((_text(record.get(field_name)) for field_name in name_fields if _text(record.get(field_name))), '')
 
 
+def _uat_record_enabled(record: dict) -> bool:
+    """只允许 UAT 明确标记为启用的客户/供应商进入附件匹配。"""
+    value = record.get('enabledFlag')
+    if isinstance(value, bool):
+        return value
+    return _text(value).casefold() in ('1', 'true', 'yes', 'y', '是', '启用', 'enabled')
+
+
 def _build_uat_targets(
     target_type: str,
     records: Iterable[dict],
@@ -517,6 +553,8 @@ def _build_uat_targets(
     config = TARGET_CONFIG[target_type]
     targets: List[UatTarget] = []
     for record in records:
+        if not _uat_record_enabled(record):
+            continue
         primary_id = _text(record.get(config['primary_key_field']))
         if not primary_id:
             continue
@@ -562,11 +600,7 @@ def _match_targets(
     source: SourceAttachment,
     identifier_index: Dict[str, List[Tuple[UatTarget, str]]],
 ) -> MatchOutcome:
-    """按客商类型独立匹配，允许同一标识同时命中一个客户和一个供应商。
-
-    同一类型内有多条候选仍视为歧义，避免把附件挂错；另一类型若唯一命中，
-    则继续处理并额外写出 ``identifier_ambiguous_partial`` 日志。
-    """
+    """按标识精确匹配全部已启用客户/供应商；命中几个目标就处理几个。"""
     matched: Dict[Tuple[str, str], Tuple[UatTarget, str, str]] = {}
     for source_field, source_identifier in source.identifier_values:
         normalized = _normalize_identifier(source_identifier)
@@ -581,21 +615,13 @@ def _match_targets(
         candidates_by_type[target.target_type].append((target, source_field, target_field))
 
     matches: List[TargetMatch] = []
-    ambiguous_target_types: List[str] = []
     for target_type in TARGET_CONFIG:
         candidates = candidates_by_type.get(target_type, [])
-        if len(candidates) == 1:
-            target, source_field, target_field = candidates[0]
+        for target, source_field, target_field in candidates:
             matches.append(TargetMatch(target, source_field, target_field))
-        elif len(candidates) > 1:
-            ambiguous_target_types.append(target_type)
 
     if not matches:
-        return MatchOutcome((), 'identifier_ambiguous', tuple(ambiguous_target_types))
-    if ambiguous_target_types:
-        return MatchOutcome(
-            tuple(matches), 'identifier_ambiguous_partial', tuple(ambiguous_target_types),
-        )
+        return MatchOutcome((), 'identifier_not_found')
     return MatchOutcome(tuple(matches))
 
 
@@ -666,6 +692,98 @@ def _document_expected_name(source: SourceAttachment) -> str:
 
 def _document_expected_identifier(source: SourceAttachment) -> str:
     return source.identity_number if _document_type(source) == 'identity_card' else _source_certificate_number(source)
+
+
+def _is_mainland_business_license(expected_name: str, expected_identifier: str) -> bool:
+    """与人工复核口径一致：中文主体且号码为18位统一社会信用代码。"""
+    return bool(re.search(r'[\u4e00-\u9fff]', expected_name or '')) and bool(
+        re.fullmatch(r'[0-9A-Z]{18}', (expected_identifier or '').strip().upper())
+    )
+
+
+def _document_review_passed(row: sqlite3.Row, result: dict) -> bool:
+    """计算豆包及人工复核后的最终通过状态。"""
+    if 'review_overall_match' in result:
+        return bool(result.get('review_overall_match'))
+    if not bool(result.get('is_target_document')):
+        return False
+
+    name_match = bool(result.get('name_match'))
+    identifier_match = bool(result.get('identifier_match'))
+    expected_name = _text(row['expected_name'])
+    expected_identifier = _text(row['expected_identifier'])
+    if row['document_type'] == 'business_license':
+        if _is_mainland_business_license(expected_name, expected_identifier):
+            return name_match and identifier_match
+        # 境外官方营业、税务或公司登记材料，名称或登记号码任一可靠确认即可。
+        return name_match or identifier_match
+    return (name_match or not expected_name) and (identifier_match or not expected_identifier)
+
+
+def _load_approved_document_files(db_path: Path) -> Dict[Tuple[str, int, int, str], Path]:
+    """加载最终复核通过的营业执照/身份证，并固定到已人工查看的本地文件。"""
+    if not db_path.is_file():
+        raise RuntimeError(f'豆包复核 SQLite 不存在: {db_path}')
+
+    approved: Dict[Tuple[str, int, int, str], Path] = {}
+    missing_files: List[str] = []
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            f'''
+            SELECT source_id, source_docid, weaver_imagefileid, document_type,
+                   expected_name, expected_identifier, local_file_path, doubao_result_json
+            FROM {DOUBAO_QUEUE_TABLE}
+            WHERE doubao_status = 'completed'
+              AND document_type IN ('business_license', 'identity_card')
+            ORDER BY document_type, CAST(source_id AS INTEGER), source_docid, weaver_imagefileid
+            '''
+        ).fetchall()
+        for row in rows:
+            try:
+                result = json.loads(_text(row['doubao_result_json']) or '{}')
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"豆包结果 JSON 无效: source={row['source_id']} doc={row['source_docid']} "
+                    f"file={row['weaver_imagefileid']}"
+                ) from exc
+            if not isinstance(result, dict) or not _document_review_passed(row, result):
+                continue
+            local_path = Path(_text(row['local_file_path']))
+            if not local_path.is_file() or local_path.stat().st_size <= 0:
+                missing_files.append(
+                    f"{row['document_type']}:{row['source_id']}:{row['source_docid']}:"
+                    f"{row['weaver_imagefileid']}:{local_path}"
+                )
+                continue
+            key = (
+                _text(row['source_id']), int(row['source_docid']),
+                int(row['weaver_imagefileid']), _text(row['document_type']),
+            )
+            approved[key] = local_path.resolve()
+
+    if missing_files:
+        preview = '\n'.join(missing_files[:10])
+        raise RuntimeError(
+            f'有 {len(missing_files)} 个审批通过附件缺少本地原文件，已中止上传。前10项:\n{preview}'
+        )
+    return approved
+
+
+def _approved_document_key(
+    source: SourceAttachment,
+    meta: AttachmentMeta,
+) -> Tuple[str, int, int, str]:
+    return source.source_id, meta.docid, meta.imagefileid, _document_type(source)
+
+
+def _read_approved_document(path: Path, max_file_bytes: int) -> bytes:
+    file_size = path.stat().st_size
+    if file_size <= 0:
+        raise RuntimeError(f'审批通过附件为空文件: {path}')
+    if file_size > max_file_bytes:
+        raise RuntimeError(f'审批通过附件过大: {file_size} bytes，超过限制 {max_file_bytes} bytes: {path}')
+    return path.read_bytes()
 
 
 def _document_local_path(source: SourceAttachment, meta: AttachmentMeta) -> Path:
@@ -1444,7 +1562,11 @@ def build_parser() -> argparse.ArgumentParser:
         help='仅处理指定泛微 uf_khgys.id；可重复传入，例如 --source-id 1 --source-id 2',
     )
     parser.add_argument('--limit', type=int, default=0, help='最多处理多少个泛微客商 ID（0 表示全部）')
-    parser.add_argument('--execute', action='store_true', help='真正下载泛微附件并上传 UAT；默认仅 dry-run')
+    parser.add_argument(
+        '--target-type', action='append', choices=tuple(TARGET_CONFIG), default=[],
+        help='仅处理指定 UAT 客商类型；可重复传入 customer/vender，默认两种都处理',
+    )
+    parser.add_argument('--execute', action='store_true', help='上传审批通过的证件及其他泛微附件到 UAT；默认仅 dry-run')
     parser.add_argument(
         '--ocr-only', action='store_true',
         help='仅调用生产汉得 OCR 校验 yyzzsmj 营业执照附件，不上传 UAT',
@@ -1479,12 +1601,12 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
     if args.import_doubao_results:
         if (
             args.execute or args.ocr_only or args.download_business_licenses
-            or args.download_identity_cards or args.source_id or args.limit
+            or args.download_identity_cards or args.source_id or args.limit or args.target_type
         ):
             raise RuntimeError('--import-doubao-results 不能与下载、OCR、上传或筛选参数同时使用。')
         return _import_doubao_results(args.import_doubao_results, logger)
     if args.execute and args.ocr_only:
-        raise RuntimeError('--execute 与 --ocr-only 不能同时使用；--execute 已自动执行营业执照 OCR。')
+        raise RuntimeError('--execute 与 --ocr-only 不能同时使用。')
     if (args.download_business_licenses or args.download_identity_cards) and (args.execute or args.ocr_only):
         raise RuntimeError(
             '--download-business-licenses / --download-identity-cards 仅用于生成豆包离线识别队列，'
@@ -1496,10 +1618,12 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
     if not access_token:
         raise RuntimeError(f'缺少 {UAT_TOKEN_ENV}；请配置 UAT Bearer Token 后重试。')
     cookie = os.getenv(c.ATTACHMENT_COOKIE_ENV, '').strip()
-    ocr_enabled = args.execute or args.ocr_only
+    ocr_enabled = args.ocr_only
     business_license_download_enabled = args.download_business_licenses
     identity_card_download_enabled = args.download_identity_cards
     document_download_enabled = business_license_download_enabled or identity_card_download_enabled
+    upload_planning_enabled = not args.ocr_only and not document_download_enabled
+    include_identity_cards = identity_card_download_enabled or upload_planning_enabled
     if (args.execute or ocr_enabled or document_download_enabled) and not cookie:
         raise RuntimeError(f'缺少 {c.ATTACHMENT_COOKIE_ENV}；下载附件或 OCR 前必须配置有效泛微 Cookie。')
     ocr_access_token = os.getenv(PROD_OCR_TOKEN_ENV, '').strip()
@@ -1534,10 +1658,19 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
         ','.join(args.source_id) if args.source_id else 'all',
     )
 
-    _validate_source_fields(include_identity_cards=identity_card_download_enabled)
+    approved_document_files: Dict[Tuple[str, int, int, str], Path] = {}
+    if upload_planning_enabled:
+        approved_document_files = _load_approved_document_files(ocr_audit_db)
+        approved_counts = Counter(key[3] for key in approved_document_files)
+        logger.info(
+            '审批通过附件: 营业执照=%s 身份证=%s；其他企业附件不做内容校验、直接进入匹配上传流程',
+            approved_counts['business_license'], approved_counts['identity_card'],
+        )
+
+    _validate_source_fields(include_identity_cards=include_identity_cards)
     source_attachments = _load_source_attachments(
         args.source_id,
-        include_identity_cards=identity_card_download_enabled,
+        include_identity_cards=include_identity_cards,
     )
     source_ids_in_order = list(dict.fromkeys(item.source_id for item in source_attachments))
     if args.limit > 0:
@@ -1546,13 +1679,20 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
     logger.info('泛微待处理: %s 个客商，%s 条附件 DOCID 关联', len({item.source_id for item in source_attachments}), len(source_attachments))
 
     all_targets: List[UatTarget] = []
+    selected_target_types = set(args.target_type) if args.target_type else set(TARGET_CONFIG)
     for target_type, config in TARGET_CONFIG.items():
+        if target_type not in selected_target_types:
+            continue
         records = _fetch_all_uat_records(
             base_url, organization_id, config['endpoint'], access_token, page_size, timeout_seconds, logger,
         )
         targets = _build_uat_targets(target_type, records, args.allow_primary_key_unique_code)
         all_targets.extend(targets)
-        logger.info('UAT %s: %s 条接口记录，%s 条含可匹配标识', target_type, len(records), len(targets))
+        enabled_records = sum(_uat_record_enabled(record) for record in records)
+        logger.info(
+            'UAT %s: %s 条接口记录，%s 条启用，%s 条启用且含可匹配标识',
+            target_type, len(records), enabled_records, len(targets),
+        )
     identifier_index = _build_identifier_index(all_targets)
 
     matched_sources: List[SourceAttachment] = []
@@ -1577,6 +1717,24 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
         if item.field_name in (BUSINESS_LICENSE_FIELD, IDENTITY_CARD_FIELD)
     )
     attachment_metadata = _load_attachment_metadata(metadata_docids)
+
+    planned_upload_actions = 0
+    if upload_planning_enabled:
+        for source in source_attachments:
+            planned_metas = attachment_metadata.get(source.docid, [])
+            if source.field_name in (BUSINESS_LICENSE_FIELD, IDENTITY_CARD_FIELD):
+                planned_metas = [
+                    meta for meta in planned_metas
+                    if _approved_document_key(source, meta) in approved_document_files
+                ]
+            uploadable_targets = sum(
+                bool(match.target.unique_code) for match in match_results[source].matches
+            )
+            planned_upload_actions += len(planned_metas) * uploadable_targets
+        logger.info(
+            '附件处理进度总数=%s（已启用目标客商 × 可上传附件；包含随后可能因已存在而跳过的项目）',
+            planned_upload_actions,
+        )
 
     ocr_status_counts: Counter = Counter()
     with _connect_sqlite_autocommit(ocr_audit_db) as ocr_connection:
@@ -1781,20 +1939,50 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
     existing_names_cache: Dict[Tuple[str, str, str], Set[str]] = {}
     status_counts: Counter = Counter()
     execute_ocr_connection: Optional[sqlite3.Connection] = None
-    if args.execute:
+    if args.execute and ocr_enabled:
         execute_ocr_connection = _connect_sqlite_autocommit(ocr_audit_db)
         _init_ocr_audit_db(execute_ocr_connection)
+    successful_uploads = _load_successful_uploads(OUTPUT_DIR)
+    logger.info('历史成功上传记录=%s 条；重复运行将先与 UAT 现有文件交叉确认', len(successful_uploads))
     # 每条营业执照只在其 OCR 到 UAT 上传之间短暂保留，避免整批附件占满内存。
     ocr_upload_memory: Dict[Tuple[str, int, int], bytes] = {}
+    upload_action_progress = 0
     with open(result_file, 'w', encoding='utf-8-sig', newline='') as result_handle:
         writer = csv.DictWriter(result_handle, fieldnames=RESULT_COLUMNS)
         writer.writeheader()
         for source in source_attachments:
             outcome = match_results[source]
-            if args.execute and source.field_name == BUSINESS_LICENSE_FIELD:
+            all_metas = attachment_metadata.get(source.docid, [])
+            approval_required = upload_planning_enabled and source.field_name in (
+                BUSINESS_LICENSE_FIELD, IDENTITY_CARD_FIELD,
+            )
+            if approval_required:
+                metas = [
+                    meta for meta in all_metas
+                    if _approved_document_key(source, meta) in approved_document_files
+                ]
+                for rejected_meta in (
+                    meta for meta in all_metas
+                    if _approved_document_key(source, meta) not in approved_document_files
+                ):
+                    row = _result_row(
+                        source,
+                        'skipped_review_not_approved',
+                        '营业执照/身份证未通过最终复核，未上传',
+                        meta=rejected_meta,
+                    )
+                    _write_result(writer, logger, row)
+                    status_counts[row['status']] += 1
+                if all_metas and not metas:
+                    continue
+            else:
+                # 公司简介、开户许可、鲜章等无法按证件字段校验，直接进入匹配上传流程。
+                metas = all_metas
+
+            if args.execute and ocr_enabled and source.field_name == BUSINESS_LICENSE_FIELD:
                 if execute_ocr_connection is None:
                     raise RuntimeError('生产 OCR SQLite 连接未初始化')
-                license_metas = attachment_metadata.get(source.docid, [])
+                license_metas = metas
                 if not license_metas:
                     ocr_record = {
                         'ocr_called': False,
@@ -1871,7 +2059,6 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                 _write_result(writer, logger, row)
                 status_counts[row['status']] += 1
 
-            metas = attachment_metadata.get(source.docid, [])
             for match in outcome.matches:
                 target = match.target
                 source_identifier_type = match.source_identifier_type
@@ -1903,8 +2090,10 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                         )
                     except UatRequestError as exc:
                         for meta in metas:
+                            upload_action_progress += 1
                             row = _result_row(
-                                source, 'target_attachment_query_failed', str(exc), target,
+                                source, 'target_attachment_query_failed',
+                                f'[进度 {upload_action_progress}/{planned_upload_actions}] {exc}', target,
                                 source_identifier_type, target_identifier_field, meta, exc.status_code,
                             )
                             _write_result(writer, logger, row)
@@ -1912,8 +2101,30 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                         continue
 
                 for meta in metas:
+                    upload_action_progress += 1
+                    progress_text = f'[进度 {upload_action_progress}/{planned_upload_actions}]'
                     existing_names = existing_names_cache[cache_key]
                     upload_meta = meta
+                    upload_history_key = (
+                        target.target_type, target.unique_code, source.source_id,
+                        meta.docid, meta.imagefileid,
+                    )
+                    prior_uploaded_name = successful_uploads.get(upload_history_key)
+                    if (
+                        prior_uploaded_name
+                        and _normalized_file_name(prior_uploaded_name) in existing_names
+                    ):
+                        row = _result_row(
+                            source,
+                            'skipped_prior_success',
+                            f'{progress_text} 历史清单已记录上传成功，且 UAT 仍存在文件 '
+                            f'{prior_uploaded_name}，本次跳过',
+                            target, source_identifier_type, target_identifier_field,
+                            replace(meta, attachment_name=prior_uploaded_name),
+                        )
+                        _write_result(writer, logger, row)
+                        status_counts[row['status']] += 1
+                        continue
                     original_name = _normalized_file_name(meta.attachment_name)
                     if not args.no_skip_existing and original_name in existing_names:
                         renamed_name = _collision_renamed_attachment_name(meta)
@@ -1922,7 +2133,7 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                             row = _result_row(
                                 source,
                                 'skipped_existing_renamed_name',
-                                f'目标营业执照页已有同名附件，改名版本 {renamed_name} 也已存在',
+                                f'{progress_text} 目标营业执照页已有同名附件，改名版本 {renamed_name} 也已存在',
                                 target, source_identifier_type, target_identifier_field,
                                 replace(meta, attachment_name=renamed_name),
                             )
@@ -1935,8 +2146,9 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                             source,
                             'matched_dry_run',
                             (
-                                f'目标页已有同名附件，dry-run 将改名为 {upload_meta.attachment_name} 后上传'
-                                if upload_meta != meta else '已唯一匹配，dry-run 未上传'
+                                f'{progress_text} 目标页已有同名附件，dry-run 将改名为 '
+                                f'{upload_meta.attachment_name} 后上传'
+                                if upload_meta != meta else f'{progress_text} 已匹配，dry-run 未上传'
                             ),
                             target, source_identifier_type, target_identifier_field, upload_meta,
                         )
@@ -1945,8 +2157,18 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                         continue
 
                     try:
+                        logger.info(
+                            '[upload_start] progress=%s/%s source=%s doc=%s target=%s/%s file=%s',
+                            upload_action_progress, planned_upload_actions,
+                            source.source_id, source.docid, target.target_type, target.code,
+                            upload_meta.attachment_name,
+                        )
                         memory_key = (source.source_id, meta.docid, meta.imagefileid)
-                        file_data = ocr_upload_memory.get(memory_key)
+                        if approval_required:
+                            approved_path = approved_document_files[_approved_document_key(source, meta)]
+                            file_data = _read_approved_document(approved_path, max_file_bytes)
+                        else:
+                            file_data = ocr_upload_memory.get(memory_key)
                         if file_data is None:
                             file_data = _download_weaver_attachment(
                                 cookie, meta, timeout_seconds, max_file_bytes,
@@ -1956,26 +2178,35 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                             timeout_seconds, upload_retries,
                         )
                         existing_names.add(_normalized_file_name(upload_meta.attachment_name))
+                        successful_uploads[upload_history_key] = upload_meta.attachment_name
                         row = _result_row(
                             source,
                             'uploaded_renamed' if upload_meta != meta else 'uploaded',
                             (
-                                f'同名附件已改名为 {upload_meta.attachment_name} 后上传成功，{len(file_data)} bytes'
-                                if upload_meta != meta else f'上传成功，{len(file_data)} bytes'
+                                f'{progress_text} 同名附件已改名为 {upload_meta.attachment_name} '
+                                f'后上传成功，{len(file_data)} bytes'
+                                if upload_meta != meta else
+                                f'{progress_text} 上传成功，{len(file_data)} bytes'
                             ),
                             target, source_identifier_type, target_identifier_field, upload_meta, status_code,
                         )
                     except UatRequestError as exc:
                         row = _result_row(
-                            source, 'upload_failed', str(exc), target, source_identifier_type,
+                            source, 'upload_failed', f'{progress_text} {exc}', target, source_identifier_type,
                             target_identifier_field, upload_meta, exc.status_code,
                         )
                     except Exception as exc:  # 单个附件失败不可中断全量迁移。
                         row = _result_row(
-                            source, 'download_or_upload_failed', str(exc), target,
+                            source, 'download_or_upload_failed', f'{progress_text} {exc}', target,
                             source_identifier_type, target_identifier_field, upload_meta,
                         )
                     _write_result(writer, logger, row)
+                    logger.info(
+                        '[upload_done] progress=%s/%s status=%s source=%s doc=%s target=%s/%s file=%s',
+                        upload_action_progress, planned_upload_actions, row['status'],
+                        source.source_id, source.docid, target.target_type, target.code,
+                        upload_meta.attachment_name,
+                    )
                     status_counts[row['status']] += 1
 
             if source.field_name == BUSINESS_LICENSE_FIELD:
