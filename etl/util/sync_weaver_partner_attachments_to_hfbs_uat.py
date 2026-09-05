@@ -86,7 +86,6 @@ DEFAULT_UAT_ORGANIZATION_ID = '0'
 DEFAULT_PAGE_SIZE = 200
 DEFAULT_TIMEOUT_SECONDS = 90
 DEFAULT_UPLOAD_RETRIES = 3
-DEFAULT_MAX_FILE_BYTES = 50 * 1024 * 1024
 DEFAULT_PROD_OCR_URL = 'http://api.link.heroesports.com/hfins/v2/0/ocr/recognize/business-file'
 UAT_TOKEN_ENV = 'HFBS_UAT_ACCESS_TOKEN'
 UAT_BASE_URL_ENV = 'HFBS_UAT_BASE_URL'
@@ -94,7 +93,6 @@ UAT_ORGANIZATION_ID_ENV = 'HFBS_UAT_ORGANIZATION_ID'
 UAT_PAGE_SIZE_ENV = 'HFBS_UAT_PAGE_SIZE'
 UAT_TIMEOUT_ENV = 'HFBS_UAT_TIMEOUT_SECONDS'
 UAT_UPLOAD_RETRIES_ENV = 'HFBS_UAT_UPLOAD_RETRIES'
-UAT_MAX_FILE_BYTES_ENV = 'HFBS_UAT_MAX_FILE_BYTES'
 PROD_OCR_TOKEN_ENV = 'HFINS_PROD_OCR_ACCESS_TOKEN'
 PROD_OCR_URL_ENV = 'HFINS_PROD_OCR_URL'
 OCR_AUDIT_DB_NAME = '泛微客商营业执照OCR结果.sqlite'
@@ -277,6 +275,35 @@ def _safe_filename(name: str, docid: int, imagefileid: int) -> str:
     return name
 
 
+def _detected_file_extension(data: bytes) -> str:
+    """根据文件头补全泛微中缺失的扩展名，避免 UAT 拒绝无后缀文件名。"""
+    if data.startswith(b'%PDF-'):
+        return '.pdf'
+    if data.startswith(b'\x89PNG\r\n\x1a\n'):
+        return '.png'
+    if data.startswith(b'\xff\xd8\xff'):
+        return '.jpg'
+    if data.startswith((b'GIF87a', b'GIF89a')):
+        return '.gif'
+    if data.startswith((b'II*\x00', b'MM\x00*')):
+        return '.tif'
+    if data.startswith(b'BM'):
+        return '.bmp'
+    if len(data) >= 12 and data.startswith(b'RIFF') and data[8:12] == b'WEBP':
+        return '.webp'
+    return ''
+
+
+def _with_detected_file_extension(meta: AttachmentMeta, data: bytes) -> AttachmentMeta:
+    """UAT 强制文件名带后缀；仅在原名无后缀且文件头可确认时补全。"""
+    if Path(meta.attachment_name).suffix:
+        return meta
+    extension = _detected_file_extension(data)
+    if not extension:
+        return meta
+    return replace(meta, attachment_name=f'{meta.attachment_name}{extension}')
+
+
 def _normalized_file_name(value: str) -> str:
     """与 UAT 文件列表保持一致：文件名可能经过 URL 编码。"""
     return urllib.parse.unquote(_text(value)).casefold()
@@ -298,6 +325,15 @@ def _setup_logger(run_id: str) -> Tuple[logging.Logger, Path]:
     logger.propagate = False
     formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
 
+    # Windows 终端通常使用 GBK；国外附件名中的韩文、土耳其文、不间断空格等
+    # 字符可能无法编码，导致每条进度日志都报 UnicodeEncodeError。保留终端原编码，
+    # 仅对无法表示的字符做可读转义；UTF-8 日志文件仍保留完整原文件名。
+    if hasattr(sys.stdout, 'reconfigure'):
+        try:
+            sys.stdout.reconfigure(errors='backslashreplace')
+        except (AttributeError, ValueError):
+            pass
+
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     file_handler = logging.FileHandler(log_file, encoding='utf-8')
@@ -308,9 +344,13 @@ def _setup_logger(run_id: str) -> Tuple[logging.Logger, Path]:
 
 def _load_successful_uploads(
     output_dir: Path,
-) -> Dict[Tuple[str, str, str, int, int], str]:
-    """从历史结果清单恢复成功上传记录，重复运行时避免再次上传同一目标附件。"""
-    successful: Dict[Tuple[str, str, str, int, int], str] = {}
+) -> Dict[Tuple[str, str, str, int, int], Set[str]]:
+    """从历史结果清单恢复成功上传记录，重复运行时避免再次上传同一目标附件。
+
+    UAT 的 primaryId/headerId 是与当前登录 Token 关联的加密值，重新登录后会变化，
+    不能作为跨次运行的去重键。这里使用稳定的客商类型 + 客商编码。
+    """
+    successful: Dict[Tuple[str, str, str, int, int], Set[str]] = defaultdict(set)
     for result_path in sorted(output_dir.glob('同步结果_*.csv')):
         try:
             with result_path.open(encoding='utf-8-sig', newline='') as result_handle:
@@ -320,7 +360,7 @@ def _load_successful_uploads(
                     try:
                         key = (
                             _text(row.get('target_type')),
-                            _text(row.get('target_unique_code')),
+                            _text(row.get('target_code')).casefold(),
                             _text(row.get('source_id')),
                             int(_text(row.get('source_docid'))),
                             int(_text(row.get('weaver_imagefileid'))),
@@ -328,7 +368,9 @@ def _load_successful_uploads(
                     except (TypeError, ValueError):
                         continue
                     if all(key[:3]) and key[3] > 0 and key[4] > 0:
-                        successful[key] = _text(row.get('attachment_name'))
+                        uploaded_name = _text(row.get('attachment_name'))
+                        if uploaded_name:
+                            successful[key].add(uploaded_name)
         except (OSError, UnicodeError, csv.Error):
             continue
     return successful
@@ -641,7 +683,6 @@ def _download_weaver_attachment(
     cookie: str,
     meta: AttachmentMeta,
     timeout_seconds: int,
-    max_file_bytes: int,
 ) -> bytes:
     base_url = os.getenv(c.ATTACHMENT_BASE_URL_ENV, c.DEFAULT_ATTACHMENT_BASE_URL).rstrip('/')
     url = f'{base_url}/weaver/weaver.file.FileDownload?fileid={meta.imagefileid}'
@@ -650,21 +691,12 @@ def _download_weaver_attachment(
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             final_url = response.geturl()
             content_type = response.headers.get('Content-Type', '')
-            content_length = response.headers.get('Content-Length', '')
-            try:
-                expected_length = int(content_length) if content_length else None
-            except ValueError:
-                expected_length = None
-            if expected_length is not None and expected_length > max_file_bytes:
-                raise RuntimeError(f'泛微附件过大: {expected_length} bytes，超过限制 {max_file_bytes} bytes')
-            data = response.read(max_file_bytes + 1)
+            data = response.read()
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f'泛微下载 HTTP {exc.code}: {_response_text(exc.read())}') from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f'泛微下载网络错误: {exc.reason}') from exc
 
-    if len(data) > max_file_bytes:
-        raise RuntimeError(f'泛微附件超过限制 {max_file_bytes} bytes')
     if 'login' in final_url.lower():
         raise RuntimeError(f'泛微下载跳转登录页: {final_url}')
     if 'text/html' in content_type.lower() and not meta.attachment_name.lower().endswith(('.html', '.htm')):
@@ -717,7 +749,14 @@ def _document_review_passed(row: sqlite3.Row, result: dict) -> bool:
             return name_match and identifier_match
         # 境外官方营业、税务或公司登记材料，名称或登记号码任一可靠确认即可。
         return name_match or identifier_match
-    return (name_match or not expected_name) and (identifier_match or not expected_identifier)
+    # 个人客商在泛微中经常使用昵称、项目名称、个体户名称或公司名称，不能要求
+    # source_name 与身份证法定姓名一致。身份证号码是唯一标识：存在预期号码时，
+    # 号码精确核验通过即可确认归属；只有缺少号码时才退回使用姓名核验。
+    if expected_identifier:
+        return identifier_match
+    if expected_name:
+        return name_match
+    return False
 
 
 def _load_approved_document_files(db_path: Path) -> Dict[Tuple[str, int, int, str], Path]:
@@ -777,12 +816,10 @@ def _approved_document_key(
     return source.source_id, meta.docid, meta.imagefileid, _document_type(source)
 
 
-def _read_approved_document(path: Path, max_file_bytes: int) -> bytes:
+def _read_approved_document(path: Path) -> bytes:
     file_size = path.stat().st_size
     if file_size <= 0:
         raise RuntimeError(f'审批通过附件为空文件: {path}')
-    if file_size > max_file_bytes:
-        raise RuntimeError(f'审批通过附件过大: {file_size} bytes，超过限制 {max_file_bytes} bytes: {path}')
     return path.read_bytes()
 
 
@@ -808,14 +845,13 @@ def _download_document_to_local(
     meta: AttachmentMeta,
     cookie: str,
     timeout_seconds: int,
-    max_file_bytes: int,
 ) -> Tuple[Path, str, int]:
     """幂等下载营业执照或身份证；文件地址固定，避免重复下载同一个 IMAGEFILEID。"""
     target_path = _document_local_path(source, meta)
     if target_path.is_file() and target_path.stat().st_size > 0:
         return target_path.resolve(), 'existing', target_path.stat().st_size
 
-    data = _download_weaver_attachment(cookie, meta, timeout_seconds, max_file_bytes)
+    data = _download_weaver_attachment(cookie, meta, timeout_seconds)
     target_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = target_path.with_name(f'{target_path.name}.part-{os.getpid()}')
     try:
@@ -1496,7 +1532,6 @@ def _get_business_license_ocr_result(
     ocr_access_token: str,
     cookie: str,
     timeout_seconds: int,
-    max_file_bytes: int,
 ) -> Tuple[dict, Optional[int], Optional[bytes]]:
     """取缓存或调用 OCR；新下载的内存 bytes 返回给同轮 UAT 上传复用。"""
     if not ocr_enabled:
@@ -1515,7 +1550,7 @@ def _get_business_license_ocr_result(
         return cached, None, None
 
     try:
-        file_data = _download_weaver_attachment(cookie, meta, timeout_seconds, max_file_bytes)
+        file_data = _download_weaver_attachment(cookie, meta, timeout_seconds)
     except Exception as exc:  # 单个附件异常不可中断整批 OCR。
         return (
             {
@@ -1635,7 +1670,6 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
     page_size = _positive_int_env(UAT_PAGE_SIZE_ENV, DEFAULT_PAGE_SIZE, maximum=500)
     timeout_seconds = _positive_int_env(UAT_TIMEOUT_ENV, DEFAULT_TIMEOUT_SECONDS, maximum=300)
     upload_retries = _positive_int_env(UAT_UPLOAD_RETRIES_ENV, DEFAULT_UPLOAD_RETRIES, maximum=10)
-    max_file_bytes = _positive_int_env(UAT_MAX_FILE_BYTES_ENV, DEFAULT_MAX_FILE_BYTES, maximum=500 * 1024 * 1024)
     ocr_url = os.getenv(PROD_OCR_URL_ENV, DEFAULT_PROD_OCR_URL).strip() or DEFAULT_PROD_OCR_URL
     logger.info(
         '开始同步: mode=%s ocr=%s base_url=%s org=%s page_size=%s source_ids=%s',
@@ -1808,7 +1842,6 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                                 meta,
                                 cookie,
                                 timeout_seconds,
-                                max_file_bytes,
                             )
                             logger.info(
                                 '[business_license_download:%s] source=%s doc=%s file=%s path=%s',
@@ -1847,7 +1880,6 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                         ocr_access_token,
                         cookie,
                         timeout_seconds,
-                        max_file_bytes,
                     )
                     _write_ocr_audit_row(
                         ocr_connection,
@@ -1902,7 +1934,6 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                             meta,
                             cookie,
                             timeout_seconds,
-                            max_file_bytes,
                         )
                         logger.info(
                             '[identity_card_download:%s] source=%s doc=%s file=%s path=%s',
@@ -2009,7 +2040,6 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                         ocr_access_token,
                         cookie,
                         timeout_seconds,
-                        max_file_bytes,
                     )
                     _write_ocr_audit_row(
                         execute_ocr_connection,
@@ -2105,15 +2135,21 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                     progress_text = f'[进度 {upload_action_progress}/{planned_upload_actions}]'
                     existing_names = existing_names_cache[cache_key]
                     upload_meta = meta
+                    renamed_for_collision = False
                     upload_history_key = (
-                        target.target_type, target.unique_code, source.source_id,
+                        target.target_type, _text(target.code).casefold(), source.source_id,
                         meta.docid, meta.imagefileid,
                     )
-                    prior_uploaded_name = successful_uploads.get(upload_history_key)
-                    if (
-                        prior_uploaded_name
-                        and _normalized_file_name(prior_uploaded_name) in existing_names
-                    ):
+                    prior_uploaded_names = successful_uploads.get(upload_history_key, set())
+                    prior_uploaded_name = next(
+                        (
+                            uploaded_name
+                            for uploaded_name in sorted(prior_uploaded_names)
+                            if _normalized_file_name(uploaded_name) in existing_names
+                        ),
+                        '',
+                    )
+                    if prior_uploaded_name:
                         row = _result_row(
                             source,
                             'skipped_prior_success',
@@ -2141,6 +2177,7 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                             status_counts[row['status']] += 1
                             continue
                         upload_meta = replace(meta, attachment_name=renamed_name)
+                        renamed_for_collision = True
                     if not args.execute:
                         row = _result_row(
                             source,
@@ -2148,7 +2185,7 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                             (
                                 f'{progress_text} 目标页已有同名附件，dry-run 将改名为 '
                                 f'{upload_meta.attachment_name} 后上传'
-                                if upload_meta != meta else f'{progress_text} 已匹配，dry-run 未上传'
+                                if renamed_for_collision else f'{progress_text} 已匹配，dry-run 未上传'
                             ),
                             target, source_identifier_type, target_identifier_field, upload_meta,
                         )
@@ -2157,35 +2194,52 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                         continue
 
                     try:
+                        memory_key = (source.source_id, meta.docid, meta.imagefileid)
+                        if approval_required:
+                            approved_path = approved_document_files[_approved_document_key(source, meta)]
+                            file_data = _read_approved_document(approved_path)
+                        else:
+                            file_data = ocr_upload_memory.get(memory_key)
+                        if file_data is None:
+                            file_data = _download_weaver_attachment(
+                                cookie, meta, timeout_seconds,
+                            )
+                        extended_meta = _with_detected_file_extension(upload_meta, file_data)
+                        if extended_meta != upload_meta:
+                            logger.info(
+                                '[filename_extension_added] source=%s doc=%s old=%s new=%s',
+                                source.source_id, source.docid, upload_meta.attachment_name,
+                                extended_meta.attachment_name,
+                            )
+                            upload_meta = extended_meta
+                            extended_normalized = _normalized_file_name(upload_meta.attachment_name)
+                            if not args.no_skip_existing and extended_normalized in existing_names:
+                                upload_meta = replace(
+                                    upload_meta,
+                                    attachment_name=_collision_renamed_attachment_name(upload_meta),
+                                )
+                                renamed_for_collision = True
                         logger.info(
                             '[upload_start] progress=%s/%s source=%s doc=%s target=%s/%s file=%s',
                             upload_action_progress, planned_upload_actions,
                             source.source_id, source.docid, target.target_type, target.code,
                             upload_meta.attachment_name,
                         )
-                        memory_key = (source.source_id, meta.docid, meta.imagefileid)
-                        if approval_required:
-                            approved_path = approved_document_files[_approved_document_key(source, meta)]
-                            file_data = _read_approved_document(approved_path, max_file_bytes)
-                        else:
-                            file_data = ocr_upload_memory.get(memory_key)
-                        if file_data is None:
-                            file_data = _download_weaver_attachment(
-                                cookie, meta, timeout_seconds, max_file_bytes,
-                            )
                         status_code = _retry_upload(
                             base_url, organization_id, access_token, target, upload_meta, file_data,
                             timeout_seconds, upload_retries,
                         )
                         existing_names.add(_normalized_file_name(upload_meta.attachment_name))
-                        successful_uploads[upload_history_key] = upload_meta.attachment_name
+                        successful_uploads.setdefault(upload_history_key, set()).add(
+                            upload_meta.attachment_name
+                        )
                         row = _result_row(
                             source,
-                            'uploaded_renamed' if upload_meta != meta else 'uploaded',
+                            'uploaded_renamed' if renamed_for_collision else 'uploaded',
                             (
                                 f'{progress_text} 同名附件已改名为 {upload_meta.attachment_name} '
                                 f'后上传成功，{len(file_data)} bytes'
-                                if upload_meta != meta else
+                                if renamed_for_collision else
                                 f'{progress_text} 上传成功，{len(file_data)} bytes'
                             ),
                             target, source_identifier_type, target_identifier_field, upload_meta, status_code,
