@@ -6,6 +6,7 @@ sshtunnel>=0.4
 paramiko<4
 python-calamine>=0.2   # 读规则表(WPS保存后openpyxl会因颜色XML报错,calamine对样式更宽容)
 Pillow>=10.0            # 附件下载后将 JPG/PNG 等图片自动转为 PDF
+PyMuPDF>=1.24           # 将超过 UAT 单文件限制的 PDF 压缩为可上传副本
 fastapi>=0.111
 uvicorn[standard]>=0.30
 python-multipart>=0.0.9  # FastAPI 接收 multipart/form-data Excel 上传

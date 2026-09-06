@@ -86,6 +86,9 @@ DEFAULT_UAT_ORGANIZATION_ID = '0'
 DEFAULT_PAGE_SIZE = 200
 DEFAULT_TIMEOUT_SECONDS = 90
 DEFAULT_UPLOAD_RETRIES = 3
+UAT_PDF_COMPRESSION_TRIGGER_BYTES = 50 * 1024 * 1024
+UAT_PDF_COMPRESSION_TARGET_BYTES = 45 * 1024 * 1024
+UAT_PDF_SAFE_UPLOAD_BYTES = 49 * 1024 * 1024
 DEFAULT_PROD_OCR_URL = 'http://api.link.heroesports.com/hfins/v2/0/ocr/recognize/business-file'
 UAT_TOKEN_ENV = 'HFBS_UAT_ACCESS_TOKEN'
 UAT_BASE_URL_ENV = 'HFBS_UAT_BASE_URL'
@@ -302,6 +305,95 @@ def _with_detected_file_extension(meta: AttachmentMeta, data: bytes) -> Attachme
     if not extension:
         return meta
     return replace(meta, attachment_name=f'{meta.attachment_name}{extension}')
+
+
+def _compressed_pdf_name(filename: str) -> str:
+    """为压缩副本生成稳定文件名，不覆盖 UAT 中可能存在的原文件。"""
+    path = Path(filename)
+    suffix = path.suffix or '.pdf'
+    stem = path.stem if path.suffix else path.name
+    if stem.endswith('_压缩版'):
+        return f'{stem}{suffix}'
+    return f'{stem}_压缩版{suffix}'
+
+
+def _compress_pdf_for_uat(data: bytes) -> Tuple[bytes, str]:
+    """把大 PDF 压到 UAT 50MB 单文件限制内；优先无损，必要时逐级栅格压缩。"""
+    try:
+        import pymupdf as fitz  # 按需加载，普通附件不增加启动成本。
+    except ImportError as exc:
+        raise RuntimeError('压缩大 PDF 需要 PyMuPDF，请先执行 pip install -r requirements.txt') from exc
+
+    source_document = fitz.open(stream=data, filetype='pdf')
+    try:
+        if source_document.needs_pass:
+            raise RuntimeError('PDF 已加密，无法自动压缩')
+        if source_document.page_count <= 0:
+            raise RuntimeError('PDF 没有可压缩页面')
+
+        best_data = data
+        best_method = '原文件'
+        try:
+            optimized = source_document.tobytes(
+                garbage=4,
+                clean=True,
+                deflate=True,
+                deflate_images=True,
+                deflate_fonts=True,
+            )
+            if len(optimized) < len(best_data):
+                best_data = optimized
+                best_method = '无损整理'
+            if len(best_data) <= UAT_PDF_COMPRESSION_TARGET_BYTES:
+                return best_data, best_method
+        except (RuntimeError, ValueError):
+            # 部分结构异常的 PDF 无法无损重写，仍可尝试逐页栅格化生成副本。
+            pass
+
+        profiles = (
+            (144, 82),
+            (120, 78),
+            (96, 72),
+            (72, 65),
+            (60, 55),
+            (48, 45),
+        )
+        for dpi, quality in profiles:
+            compressed_document = fitz.open()
+            try:
+                scale = dpi / 72.0
+                matrix = fitz.Matrix(scale, scale)
+                for page_number in range(source_document.page_count):
+                    source_page = source_document.load_page(page_number)
+                    pixmap = source_page.get_pixmap(
+                        matrix=matrix,
+                        colorspace=fitz.csRGB,
+                        alpha=False,
+                        annots=True,
+                    )
+                    jpeg_data = pixmap.tobytes('jpeg', jpg_quality=quality)
+                    output_page = compressed_document.new_page(
+                        width=source_page.rect.width,
+                        height=source_page.rect.height,
+                    )
+                    output_page.insert_image(output_page.rect, stream=jpeg_data)
+                candidate = compressed_document.tobytes(garbage=4, deflate=True)
+            finally:
+                compressed_document.close()
+
+            if len(candidate) < len(best_data):
+                best_data = candidate
+                best_method = f'{dpi}dpi/JPEG{quality}'
+            if len(best_data) <= UAT_PDF_COMPRESSION_TARGET_BYTES:
+                return best_data, best_method
+
+        if len(best_data) <= UAT_PDF_SAFE_UPLOAD_BYTES:
+            return best_data, best_method
+        raise RuntimeError(
+            f'PDF 自动压缩后仍有 {len(best_data)} bytes，无法降到 UAT 50MB 限制以内'
+        )
+    finally:
+        source_document.close()
 
 
 def _normalized_file_name(value: str) -> str:
@@ -1982,6 +2074,9 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
         writer = csv.DictWriter(result_handle, fieldnames=RESULT_COLUMNS)
         writer.writeheader()
         for source in source_attachments:
+            prepared_upload_cache: Dict[
+                Tuple[str, int, int], Tuple[AttachmentMeta, bytes, str]
+            ] = {}
             outcome = match_results[source]
             all_metas = attachment_metadata.get(source.docid, [])
             approval_required = upload_planning_enabled and source.field_name in (
@@ -2161,24 +2256,25 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                         _write_result(writer, logger, row)
                         status_counts[row['status']] += 1
                         continue
-                    original_name = _normalized_file_name(meta.attachment_name)
-                    if not args.no_skip_existing and original_name in existing_names:
-                        renamed_name = _collision_renamed_attachment_name(meta)
-                        renamed_normalized = _normalized_file_name(renamed_name)
-                        if renamed_normalized in existing_names:
-                            row = _result_row(
-                                source,
-                                'skipped_existing_renamed_name',
-                                f'{progress_text} 目标营业执照页已有同名附件，改名版本 {renamed_name} 也已存在',
-                                target, source_identifier_type, target_identifier_field,
-                                replace(meta, attachment_name=renamed_name),
-                            )
-                            _write_result(writer, logger, row)
-                            status_counts[row['status']] += 1
-                            continue
-                        upload_meta = replace(meta, attachment_name=renamed_name)
-                        renamed_for_collision = True
                     if not args.execute:
+                        original_name = _normalized_file_name(meta.attachment_name)
+                        if not args.no_skip_existing and original_name in existing_names:
+                            renamed_name = _collision_renamed_attachment_name(meta)
+                            renamed_normalized = _normalized_file_name(renamed_name)
+                            if renamed_normalized in existing_names:
+                                row = _result_row(
+                                    source,
+                                    'skipped_existing_renamed_name',
+                                    f'{progress_text} 目标营业执照页已有同名附件，改名版本 '
+                                    f'{renamed_name} 也已存在',
+                                    target, source_identifier_type, target_identifier_field,
+                                    replace(meta, attachment_name=renamed_name),
+                                )
+                                _write_result(writer, logger, row)
+                                status_counts[row['status']] += 1
+                                continue
+                            upload_meta = replace(meta, attachment_name=renamed_name)
+                            renamed_for_collision = True
                         row = _result_row(
                             source,
                             'matched_dry_run',
@@ -2195,35 +2291,89 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
 
                     try:
                         memory_key = (source.source_id, meta.docid, meta.imagefileid)
-                        if approval_required:
-                            approved_path = approved_document_files[_approved_document_key(source, meta)]
-                            file_data = _read_approved_document(approved_path)
-                        else:
-                            file_data = ocr_upload_memory.get(memory_key)
-                        if file_data is None:
-                            file_data = _download_weaver_attachment(
-                                cookie, meta, timeout_seconds,
-                            )
-                        extended_meta = _with_detected_file_extension(upload_meta, file_data)
-                        if extended_meta != upload_meta:
-                            logger.info(
-                                '[filename_extension_added] source=%s doc=%s old=%s new=%s',
-                                source.source_id, source.docid, upload_meta.attachment_name,
-                                extended_meta.attachment_name,
-                            )
-                            upload_meta = extended_meta
-                            extended_normalized = _normalized_file_name(upload_meta.attachment_name)
-                            if not args.no_skip_existing and extended_normalized in existing_names:
-                                upload_meta = replace(
-                                    upload_meta,
-                                    attachment_name=_collision_renamed_attachment_name(upload_meta),
+                        prepared_upload = prepared_upload_cache.get(memory_key)
+                        if prepared_upload is None:
+                            if approval_required:
+                                approved_path = approved_document_files[_approved_document_key(source, meta)]
+                                file_data = _read_approved_document(approved_path)
+                            else:
+                                file_data = ocr_upload_memory.get(memory_key)
+                            if file_data is None:
+                                file_data = _download_weaver_attachment(
+                                    cookie, meta, timeout_seconds,
                                 )
-                                renamed_for_collision = True
+
+                            prepared_meta = _with_detected_file_extension(meta, file_data)
+                            if prepared_meta != meta:
+                                logger.info(
+                                    '[filename_extension_added] source=%s doc=%s old=%s new=%s',
+                                    source.source_id, source.docid, meta.attachment_name,
+                                    prepared_meta.attachment_name,
+                                )
+
+                            compression_note = ''
+                            is_pdf = (
+                                prepared_meta.attachment_name.casefold().endswith('.pdf')
+                                or file_data[:1024].lstrip().startswith(b'%PDF-')
+                            )
+                            if len(file_data) > UAT_PDF_COMPRESSION_TRIGGER_BYTES and is_pdf:
+                                original_size = len(file_data)
+                                logger.info(
+                                    '[pdf_compress_start] source=%s doc=%s file=%s original_size=%s',
+                                    source.source_id, source.docid,
+                                    prepared_meta.attachment_name, original_size,
+                                )
+                                file_data, compression_method = _compress_pdf_for_uat(file_data)
+                                prepared_meta = replace(
+                                    prepared_meta,
+                                    attachment_name=_compressed_pdf_name(prepared_meta.attachment_name),
+                                )
+                                compression_note = (
+                                    f'PDF压缩 {original_size} -> {len(file_data)} bytes'
+                                    f'（{compression_method}）'
+                                )
+                                logger.info(
+                                    '[pdf_compress_done] source=%s doc=%s file=%s '
+                                    'original_size=%s compressed_size=%s method=%s',
+                                    source.source_id, source.docid,
+                                    prepared_meta.attachment_name, original_size,
+                                    len(file_data), compression_method,
+                                )
+                            prepared_upload = (prepared_meta, file_data, compression_note)
+                            prepared_upload_cache[memory_key] = prepared_upload
+
+                        upload_meta, file_data, compression_note = prepared_upload
+                        prepared_name = _normalized_file_name(upload_meta.attachment_name)
+                        if not args.no_skip_existing and prepared_name in existing_names:
+                            renamed_name = _collision_renamed_attachment_name(upload_meta)
+                            renamed_normalized = _normalized_file_name(renamed_name)
+                            if renamed_normalized in existing_names:
+                                row = _result_row(
+                                    source,
+                                    'skipped_existing_renamed_name',
+                                    f'{progress_text} 目标营业执照页已有同名附件，改名版本 '
+                                    f'{renamed_name} 也已存在',
+                                    target, source_identifier_type, target_identifier_field,
+                                    replace(upload_meta, attachment_name=renamed_name),
+                                )
+                                _write_result(writer, logger, row)
+                                logger.info(
+                                    '[upload_done] progress=%s/%s status=%s source=%s doc=%s '
+                                    'target=%s/%s file=%s',
+                                    upload_action_progress, planned_upload_actions, row['status'],
+                                    source.source_id, source.docid, target.target_type, target.code,
+                                    renamed_name,
+                                )
+                                status_counts[row['status']] += 1
+                                continue
+                            upload_meta = replace(upload_meta, attachment_name=renamed_name)
+                            renamed_for_collision = True
                         logger.info(
-                            '[upload_start] progress=%s/%s source=%s doc=%s target=%s/%s file=%s',
+                            '[upload_start] progress=%s/%s source=%s doc=%s target=%s/%s '
+                            'file=%s size=%s',
                             upload_action_progress, planned_upload_actions,
                             source.source_id, source.docid, target.target_type, target.code,
-                            upload_meta.attachment_name,
+                            upload_meta.attachment_name, len(file_data),
                         )
                         status_code = _retry_upload(
                             base_url, organization_id, access_token, target, upload_meta, file_data,
@@ -2236,12 +2386,13 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                         row = _result_row(
                             source,
                             'uploaded_renamed' if renamed_for_collision else 'uploaded',
-                            (
-                                f'{progress_text} 同名附件已改名为 {upload_meta.attachment_name} '
-                                f'后上传成功，{len(file_data)} bytes'
-                                if renamed_for_collision else
-                                f'{progress_text} 上传成功，{len(file_data)} bytes'
-                            ),
+                            f'{progress_text} '
+                            + (f'{compression_note}；' if compression_note else '')
+                            + (
+                                f'同名附件已改名为 {upload_meta.attachment_name} 后上传成功，'
+                                if renamed_for_collision else '上传成功，'
+                            )
+                            + f'{len(file_data)} bytes',
                             target, source_identifier_type, target_identifier_field, upload_meta, status_code,
                         )
                     except UatRequestError as exc:
