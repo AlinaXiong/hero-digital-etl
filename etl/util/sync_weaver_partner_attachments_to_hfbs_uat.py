@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""泛微客商附件同步到业财 UAT。
+"""泛微客商附件同步到业财 UAT 或生产环境。
 
 从泛微 ``uf_khgys`` 读取客商证件号/纳税人识别号及以下附件字段，
 精确匹配业财 UAT 客户、供应商后，上传到其「营业执照」附件页：
@@ -11,8 +11,11 @@
 * yqlcxz：印签留存鲜章
 * gsqdxz：公司清单鲜章
 
-默认仅生成匹配日志（dry-run），必须显式传入 ``--execute`` 才会下载泛微
-文件并上传 UAT。仅对证件号/税号精确匹配且明确处于启用状态的 UAT 客商上传；
+默认目标为 UAT 且仅生成匹配日志（dry-run），必须显式传入 ``--execute`` 才会
+下载泛微文件并上传。生产环境必须额外显式传入 ``--target-environment prod``，
+并通过 SSH 只读查询 ``hfins_base`` 客商主数据；附件绑定使用主数据表的
+``header_id``，不会误用 ``customer_id`` / ``vender_id``。仅对证件号/税号
+精确匹配且明确处于启用状态的目标客商上传；
 同一标识命中多个已启用客户或供应商时会全部上传，禁用记录、无匹配记录、
 缺少附件关联键的记录会写入结果清单而不会上传。
 
@@ -28,12 +31,14 @@
 运行前配置（项目根目录 .env.local 优先）：
 
     HFBS_UAT_ACCESS_TOKEN=<UAT 登录 Bearer Token，必填>
+    HFBS_PROD_ACCESS_TOKEN=<生产登录 Bearer Token，生产目标必填>
     WEAVER_CONTRACT_ATTACHMENT_COOKIE=<泛微 Cookie，执行上传时必填>
     HFINS_PROD_OCR_ACCESS_TOKEN=<生产汉得 OCR Token，OCR 时必填>
 
 可选配置：
 
     HFBS_UAT_BASE_URL=https://uat.link.heroesports.com/gtw/hfbs
+    HFBS_PROD_BASE_URL=http://api.link.heroesports.com/hfbs
     HFBS_UAT_ORGANIZATION_ID=0
     HFBS_UAT_PAGE_SIZE=200
     HFBS_UAT_TIMEOUT_SECONDS=90
@@ -45,6 +50,8 @@
     python etl/util/sync_weaver_partner_attachments_to_hfbs_uat.py
     python etl/util/sync_weaver_partner_attachments_to_hfbs_uat.py --source-id 12345
     python etl/util/sync_weaver_partner_attachments_to_hfbs_uat.py --execute
+    python etl/util/sync_weaver_partner_attachments_to_hfbs_uat.py --target-environment prod
+    python etl/util/sync_weaver_partner_attachments_to_hfbs_uat.py --target-environment prod --execute
     python etl/util/sync_weaver_partner_attachments_to_hfbs_uat.py --ocr-only
     python etl/util/sync_weaver_partner_attachments_to_hfbs_uat.py --download-business-licenses
     python etl/util/sync_weaver_partner_attachments_to_hfbs_uat.py --download-identity-cards
@@ -82,6 +89,7 @@ from etl.util import common as c
 TASK_NAME = 'sync_weaver_partner_attachments_to_hfbs_uat'
 OUTPUT_DIR = c.OUT_DIR / TASK_NAME
 DEFAULT_UAT_BASE_URL = 'https://uat.link.heroesports.com/gtw/hfbs'
+DEFAULT_PROD_BASE_URL = 'http://api.link.heroesports.com/hfbs'
 DEFAULT_UAT_ORGANIZATION_ID = '0'
 DEFAULT_PAGE_SIZE = 200
 DEFAULT_TIMEOUT_SECONDS = 90
@@ -92,7 +100,10 @@ UAT_PDF_SAFE_UPLOAD_BYTES = 49 * 1024 * 1024
 DEFAULT_PROD_OCR_URL = 'http://api.link.heroesports.com/hfins/v2/0/ocr/recognize/business-file'
 UAT_TOKEN_ENV = 'HFBS_UAT_ACCESS_TOKEN'
 UAT_BASE_URL_ENV = 'HFBS_UAT_BASE_URL'
+PROD_TOKEN_ENV = 'HFBS_PROD_ACCESS_TOKEN'
+PROD_BASE_URL_ENV = 'HFBS_PROD_BASE_URL'
 UAT_ORGANIZATION_ID_ENV = 'HFBS_UAT_ORGANIZATION_ID'
+PROD_ORGANIZATION_ID_ENV = 'HFBS_PROD_ORGANIZATION_ID'
 UAT_PAGE_SIZE_ENV = 'HFBS_UAT_PAGE_SIZE'
 UAT_TIMEOUT_ENV = 'HFBS_UAT_TIMEOUT_SECONDS'
 UAT_UPLOAD_RETRIES_ENV = 'HFBS_UAT_UPLOAD_RETRIES'
@@ -206,7 +217,7 @@ class UatTarget:
 
 @dataclass(frozen=True)
 class TargetMatch:
-    """一条泛微附件与一个唯一 UAT 客商的匹配结果。"""
+    """一条泛微附件与一个唯一目标环境客商的匹配结果。"""
 
     target: UatTarget
     source_identifier_type: str
@@ -223,7 +234,7 @@ class MatchOutcome:
 
 
 class UatRequestError(RuntimeError):
-    """UAT HTTP 调用失败，保留可写入日志的状态码和错误摘要。"""
+    """目标环境 HTTP 调用失败，保留可写入日志的状态码和错误摘要。"""
 
     def __init__(self, message: str, status_code: Optional[int] = None):
         super().__init__(message)
@@ -401,14 +412,6 @@ def _normalized_file_name(value: str) -> str:
     return urllib.parse.unquote(_text(value)).casefold()
 
 
-def _collision_renamed_attachment_name(meta: AttachmentMeta) -> str:
-    """同名时保留扩展名，并追加稳定的泛微文件标识以支持重复运行去重。"""
-    filename = _safe_filename(meta.attachment_name, meta.docid, meta.imagefileid)
-    suffix = Path(filename).suffix
-    stem = filename[:-len(suffix)] if suffix else filename
-    return f'{stem}__weaver_doc{meta.docid}_file{meta.imagefileid}{suffix}'
-
-
 def _setup_logger(run_id: str) -> Tuple[logging.Logger, Path]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     log_file = OUTPUT_DIR / f'同步日志_{run_id}.log'
@@ -436,6 +439,7 @@ def _setup_logger(run_id: str) -> Tuple[logging.Logger, Path]:
 
 def _load_successful_uploads(
     output_dir: Path,
+    target_environment: str = 'uat',
 ) -> Dict[Tuple[str, str, str, int, int], Set[str]]:
     """从历史结果清单恢复成功上传记录，重复运行时避免再次上传同一目标附件。
 
@@ -444,6 +448,9 @@ def _load_successful_uploads(
     """
     successful: Dict[Tuple[str, str, str, int, int], Set[str]] = defaultdict(set)
     for result_path in sorted(output_dir.glob('同步结果_*.csv')):
+        is_prod_result = result_path.name.startswith('同步结果_prod_')
+        if (target_environment == 'prod') != is_prod_result:
+            continue
         try:
             with result_path.open(encoding='utf-8-sig', newline='') as result_handle:
                 for row in csv.DictReader(result_handle):
@@ -598,13 +605,13 @@ def _request_json(url: str, access_token: str, timeout_seconds: int) -> Tuple[ob
             body = response.read()
             status_code = response.getcode()
     except urllib.error.HTTPError as exc:
-        raise UatRequestError(f'UAT HTTP {exc.code}: {_response_text(exc.read())}', exc.code) from exc
+        raise UatRequestError(f'目标 API HTTP {exc.code}: {_response_text(exc.read())}', exc.code) from exc
     except urllib.error.URLError as exc:
-        raise UatRequestError(f'UAT 网络错误: {exc.reason}') from exc
+        raise UatRequestError(f'目标 API 网络错误: {exc.reason}') from exc
     try:
         return json.loads(body.decode('utf-8')), status_code
     except json.JSONDecodeError as exc:
-        raise UatRequestError(f'UAT 返回非 JSON: {_response_text(body)}', status_code) from exc
+        raise UatRequestError(f'目标 API 返回非 JSON: {_response_text(body)}', status_code) from exc
 
 
 def _extract_page_items(payload: object) -> Tuple[List[dict], Optional[int]]:
@@ -719,6 +726,83 @@ def _build_uat_targets(
                 identifier_fields=identifier_fields,
             )
         )
+    return targets
+
+
+def _load_prod_targets_from_db(
+    target_type: str,
+    organization_id: str,
+    logger: logging.Logger,
+) -> List[UatTarget]:
+    """通过 SSH 读取业财生产客户/供应商及页面实际使用的附件 ``header_id``。"""
+    try:
+        tenant_id = int(organization_id)
+    except ValueError as exc:
+        raise RuntimeError(f'生产环境组织 ID 必须是整数: {organization_id}') from exc
+
+    if target_type == 'customer':
+        sql = '''
+            SELECT
+                CAST(customer_id AS CHAR) AS customerId,
+                CAST(header_id AS CHAR) AS headerId,
+                customer_code AS customerCode,
+                description,
+                taxpayer_name AS taxpayerName,
+                taxpayer_number AS taxpayerNumber,
+                enabled_flag AS enabledFlag
+            FROM hfbs_system_customer
+            WHERE tenant_id = %s AND enabled_flag = 1
+            ORDER BY customer_id
+        '''
+    elif target_type == 'vender':
+        sql = '''
+            SELECT
+                CAST(vender_id AS CHAR) AS venderId,
+                CAST(header_id AS CHAR) AS headerId,
+                vender_code AS venderCode,
+                description,
+                taxpayer_name AS taxpayerName,
+                tax_id_number AS taxIdNumber,
+                taxpayer_number AS taxpayerNumber,
+                enabled_flag AS enabledFlag
+            FROM hfbs_system_vender
+            WHERE tenant_id = %s AND enabled_flag = 1
+            ORDER BY vender_id
+        '''
+    else:
+        raise RuntimeError(f'不支持的生产客商类型: {target_type}')
+
+    records = c.query_db('HAND', 'hfins_base', sql, [tenant_id]).to_dict('records')
+    # 生产「营业执照」页绑定的是主数据表 header_id。customer_id/vender_id 与
+    # header_id 并不相同，缺失时宁可跳过，也不能把附件挂到错误业务键上。
+    targets = _build_uat_targets(target_type, records, allow_primary_key_unique_code=False)
+
+    # 同一 tableName + uniqueCode 无法区分两个客商。生产数据若出现重复 header_id，
+    # 禁止自动上传，避免一个客商的证件同时出现在另一个客商页面。
+    unique_code_counts = Counter(target.unique_code for target in targets if target.unique_code)
+    duplicate_unique_codes = {
+        unique_code for unique_code, count in unique_code_counts.items() if count > 1
+    }
+    if duplicate_unique_codes:
+        logger.error(
+            '[PROD-DB] %s 存在 %s 个重复 header_id，相关客商将跳过上传: %s',
+            target_type, len(duplicate_unique_codes), ','.join(sorted(duplicate_unique_codes)),
+        )
+        targets = [
+            replace(target, unique_code='', unique_code_source='duplicate_headerId')
+            if target.unique_code in duplicate_unique_codes else target
+            for target in targets
+        ]
+
+    attachment_ready = sum(bool(target.unique_code) for target in targets)
+    missing_header = sum(not target.unique_code and not target.unique_code_source for target in targets)
+    duplicate_header = sum(target.unique_code_source == 'duplicate_headerId' for target in targets)
+    logger.info(
+        '[PROD-DB] %s: %s 条启用记录，%s 条含可匹配标识，%s 条附件键可用，'
+        '%s 条缺少 header_id，%s 条命中重复 header_id 保护',
+        target_type, len(records), len(targets), attachment_ready,
+        missing_header, duplicate_header,
+    )
     return targets
 
 
@@ -1213,7 +1297,11 @@ def _match_audit_values(outcome: MatchOutcome) -> Tuple[str, str, str]:
     elif target_summaries:
         detail = f'唯一匹配目标：{"; ".join(target_summaries)}'
     else:
-        detail = '未找到 UAT 客商' if match_result == 'identifier_not_found' else '同一客商类型匹配到多条 UAT 客商'
+        detail = (
+            '未找到目标环境客商'
+            if match_result == 'identifier_not_found'
+            else '同一客商类型匹配到多条目标环境客商'
+        )
     return match_result, detail, '; '.join(target_summaries)
 
 
@@ -1683,7 +1771,11 @@ def _get_business_license_ocr_result(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description='泛微客商附件同步到业财 UAT 营业执照页')
+    parser = argparse.ArgumentParser(description='泛微客商附件同步到业财 UAT/PROD 营业执照页')
+    parser.add_argument(
+        '--target-environment', choices=('uat', 'prod'), default='uat',
+        help='目标环境；默认 uat。生产上传必须显式指定 prod',
+    )
     parser.add_argument(
         '--source-id', action='append', default=[],
         help='仅处理指定泛微 uf_khgys.id；可重复传入，例如 --source-id 1 --source-id 2',
@@ -1691,9 +1783,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--limit', type=int, default=0, help='最多处理多少个泛微客商 ID（0 表示全部）')
     parser.add_argument(
         '--target-type', action='append', choices=tuple(TARGET_CONFIG), default=[],
-        help='仅处理指定 UAT 客商类型；可重复传入 customer/vender，默认两种都处理',
+        help='仅处理指定目标客商类型；可重复传入 customer/vender，默认两种都处理',
     )
-    parser.add_argument('--execute', action='store_true', help='上传审批通过的证件及其他泛微附件到 UAT；默认仅 dry-run')
+    parser.add_argument('--execute', action='store_true', help='上传审批通过的证件及其他泛微附件；默认仅 dry-run')
     parser.add_argument(
         '--ocr-only', action='store_true',
         help='仅调用生产汉得 OCR 校验 yyzzsmj 营业执照附件，不上传 UAT',
@@ -1712,18 +1804,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--allow-primary-key-unique-code', action='store_true',
-        help='UAT 列表未返回 headerId 时，允许使用 customerId/venderId 作为附件 uniqueCode（默认禁止）',
+        help='仅限 UAT：列表未返回 headerId 时允许使用 customerId/venderId 作为附件 uniqueCode（生产始终禁止）',
     )
     parser.add_argument(
         '--no-skip-existing', action='store_true',
-        help='同名时仍使用原文件名上传（默认改名为 __weaver_doc{DOCID}_file{IMAGEFILEID} 后上传）',
+        help='目标页已有同名附件时仍使用原文件名上传（默认直接跳过）',
     )
     return parser
 
 
 def run(argv: Optional[Sequence[str]] = None) -> Path:
     args = build_parser().parse_args(argv)
-    run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_id = f'prod_{timestamp}' if args.target_environment == 'prod' else timestamp
     logger, log_file = _setup_logger(run_id)
     if args.import_doubao_results:
         if (
@@ -1741,9 +1834,12 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
         )
     result_file = OUTPUT_DIR / f'同步结果_{run_id}.csv'
     ocr_audit_db = OUTPUT_DIR / OCR_AUDIT_DB_NAME
-    access_token = os.getenv(UAT_TOKEN_ENV, '').strip()
+    target_environment = args.target_environment
+    access_token_env = PROD_TOKEN_ENV if target_environment == 'prod' else UAT_TOKEN_ENV
+    access_token = os.getenv(access_token_env, '').strip()
+    # dry-run 也会查询目标页现有附件，以准确判断是否跳过，因此始终需要对应环境 Token。
     if not access_token:
-        raise RuntimeError(f'缺少 {UAT_TOKEN_ENV}；请配置 UAT Bearer Token 后重试。')
+        raise RuntimeError(f'缺少 {access_token_env}；请配置目标环境 Bearer Token 后重试。')
     cookie = os.getenv(c.ATTACHMENT_COOKIE_ENV, '').strip()
     ocr_enabled = args.ocr_only
     business_license_download_enabled = args.download_business_licenses
@@ -1757,14 +1853,21 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
     if ocr_enabled and not ocr_access_token:
         raise RuntimeError(f'缺少 {PROD_OCR_TOKEN_ENV}；生产 OCR 校验前必须配置有效 Token。')
 
-    base_url = os.getenv(UAT_BASE_URL_ENV, DEFAULT_UAT_BASE_URL).strip().rstrip('/')
-    organization_id = os.getenv(UAT_ORGANIZATION_ID_ENV, DEFAULT_UAT_ORGANIZATION_ID).strip()
+    if target_environment == 'prod':
+        base_url = os.getenv(PROD_BASE_URL_ENV, DEFAULT_PROD_BASE_URL).strip().rstrip('/')
+        organization_id = os.getenv(
+            PROD_ORGANIZATION_ID_ENV, DEFAULT_UAT_ORGANIZATION_ID,
+        ).strip()
+    else:
+        base_url = os.getenv(UAT_BASE_URL_ENV, DEFAULT_UAT_BASE_URL).strip().rstrip('/')
+        organization_id = os.getenv(UAT_ORGANIZATION_ID_ENV, DEFAULT_UAT_ORGANIZATION_ID).strip()
     page_size = _positive_int_env(UAT_PAGE_SIZE_ENV, DEFAULT_PAGE_SIZE, maximum=500)
     timeout_seconds = _positive_int_env(UAT_TIMEOUT_ENV, DEFAULT_TIMEOUT_SECONDS, maximum=300)
     upload_retries = _positive_int_env(UAT_UPLOAD_RETRIES_ENV, DEFAULT_UPLOAD_RETRIES, maximum=10)
     ocr_url = os.getenv(PROD_OCR_URL_ENV, DEFAULT_PROD_OCR_URL).strip() or DEFAULT_PROD_OCR_URL
     logger.info(
-        '开始同步: mode=%s ocr=%s base_url=%s org=%s page_size=%s source_ids=%s',
+        '开始同步: environment=%s mode=%s ocr=%s base_url=%s org=%s page_size=%s source_ids=%s',
+        target_environment,
         (
             'execute' if args.execute else (
                 'ocr-only' if args.ocr_only else (
@@ -1809,16 +1912,22 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
     for target_type, config in TARGET_CONFIG.items():
         if target_type not in selected_target_types:
             continue
-        records = _fetch_all_uat_records(
-            base_url, organization_id, config['endpoint'], access_token, page_size, timeout_seconds, logger,
-        )
-        targets = _build_uat_targets(target_type, records, args.allow_primary_key_unique_code)
+        if target_environment == 'prod':
+            targets = _load_prod_targets_from_db(target_type, organization_id, logger)
+        else:
+            records = _fetch_all_uat_records(
+                base_url, organization_id, config['endpoint'], access_token,
+                page_size, timeout_seconds, logger,
+            )
+            targets = _build_uat_targets(
+                target_type, records, args.allow_primary_key_unique_code,
+            )
+            enabled_records = sum(_uat_record_enabled(record) for record in records)
+            logger.info(
+                'UAT %s: %s 条接口记录，%s 条启用，%s 条启用且含可匹配标识',
+                target_type, len(records), enabled_records, len(targets),
+            )
         all_targets.extend(targets)
-        enabled_records = sum(_uat_record_enabled(record) for record in records)
-        logger.info(
-            'UAT %s: %s 条接口记录，%s 条启用，%s 条启用且含可匹配标识',
-            target_type, len(records), enabled_records, len(targets),
-        )
     identifier_index = _build_identifier_index(all_targets)
 
     matched_sources: List[SourceAttachment] = []
@@ -2065,12 +2174,16 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
     if args.execute and ocr_enabled:
         execute_ocr_connection = _connect_sqlite_autocommit(ocr_audit_db)
         _init_ocr_audit_db(execute_ocr_connection)
-    successful_uploads = _load_successful_uploads(OUTPUT_DIR)
-    logger.info('历史成功上传记录=%s 条；重复运行将先与 UAT 现有文件交叉确认', len(successful_uploads))
+    successful_uploads = _load_successful_uploads(OUTPUT_DIR, target_environment)
+    logger.info(
+        '%s 历史成功上传记录=%s 条；重复运行将先与目标环境现有文件交叉确认',
+        target_environment.upper(), len(successful_uploads),
+    )
     # 每条营业执照只在其 OCR 到 UAT 上传之间短暂保留，避免整批附件占满内存。
     ocr_upload_memory: Dict[Tuple[str, int, int], bytes] = {}
     upload_action_progress = 0
-    with open(result_file, 'w', encoding='utf-8-sig', newline='') as result_handle:
+    # 结果清单逐行落盘。即使下载或网络请求使进程中断，重跑时也能读取已经成功的记录。
+    with open(result_file, 'w', encoding='utf-8-sig', newline='', buffering=1) as result_handle:
         writer = csv.DictWriter(result_handle, fieldnames=RESULT_COLUMNS)
         writer.writeheader()
         for source in source_attachments:
@@ -2159,9 +2272,9 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                     )
             if not outcome.matches:
                 message = (
-                    '未找到 UAT 客商，未上传'
+                    '未找到目标环境客商，未上传'
                     if outcome.reason == 'identifier_not_found'
-                    else '同一客商类型匹配到多条 UAT 客商，未上传'
+                    else '同一客商类型匹配到多条目标环境客商，未上传'
                 )
                 row = _result_row(source, outcome.reason, message)
                 _write_result(writer, logger, row)
@@ -2179,7 +2292,7 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                 row = _result_row(
                     source,
                     outcome.reason,
-                    f'{ambiguous_labels}匹配到多条 UAT 客商，已跳过该类型；其余唯一类型继续处理',
+                    f'{ambiguous_labels}匹配到多条目标环境客商，已跳过该类型；其余唯一类型继续处理',
                 )
                 _write_result(writer, logger, row)
                 status_counts[row['status']] += 1
@@ -2189,9 +2302,22 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                 source_identifier_type = match.source_identifier_type
                 target_identifier_field = match.target_identifier_field
                 if not target.unique_code:
+                    if target.unique_code_source == 'duplicate_headerId':
+                        missing_key_message = (
+                            '生产客商 header_id 与其他启用客商重复；为避免附件串到错误客商，未上传。'
+                        )
+                    elif target_environment == 'prod':
+                        missing_key_message = (
+                            '生产客商主数据缺少 header_id；页面没有可安全绑定的附件业务键，未上传。'
+                        )
+                    else:
+                        missing_key_message = (
+                            'UAT 列表未返回 headerId；为避免附件挂错，未上传。'
+                            '可核实后使用 --allow-primary-key-unique-code。'
+                        )
                     row = _result_row(
                         source, 'target_attachment_key_missing',
-                        'UAT 列表未返回 headerId；为避免附件挂错，未上传。可核实后使用 --allow-primary-key-unique-code。',
+                        missing_key_message,
                         target, source_identifier_type, target_identifier_field,
                     )
                     _write_result(writer, logger, row)
@@ -2230,7 +2356,6 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                     progress_text = f'[进度 {upload_action_progress}/{planned_upload_actions}]'
                     existing_names = existing_names_cache[cache_key]
                     upload_meta = meta
-                    renamed_for_collision = False
                     upload_history_key = (
                         target.target_type, _text(target.code).casefold(), source.source_id,
                         meta.docid, meta.imagefileid,
@@ -2248,7 +2373,7 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                         row = _result_row(
                             source,
                             'skipped_prior_success',
-                            f'{progress_text} 历史清单已记录上传成功，且 UAT 仍存在文件 '
+                            f'{progress_text} 历史清单已记录上传成功，且目标环境仍存在文件 '
                             f'{prior_uploaded_name}，本次跳过',
                             target, source_identifier_type, target_identifier_field,
                             replace(meta, attachment_name=prior_uploaded_name),
@@ -2259,30 +2384,19 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                     if not args.execute:
                         original_name = _normalized_file_name(meta.attachment_name)
                         if not args.no_skip_existing and original_name in existing_names:
-                            renamed_name = _collision_renamed_attachment_name(meta)
-                            renamed_normalized = _normalized_file_name(renamed_name)
-                            if renamed_normalized in existing_names:
-                                row = _result_row(
-                                    source,
-                                    'skipped_existing_renamed_name',
-                                    f'{progress_text} 目标营业执照页已有同名附件，改名版本 '
-                                    f'{renamed_name} 也已存在',
-                                    target, source_identifier_type, target_identifier_field,
-                                    replace(meta, attachment_name=renamed_name),
-                                )
-                                _write_result(writer, logger, row)
-                                status_counts[row['status']] += 1
-                                continue
-                            upload_meta = replace(meta, attachment_name=renamed_name)
-                            renamed_for_collision = True
+                            row = _result_row(
+                                source,
+                                'skipped_existing_name',
+                                f'{progress_text} 目标营业执照页已有同名附件，本次跳过',
+                                target, source_identifier_type, target_identifier_field, meta,
+                            )
+                            _write_result(writer, logger, row)
+                            status_counts[row['status']] += 1
+                            continue
                         row = _result_row(
                             source,
                             'matched_dry_run',
-                            (
-                                f'{progress_text} 目标页已有同名附件，dry-run 将改名为 '
-                                f'{upload_meta.attachment_name} 后上传'
-                                if renamed_for_collision else f'{progress_text} 已匹配，dry-run 未上传'
-                            ),
+                            f'{progress_text} 已匹配，dry-run 未上传',
                             target, source_identifier_type, target_identifier_field, upload_meta,
                         )
                         _write_result(writer, logger, row)
@@ -2345,29 +2459,23 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                         upload_meta, file_data, compression_note = prepared_upload
                         prepared_name = _normalized_file_name(upload_meta.attachment_name)
                         if not args.no_skip_existing and prepared_name in existing_names:
-                            renamed_name = _collision_renamed_attachment_name(upload_meta)
-                            renamed_normalized = _normalized_file_name(renamed_name)
-                            if renamed_normalized in existing_names:
-                                row = _result_row(
-                                    source,
-                                    'skipped_existing_renamed_name',
-                                    f'{progress_text} 目标营业执照页已有同名附件，改名版本 '
-                                    f'{renamed_name} 也已存在',
-                                    target, source_identifier_type, target_identifier_field,
-                                    replace(upload_meta, attachment_name=renamed_name),
-                                )
-                                _write_result(writer, logger, row)
-                                logger.info(
-                                    '[upload_done] progress=%s/%s status=%s source=%s doc=%s '
-                                    'target=%s/%s file=%s',
-                                    upload_action_progress, planned_upload_actions, row['status'],
-                                    source.source_id, source.docid, target.target_type, target.code,
-                                    renamed_name,
-                                )
-                                status_counts[row['status']] += 1
-                                continue
-                            upload_meta = replace(upload_meta, attachment_name=renamed_name)
-                            renamed_for_collision = True
+                            row = _result_row(
+                                source,
+                                'skipped_existing_name',
+                                f'{progress_text} 目标营业执照页已有同名附件，本次跳过',
+                                target, source_identifier_type, target_identifier_field,
+                                upload_meta,
+                            )
+                            _write_result(writer, logger, row)
+                            logger.info(
+                                '[upload_done] progress=%s/%s status=%s source=%s doc=%s '
+                                'target=%s/%s file=%s',
+                                upload_action_progress, planned_upload_actions, row['status'],
+                                source.source_id, source.docid, target.target_type, target.code,
+                                upload_meta.attachment_name,
+                            )
+                            status_counts[row['status']] += 1
+                            continue
                         logger.info(
                             '[upload_start] progress=%s/%s source=%s doc=%s target=%s/%s '
                             'file=%s size=%s',
@@ -2385,13 +2493,10 @@ def run(argv: Optional[Sequence[str]] = None) -> Path:
                         )
                         row = _result_row(
                             source,
-                            'uploaded_renamed' if renamed_for_collision else 'uploaded',
+                            'uploaded',
                             f'{progress_text} '
                             + (f'{compression_note}；' if compression_note else '')
-                            + (
-                                f'同名附件已改名为 {upload_meta.attachment_name} 后上传成功，'
-                                if renamed_for_collision else '上传成功，'
-                            )
+                            + '上传成功，'
                             + f'{len(file_data)} bytes',
                             target, source_identifier_type, target_identifier_field, upload_meta, status_code,
                         )
